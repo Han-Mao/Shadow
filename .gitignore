@@ -1,0 +1,14 @@
+# 参考资料与生成物
+_ref_extract/
+.trae-html-share-packages/
+
+# 开发文档（不入库）
+bluewhale-shadow-phone/
+
+# IDE
+.idea/
+
+# 运行产物与环境
+__pycache__/
+artifacts/
+.venv/
