@@ -17,7 +17,13 @@ import time
 from typing import Any, Protocol
 
 from device.session import DeviceSession
-from models.task import Task, TaskStatus, priority_rank
+from models.task import (
+    PAUSED_BY_PREEMPTION,
+    PAUSED_BY_USER,
+    Task,
+    TaskStatus,
+    priority_rank,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +67,13 @@ class TaskScheduler:
         if self._worker is not None and self._worker.is_alive():
             return
         self._stopping = False
+
+        # 先重建队列再起 worker：反过来的话 worker 会对着空队列空转，
+        # 恢复出来的任务也可能和刚提交的任务抢设备
+        restored = self.recover()
+        if any(restored.values()):
+            logger.info("从磁盘恢复任务：%s", restored)
+
         self._worker = threading.Thread(target=self._worker_loop, name="shadow-scheduler", daemon=True)
         self._worker.start()
         logger.info("调度器已启动（单设备 / 单 Worker）")
@@ -72,6 +85,55 @@ class TaskScheduler:
         if self._worker is not None:
             self._worker.join(timeout=timeout)
 
+    # ---- 启动恢复 ----
+
+    def recover(self) -> dict[str, int]:
+        """从持久化层重建内存队列（V2 §23 第七阶段：A → B → 重启 → A）。
+
+        内存队列随进程一起消失，但 TaskStore 里还留着未完成的任务。不重建的话，
+        这些任务会变成「从 `/tasks/{id}` 看还活着、但永远没人执行」的僵尸——
+        比直接失败更难排查。
+
+        返回各类任务的恢复数量，方便启动日志与测试断言。幂等：已在内存队列里的不会重复投递。
+        """
+        if self._task_store is None:
+            return {}
+
+        restored = {"queued": 0, "resuming": 0, "paused": 0}
+        with self._cond:
+            for task in self._task_store.list_active():
+                if self._find_locked(task.id) is not None:
+                    continue
+
+                if task.status is TaskStatus.PAUSED and task.paused_reason == PAUSED_BY_USER:
+                    # 用户主动暂停的：重启后保持暂停，不替他做决定
+                    self._paused[task.id] = task
+                    restored["paused"] += 1
+                elif task.status is TaskStatus.PAUSED:
+                    # 被抢占挂起的：自动恢复，但仍要排在抢占者之后（_pop_next 会做优先级比较）
+                    self._suspended.append(task)
+                    restored["resuming"] += 1
+                else:
+                    # created / queued / running / waiting
+                    # running 说明上次是进程被杀、动作已中断 —— 交给 Checkpoint 校验后重跑；
+                    # waiting 说明在等人工确认，重启后重新决策一次比沿用旧确认更安全
+                    task.mark(TaskStatus.QUEUED)
+                    self._push_ready(task)
+                    restored["queued"] += 1
+
+                self._persist(task)
+
+            self._cond.notify_all()
+
+        return restored
+
+    def _push_ready(self, task: Task) -> None:
+        """把任务放进就绪队列。调用方需持有 `self._cond`。"""
+        heapq.heappush(
+            self._ready,
+            (-priority_rank(task.priority), task.created_at.timestamp(), next(self._counter), task),
+        )
+
     # ---- 提交与状态变更 ----
 
     def submit(self, task: Task, *, allow_preempt: bool = True) -> Task:
@@ -80,10 +142,7 @@ class TaskScheduler:
         self._persist(task)
 
         with self._cond:
-            heapq.heappush(
-                self._ready,
-                (-priority_rank(task.priority), task.created_at.timestamp(), next(self._counter), task),
-            )
+            self._push_ready(task)
             self._cond.notify_all()
 
         if allow_preempt:
@@ -108,7 +167,7 @@ class TaskScheduler:
             self._paused[task_id] = task
             self._ready = [entry for entry in self._ready if entry[3].id != task_id]
             self._suspended = [t for t in self._suspended if t.id != task_id]
-            task.mark(TaskStatus.PAUSED)
+            task.mark(TaskStatus.PAUSED, paused_reason=PAUSED_BY_USER)
         self._persist(task)
         return True
 
@@ -121,10 +180,7 @@ class TaskScheduler:
                 self._paused[task_id] = task
                 return False
             task.mark(TaskStatus.QUEUED)
-            heapq.heappush(
-                self._ready,
-                (-priority_rank(task.priority), task.created_at.timestamp(), next(self._counter), task),
-            )
+            self._push_ready(task)
             self._cond.notify_all()
         self._persist(task)
         return True
@@ -281,15 +337,7 @@ class TaskScheduler:
             if not self._session.acquire(task.id):
                 logger.info("设备忙，任务 %s 稍后重试", task.id)
                 with self._cond:
-                    heapq.heappush(
-                        self._ready,
-                        (
-                            -priority_rank(task.priority),
-                            task.created_at.timestamp(),
-                            next(self._counter),
-                            task,
-                        ),
-                    )
+                    self._push_ready(task)
                     self._cond.wait(timeout=self._idle_poll)
                 return
 
@@ -326,7 +374,7 @@ class TaskScheduler:
         elif name == "cancelled":
             task.mark(TaskStatus.CANCELLED)
         elif name == "suspended":
-            task.mark(TaskStatus.PAUSED)
+            task.mark(TaskStatus.PAUSED, paused_reason=PAUSED_BY_PREEMPTION)
             with self._cond:
                 self._suspended.append(task)
             logger.info("任务 %s 已挂起（让出设备），等待恢复", task.id)

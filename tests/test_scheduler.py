@@ -8,7 +8,8 @@ from agent.runtime import RunOutcome
 from agent.scheduler import TaskScheduler
 from device.session import DeviceSession
 from fakes import FakeDevice
-from models.task import Task, TaskPriority, TaskStatus
+from models.task import PAUSED_BY_PREEMPTION, PAUSED_BY_USER, Task, TaskPriority, TaskStatus
+from storage import TaskStore
 
 
 class DoneRuntime:
@@ -92,6 +93,56 @@ class ConfirmationRuntime:
             self.runs += 1
             self.first_run.set()
         return RunOutcome.AWAITING_CONFIRMATION
+
+
+class PreemptionRuntime:
+    """可脚本化的抢占场景 runtime。
+
+    A 第一次运行会挂在安全点上，直到被请求让出设备；
+    B 的行为由 `b_outcome` 决定——给出结果就直接返回，给 `None` 则挂着等被取消。
+    """
+
+    def __init__(self, session: DeviceSession, *, b_outcome: RunOutcome | None = RunOutcome.DONE) -> None:
+        self._session = session
+        self._b_outcome = b_outcome
+        self.order: list[str] = []
+        self.a_started = threading.Event()
+        self.a_resumed = threading.Event()
+        self.b_started = threading.Event()
+        self._a_runs = 0
+        self._lock = threading.Lock()
+
+    def run(self, task: Task) -> RunOutcome:
+        with self._lock:
+            self.order.append(task.id)
+            is_a = task.instruction.startswith("A")
+            if is_a:
+                self._a_runs += 1
+                a_run = self._a_runs
+            else:
+                self.b_started.set()
+
+        if not is_a:
+            if self._b_outcome is not None:
+                return self._b_outcome
+            deadline = time.monotonic() + 4.0
+            while time.monotonic() < deadline:
+                if task.status is TaskStatus.CANCELLED:
+                    return RunOutcome.CANCELLED
+                time.sleep(0.01)
+            return RunOutcome.DONE
+
+        if a_run == 1:
+            self.a_started.set()
+            deadline = time.monotonic() + 4.0
+            while time.monotonic() < deadline:
+                if self._session.should_yield(task.id):
+                    return RunOutcome.SUSPENDED
+                time.sleep(0.01)
+            return RunOutcome.DONE
+
+        self.a_resumed.set()
+        return RunOutcome.DONE
 
 
 def make_scheduler(runtime, session: DeviceSession) -> TaskScheduler:
@@ -365,3 +416,227 @@ def test_worker_survives_runtime_crash():
         assert second.status is TaskStatus.DONE, "worker 必须还活着"
     finally:
         scheduler.stop()
+
+
+# ---------------------------------------------------------------- 组合式中断场景
+
+
+def test_a_resumes_after_b_fails():
+    """A → B 失败 → A：B 挂掉不能把被抢占的 A 一起带走。"""
+    session = DeviceSession(FakeDevice())
+    runtime = PreemptionRuntime(session, b_outcome=RunOutcome.FAILED)
+    scheduler = make_scheduler(runtime, session)
+
+    task_a = Task(instruction="A 逛淘宝", priority=TaskPriority.NORMAL)
+    scheduler.submit(task_a, allow_preempt=False)
+    scheduler.start()
+    try:
+        assert runtime.a_started.wait(2.0), "A 应该先跑起来"
+
+        task_b = Task(instruction="B 发微信", priority=TaskPriority.HIGH)
+        scheduler.submit(task_b)
+
+        assert runtime.a_resumed.wait(4.0), "B 失败后 A 必须被恢复"
+    finally:
+        scheduler.stop()
+
+    assert runtime.order == [task_a.id, task_b.id, task_a.id]
+    assert task_b.status is TaskStatus.FAILED
+    assert task_a.status is TaskStatus.DONE
+
+
+def test_a_resumes_after_b_cancelled():
+    """A → B 被取消 → A：取消抢占者之后，被抢占的任务不能跟着一起卡住。"""
+    session = DeviceSession(FakeDevice())
+    runtime = PreemptionRuntime(session, b_outcome=None)  # B 挂着，等被取消
+    scheduler = make_scheduler(runtime, session)
+
+    task_a = Task(instruction="A 逛淘宝", priority=TaskPriority.NORMAL)
+    scheduler.submit(task_a, allow_preempt=False)
+    scheduler.start()
+    try:
+        assert runtime.a_started.wait(2.0)
+
+        task_b = Task(instruction="B 发微信", priority=TaskPriority.HIGH)
+        scheduler.submit(task_b)
+        assert runtime.b_started.wait(2.0), "B 应该抢占成功并开始执行"
+
+        assert scheduler.cancel(task_b.id)
+        assert runtime.a_resumed.wait(4.0), "B 被取消后 A 必须被恢复"
+    finally:
+        scheduler.stop()
+
+    assert task_b.status is TaskStatus.CANCELLED
+    assert task_a.status is TaskStatus.DONE
+
+
+# ---------------------------------------------------------------- 启动恢复（服务重启）
+
+
+def make_persistent(tmp_path, runtime, *, session=None) -> TaskScheduler:
+    return TaskScheduler(
+        runtime,
+        session or DeviceSession(FakeDevice()),
+        task_store=TaskStore(tmp_path / "tasks"),
+        idle_poll_seconds=0.01,
+    )
+
+
+def test_recover_requeues_queued_task(tmp_path):
+    """服务重启后，磁盘上排队的任务必须被重新投递，否则永远没人执行。"""
+    store = TaskStore(tmp_path / "tasks")
+    first = TaskScheduler(DoneRuntime(), DeviceSession(FakeDevice()), task_store=store)
+
+    task = Task(instruction="重启前提交的任务")
+    first.submit(task, allow_preempt=False)  # 只入队，不给它跑的机会
+    first.stop()
+
+    runtime = DoneRuntime(expected=1)
+    second = TaskScheduler(
+        runtime, DeviceSession(FakeDevice()), task_store=store, idle_poll_seconds=0.01
+    )
+    restored = second.recover()
+    assert restored["queued"] == 1
+
+    second.start()
+    try:
+        assert runtime.done_event.wait(2.0)
+    finally:
+        second.stop()
+
+    assert runtime.order == [task.id]
+
+
+def test_recover_requeues_task_that_was_running(tmp_path):
+    """进程被杀时正在执行的任务：重启后要接着跑，而不是永久停在 running。"""
+    store = TaskStore(tmp_path / "tasks")
+    task = Task(instruction="跑到一半被杀")
+    task.mark(TaskStatus.RUNNING)
+    store.save(task)
+
+    runtime = DoneRuntime(expected=1)
+    scheduler = TaskScheduler(
+        runtime, DeviceSession(FakeDevice()), task_store=store, idle_poll_seconds=0.01
+    )
+    assert scheduler.recover()["queued"] == 1
+
+    scheduler.start()
+    try:
+        assert runtime.done_event.wait(2.0)
+    finally:
+        scheduler.stop()
+
+    assert runtime.order == [task.id]
+    assert store.load(task.id).status is TaskStatus.DONE
+
+
+def test_recover_keeps_user_paused_task_paused(tmp_path):
+    """用户显式暂停的任务，重启后不该被擅自恢复。"""
+    store = TaskStore(tmp_path / "tasks")
+    first = TaskScheduler(DoneRuntime(), DeviceSession(FakeDevice()), task_store=store)
+
+    task = Task(instruction="用户暂停的任务")
+    first.submit(task, allow_preempt=False)
+    assert first.pause(task.id)
+    first.stop()
+
+    scheduler = TaskScheduler(DoneRuntime(), DeviceSession(FakeDevice()), task_store=store)
+    restored = scheduler.recover()
+
+    assert restored == {"queued": 0, "resuming": 0, "paused": 1}
+    assert scheduler.snapshot()["paused"] == [task.id]
+
+
+def test_recover_resumes_preempted_task(tmp_path):
+    """被抢占挂起只是「临时让位」，重启后必须自动回到执行队列。"""
+    store = TaskStore(tmp_path / "tasks")
+    task = Task(instruction="被抢占的任务")
+    task.mark(TaskStatus.PAUSED, paused_reason=PAUSED_BY_PREEMPTION)
+    store.save(task)
+
+    runtime = DoneRuntime(expected=1)
+    scheduler = TaskScheduler(
+        runtime, DeviceSession(FakeDevice()), task_store=store, idle_poll_seconds=0.01
+    )
+    assert scheduler.recover()["resuming"] == 1
+
+    scheduler.start()
+    try:
+        assert runtime.done_event.wait(2.0)
+    finally:
+        scheduler.stop()
+
+    assert runtime.order == [task.id]
+
+
+def test_recover_is_idempotent(tmp_path):
+    """start() 内部会调 recover()，重复调用不能把同一个任务投递两次。"""
+    store = TaskStore(tmp_path / "tasks")
+    task = Task(instruction="任务")
+    task.mark(TaskStatus.QUEUED)
+    store.save(task)
+
+    scheduler = TaskScheduler(DoneRuntime(), DeviceSession(FakeDevice()), task_store=store)
+    assert scheduler.recover()["queued"] == 1
+    assert scheduler.recover()["queued"] == 0
+    assert len(scheduler.snapshot()["ready"]) == 1
+
+
+def test_recover_ignores_finished_tasks(tmp_path):
+    store = TaskStore(tmp_path / "tasks")
+    for status in (TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.CANCELLED):
+        task = Task(instruction=f"已结束-{status.value}", status=status)
+        store.save(task)
+
+    scheduler = TaskScheduler(DoneRuntime(), DeviceSession(FakeDevice()), task_store=store)
+    assert scheduler.recover() == {"queued": 0, "resuming": 0, "paused": 0}
+    assert scheduler.snapshot()["ready"] == []
+
+
+def test_recover_without_store_is_noop():
+    """没接持久化层时（单机脚本、部分测试）recover 应当安全返回。"""
+    scheduler = TaskScheduler(DoneRuntime(), DeviceSession(FakeDevice()))
+    assert scheduler.recover() == {}
+    assert scheduler.snapshot()["ready"] == []
+
+
+def test_restart_after_preemption_end_to_end(tmp_path):
+    """A → B → 重启 → A：被抢占挂起后进程退出，重启要把 A 拉回来跑完。"""
+    store = TaskStore(tmp_path / "tasks")
+
+    # 磁盘上留下的状态 = 「A 被 B 抢占挂起的那一刻进程被杀」
+    task_a = Task(instruction="A 逛淘宝")
+    task_a.set_plan(["打开淘宝", "搜索运动鞋"])
+    task_a.mark(TaskStatus.PAUSED, paused_reason=PAUSED_BY_PREEMPTION)
+    store.save(task_a)
+
+    runtime = DoneRuntime(expected=1)
+    scheduler = TaskScheduler(
+        runtime, DeviceSession(FakeDevice()), task_store=store, idle_poll_seconds=0.01
+    )
+    restored = scheduler.recover()
+    scheduler.start()
+    try:
+        assert runtime.done_event.wait(3.0), "重启后 A 必须被拉回执行"
+    finally:
+        scheduler.stop()
+
+    assert restored["resuming"] == 1
+    assert runtime.order == [task_a.id]
+    assert store.load(task_a.id).status is TaskStatus.DONE
+
+
+def test_pause_reason_is_recorded_and_cleared(tmp_path):
+    """paused_reason 决定重启后的去留，必须如实记录、切走时清空。"""
+    session = DeviceSession(FakeDevice())
+    scheduler = make_scheduler(DoneRuntime(), session)
+    task = Task(instruction="x")
+    scheduler.submit(task, allow_preempt=False)
+
+    assert task.paused_reason is None
+    scheduler.pause(task.id)
+    assert task.paused_reason == PAUSED_BY_USER
+
+    scheduler.resume(task.id)
+    assert task.paused_reason is None
+    assert task.status is TaskStatus.QUEUED

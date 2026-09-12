@@ -12,7 +12,7 @@ from device.session import DeviceSession
 from fakes import FakeDevice
 from models.action import Action, ActionType, Decision
 from models.state import Observation
-from models.task import TaskStatus
+from models.task import PAUSED_BY_PREEMPTION, PAUSED_BY_USER, Task, TaskStatus
 from storage import CheckpointStore, TaskStore, TrajectoryStore
 
 
@@ -349,3 +349,90 @@ def test_wait_timeout_returns_504(api):
         assert "轮询" in resp.json()["detail"]
     finally:
         session.release("__manual__")
+
+
+# ---------------------------------------------------------------- 启动恢复
+
+
+def test_lifespan_recovers_unfinished_tasks(tmp_path, monkeypatch):
+    """服务重启：磁盘上留着未完成的任务时，lifespan 必须把它拉回队列并跑完。
+
+    没有这段逻辑的话，任务会停在磁盘上没人执行——从 /tasks/{id} 看还「活着」，
+    但永远不会有进展（§23 第七阶段）。
+    """
+    import time
+
+    from fastapi.testclient import TestClient
+
+    from api import server
+
+    store = TaskStore(tmp_path / "tasks")
+    task = Task(instruction="上次被抢占后没跑完")
+    task.set_plan(["打开淘宝"])
+    task.mark(TaskStatus.PAUSED, paused_reason=PAUSED_BY_PREEMPTION)
+    store.save(task)
+
+    session = DeviceSession(FakeDevice(), serial="fake-serial")
+    runtime = AgentRuntime(
+        session,
+        artifact_dir=tmp_path,
+        trajectory=TrajectoryStore(),
+        checkpoints=CheckpointStore(tmp_path / "checkpoints"),
+        task_store=store,
+    )
+    scheduler = TaskScheduler(runtime, session, task_store=store, idle_poll_seconds=0.01)
+    manager = TaskManager(store=store, scheduler=scheduler, classifier=TaskClassifier())
+
+    monkeypatch.setattr(server, "session", session)
+    monkeypatch.setattr(server, "task_store", store)
+    monkeypatch.setattr(server, "runtime", runtime)
+    monkeypatch.setattr(server, "scheduler", scheduler)
+    monkeypatch.setattr(server, "manager", manager)
+    stub_loop(monkeypatch, tmp_path)
+
+    # 进入 context manager 才会触发 lifespan（scheduler.start → recover）
+    with TestClient(server.app) as client:
+        payload: dict = {}
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            payload = client.get(f"/tasks/{task.id}").json()
+            if payload["status"] in {"done", "failed"}:
+                break
+            time.sleep(0.05)
+
+    assert payload["status"] == "done", "重启后未完成的任务必须被自动执行完"
+
+
+def test_lifespan_does_not_resume_user_paused_tasks(tmp_path, monkeypatch):
+    """用户显式暂停的任务，重启后应保持暂停。"""
+    import time
+
+    from fastapi.testclient import TestClient
+
+    from api import server
+
+    store = TaskStore(tmp_path / "tasks")
+    task = Task(instruction="用户暂停的任务")
+    task.mark(TaskStatus.PAUSED, paused_reason=PAUSED_BY_USER)
+    store.save(task)
+
+    session = DeviceSession(FakeDevice(), serial="fake-serial")
+    runtime = AgentRuntime(session, artifact_dir=tmp_path, task_store=store)
+    scheduler = TaskScheduler(runtime, session, task_store=store, idle_poll_seconds=0.01)
+    manager = TaskManager(store=store, scheduler=scheduler, classifier=TaskClassifier())
+
+    monkeypatch.setattr(server, "session", session)
+    monkeypatch.setattr(server, "task_store", store)
+    monkeypatch.setattr(server, "runtime", runtime)
+    monkeypatch.setattr(server, "scheduler", scheduler)
+    monkeypatch.setattr(server, "manager", manager)
+    stub_loop(monkeypatch, tmp_path)
+
+    with TestClient(server.app) as client:
+        time.sleep(0.3)  # 给 worker 充分机会去「多管闲事」
+        payload = client.get(f"/tasks/{task.id}").json()
+        scheduler_state = client.get("/scheduler").json()
+
+    assert payload["status"] == "paused"
+    assert task.id in scheduler_state["paused"]
+    assert scheduler_state["running"] is None

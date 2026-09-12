@@ -1,4 +1,4 @@
-#Shadow Phone — V2
+#  Shadow Phone — V2
 
 > **Shadow 是一个面向 Android 的任务级 Agent Runtime。**
 > 它通过任务关系识别、动态调度、Checkpoint 与抢占恢复，让 Agent 在连续执行复杂手机任务的同时，
@@ -67,7 +67,7 @@ VLM 决定「下一步点哪里」，调度与检查点决定「多件事怎么�
 ├── vision/                 # vlm / grounding / parser
 ├── api/server.py           # FastAPI
 ├── scripts/demo_preemption.py   # 抢占恢复演示（离线可跑）
-└── tests/                  # 141 个离线用例
+└── tests/                  # 154 个离线用例
 ```
 
 ## 职责边界
@@ -126,7 +126,24 @@ python scripts/demo_preemption.py
 - `Checkpoint` 保存「恢复所需的最小状态」（当前页、package/activity、最近轨迹）
 - 每个执行完的步骤都进 `TrajectoryStore`，供下一步决策取上下文
 
-### 4. 执行安全
+### 4. 服务重启后自愈
+
+任务队列在内存里，进程一退出就没了；但任务本身持久化在 `storage/`。
+所以 `Scheduler.start()` 的第一步是 **从磁盘重建队列**：
+
+```text
+启动 → TaskStore.list_active()
+        ├─ running   → 上次进程被杀，动作已中断 → 重新入队，交给 Checkpoint 校验后重跑
+        ├─ queued    → 重新入队
+        ├─ waiting   → 重新入队（重启后重新决策一次，比沿用旧确认更安全）
+        ├─ paused(被抢占) → 自动恢复，但仍排在抢占者之后
+        └─ paused(用户暂停) → 保持暂停，不替用户做决定
+```
+
+没有这一步，重启后的任务会变成「从 `/tasks/{id}` 看还活着、但永远没人执行」的僵尸——
+比直接失败更难排查。`Task.paused_reason` 就是为此而加：它区分「临时让位」和「用户暂停」。
+
+### 5. 执行安全
 
 - **风险分级**：`safe / caution / dangerous`，命中「发送/支付/删除/下单」等关键词升级为危险动作
 - **HITL 门禁**：危险动作挂起任务等人工确认，批准才放行；被否决的动作进黑名单，
@@ -223,7 +240,7 @@ pip install -r requirements.txt
 python -m pytest -q
 ```
 
-**141 个用例，全部离线**：不需要 adb、模拟器或 API Key。
+**154 个用例，全部离线**：不需要 adb、模拟器或 API Key。
 
 | 文件 | 覆盖 |
 |---|---|
@@ -231,7 +248,7 @@ python -m pytest -q
 | `test_device.py` | ADB 封装、输入通道（含中文）、设备会话所有权与并发 |
 | `test_vision.py` | UI 树容错、坐标落点、VLM 重试、prompt 构造 |
 | `test_classifier.py` | 三层关系判定与相似度否决 |
-| `test_scheduler.py` | 优先级、暂停/取消、**抢占与恢复**、设备占用 |
+| `test_scheduler.py` | 优先级、暂停/取消、**抢占与恢复**、组合式中断（B 失败/取消）、**启动恢复**、设备占用 |
 | `test_runtime.py` | 闭环执行、异常收敛、死循环、HITL、Checkpoint 恢复 |
 | `test_api.py` | HTTP 契约、状态码语义、错误脱敏 |
 

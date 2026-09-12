@@ -39,6 +39,12 @@ TERMINAL_STATUSES = frozenset({TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.CA
 # 已进入调度视野、但尚未结束
 ACTIVE_STATUSES = frozenset({TaskStatus.QUEUED, TaskStatus.RUNNING, TaskStatus.PAUSED, TaskStatus.WAITING})
 
+# 暂停原因。进程重启后只有「用户显式暂停」该继续保持暂停；
+# 「被抢占挂起」是调度器临时让位，重启后必须自动恢复，否则任务就被永久搁置了。
+PAUSED_BY_USER = "user"
+PAUSED_BY_PREEMPTION = "preemption"
+
+
 
 def priority_rank(priority: TaskPriority) -> int:
     """数值化优先级，便于排序（越大越先执行）。"""
@@ -70,6 +76,9 @@ class Task(BaseModel):
     # 最近一次 Checkpoint，用于暂停后恢复
     checkpoint_id: str | None = None
 
+    # 仅当 status 为 PAUSED 时有意义：区分用户暂停与抢占挂起（见 PAUSED_BY_* 常量）
+    paused_reason: str | None = None
+
     # 是否允许被打断 / 是否允许恢复，由调度器读取
     interruptible: bool = True
     resumable: bool = True
@@ -79,8 +88,14 @@ class Task(BaseModel):
 
     # ---- 状态 ----
 
-    def mark(self, status: TaskStatus) -> None:
+    def mark(self, status: TaskStatus, *, paused_reason: str | None = None) -> None:
+        """切换状态。
+
+        `paused_reason` 只在 PAUSED 时有意义，切到其它状态会被自动清空，
+        避免把「上次为什么暂停」的信息带到下一次运行里。
+        """
         self.status = status
+        self.paused_reason = paused_reason if status is TaskStatus.PAUSED else None
         self.updated_at = datetime.now()
 
     @property
