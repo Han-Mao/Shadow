@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -12,8 +14,22 @@ import httpx
 
 from models.action import Action, ActionType, Point
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_MODEL = "gpt-4o"
+VLM_TIMEOUT_SECONDS = 60.0
+VLM_MAX_ATTEMPTS = 3
+VLM_BACKOFF_SECONDS = 0.8
+# 可重试状态：限流与 5xx 属瞬时故障；其余 4xx（如 401 认证失败）重试没有意义
+RETRYABLE_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
+# 图片精度：坐标决策必须 high；计划与验证只需判断页面语义，low 足够，能省下大量 token 与延迟
+_DEFAULT_IMAGE_DETAIL = {"plan": "low", "decide": "high", "verify": "low"}
+
+
+def _image_detail(stage: str) -> str:
+    """按阶段取图片精度，可用 VLM_DETAIL_PLAN / VLM_DETAIL_DECIDE / VLM_DETAIL_VERIFY 覆盖。"""
+    return os.getenv(f"VLM_DETAIL_{stage.upper()}", _DEFAULT_IMAGE_DETAIL[stage])
 
 
 class VlmError(RuntimeError):
@@ -30,12 +46,31 @@ def _encode_image(path: str | Path) -> str:
 
 
 def _extract_json(text: str) -> dict[str, Any]:
-    """从可能包含 markdown 代码块的文本中提取 JSON。"""
-    if "```" in text:
-        m = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
-        if m:
-            text = m.group(1).strip()
-    return json.loads(text)
+    """从可能包含 markdown 代码块或解释文字的文本中提取 JSON 对象。
+
+    VLM 经常在 JSON 前后附带说明（"好的，我的判断是：{...}"），直接 json.loads 会失败，
+    因此按「代码块 → 最外层大括号 → 原文」依次尝试。
+    """
+    if not isinstance(text, str) or not text.strip():
+        raise VlmParseError("VLM 返回内容为空")
+
+    candidates = [m.group(1).strip() for m in re.finditer(r"```(?:json)?\s*([\s\S]*?)```", text)]
+    candidates.append(text.strip())
+    start, end = text.find("{"), text.rfind("}")
+    if start != -1 and end > start:
+        candidates.append(text[start : end + 1])
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            data = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict):
+            return data
+
+    raise VlmParseError(f"无法从 VLM 响应中解析 JSON 对象: {text[:200]!r}")
 
 
 def _compact_ui_tree(ui_tree: str | None, max_nodes: int = 20) -> str:
@@ -52,8 +87,9 @@ def _compact_ui_tree(ui_tree: str | None, max_nodes: int = 20) -> str:
             x, y = node.center
             lines.append(f"{i}. {label} [{x},{y}]")
         return "\n".join(lines)
-    except Exception as exc:
-        return f"UI 树解析失败: {exc}"
+    except Exception:
+        # 解析失败时返回空串，不要把异常文本当成 UI 结构塞进 prompt 误导模型
+        return ""
 
 
 def build_plan_prompt(instruction: str, screenshot_path: str, ui_tree: str | None) -> str:
@@ -69,6 +105,33 @@ def build_plan_prompt(instruction: str, screenshot_path: str, ui_tree: str | Non
     )
 
 
+def _format_target(target: Any) -> str:
+    if isinstance(target, dict):
+        return "(" + ",".join(f"{k}={v}" for k, v in target.items()) + ")"
+    return str(target)
+
+
+def _format_action(action: Any) -> str:
+    """把 action 压成一行。
+
+    history 里的 action 是 dict，整块 dump 进 prompt 又长又难读；而 action 为 None
+    的观察步（如计划阶段的初始截图）直接显示 "None" 会让模型误以为发生了动作。
+    """
+    if not action:
+        return "（无动作，仅观察）"
+    if not isinstance(action, dict):
+        return str(action)
+
+    parts = [str(action.get("type") or "?")]
+    target = action.get("target")
+    if target is not None:
+        parts.append(_format_target(target))
+    value = action.get("value")
+    if value is not None:
+        parts.append(f"value={value!r}")
+    return " ".join(parts)
+
+
 def build_decision_prompt(
     instruction: str,
     screenshot_path: str,
@@ -77,7 +140,8 @@ def build_decision_prompt(
     plan: list[str],
 ) -> str:
     steps = "\n".join(
-        f"步骤 {o['step']}: {o.get('action')} -> {o.get('status')} ({o.get('message')})"
+        f"步骤 {o['step']}: {_format_action(o.get('action'))} -> {o.get('status')} "
+        f"({o.get('message') or '无说明'})"
         for o in history[-5:]
     )
     plan_text = "\n".join(f"{i+1}. {p}" for i, p in enumerate(plan)) if plan else "无"
@@ -99,6 +163,39 @@ def build_decision_prompt(
     )
 
 
+def _post_chat_completions(url: str, headers: dict[str, str], payload: dict[str, Any]) -> httpx.Response:
+    """带指数退避的 VLM 请求。
+
+    主循环的重试只作用于 action 维度；VLM 自己若不重试，一次限流或网络抖动就会
+    连锁触发无谓的 Re-plan，甚至让整个任务失败。
+    """
+    last_error = ""
+    for attempt in range(1, VLM_MAX_ATTEMPTS + 1):
+        try:
+            resp = httpx.post(url, headers=headers, json=payload, timeout=VLM_TIMEOUT_SECONDS)
+        except httpx.TimeoutException as exc:
+            last_error = f"请求超时: {exc}"
+        except httpx.TransportError as exc:
+            last_error = f"网络错误: {exc}"
+        else:
+            if resp.status_code not in RETRYABLE_STATUS_CODES:
+                return resp
+            last_error = f"HTTP {resp.status_code}"
+
+        if attempt < VLM_MAX_ATTEMPTS:
+            delay = VLM_BACKOFF_SECONDS * (2 ** (attempt - 1))
+            logger.warning(
+                "VLM 请求失败（第 %d/%d 次，%s），%.1fs 后重试",
+                attempt,
+                VLM_MAX_ATTEMPTS,
+                last_error,
+                delay,
+            )
+            time.sleep(delay)
+
+    raise VlmError(f"VLM 请求失败（已重试 {VLM_MAX_ATTEMPTS} 次）: {last_error}")
+
+
 def _call_vlm(messages: list[dict]) -> dict[str, Any]:
     base_url = os.getenv("VLM_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
     api_key = os.getenv("VLM_API_KEY")
@@ -113,18 +210,19 @@ def _call_vlm(messages: list[dict]) -> dict[str, Any]:
         "max_tokens": 512,
     }
 
+    resp = _post_chat_completions(
+        f"{base_url}/chat/completions",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        payload=payload,
+    )
+
     try:
-        resp = httpx.post(
-            f"{base_url}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=60.0,
-        )
         resp.raise_for_status()
     except httpx.HTTPError as exc:
+        # 走到这里的是不可重试的 4xx（认证失败、请求非法等），直接暴露给上层
         raise VlmError(f"VLM 请求失败: {exc}") from exc
 
     try:
@@ -141,7 +239,8 @@ def _call_vlm(messages: list[dict]) -> dict[str, Any]:
         if not isinstance(message.get("content"), str):
             message["content"] = ""
         return message
-    except (KeyError, IndexError, TypeError) as exc:
+    except (ValueError, KeyError, IndexError, TypeError) as exc:
+        # ValueError 覆盖 resp.json() 对非法 JSON 的解码失败，统一收敛为 VlmError
         raise VlmError(f"无法解析 VLM 响应结构: {exc}") from exc
 
 
@@ -156,7 +255,7 @@ def generate_plan(instruction: str, screenshot_path: str, ui_tree: str | None) -
                 {"type": "text", "text": prompt},
                 {
                     "type": "image_url",
-                    "image_url": {"url": f"data:image/png;base64,{image_b64}", "detail": "high"},
+                    "image_url": {"url": f"data:image/png;base64,{image_b64}", "detail": _image_detail("plan")},
                 },
             ],
         }
@@ -190,7 +289,7 @@ def decide_next_action(
                 {"type": "text", "text": prompt},
                 {
                     "type": "image_url",
-                    "image_url": {"url": f"data:image/png;base64,{image_b64}", "detail": "high"},
+                    "image_url": {"url": f"data:image/png;base64,{image_b64}", "detail": _image_detail("decide")},
                 },
             ],
         }
@@ -199,7 +298,9 @@ def decide_next_action(
     try:
         content = _call_vlm(messages)["content"]
         data = _extract_json(content)
-    except json.JSONDecodeError as exc:
+    except VlmParseError:
+        raise
+    except (VlmError, json.JSONDecodeError) as exc:
         raise VlmParseError(f"无法解析 VLM 响应: {exc}") from exc
 
     return _parse_action(data)
@@ -217,7 +318,8 @@ def _parse_action(data: dict[str, Any]) -> Action:
 
     target = data.get("target")
     if isinstance(target, dict):
-        target = Point(x=int(target.get("x", 0)), y=int(target.get("y", 0)))
+        # 保留浮点，归一化坐标(0,1)交由 grounding 依据屏幕尺寸换算，避免 int() 截断成 0
+        target = Point(x=target.get("x", 0), y=target.get("y", 0))
 
     value = data.get("value")
     reason = data.get("thought", "")
@@ -251,11 +353,11 @@ def verify_transition(
                 {"type": "text", "text": prompt},
                 {
                     "type": "image_url",
-                    "image_url": {"url": f"data:image/png;base64,{pre_b64}", "detail": "high"},
+                    "image_url": {"url": f"data:image/png;base64,{pre_b64}", "detail": _image_detail("verify")},
                 },
                 {
                     "type": "image_url",
-                    "image_url": {"url": f"data:image/png;base64,{post_b64}", "detail": "high"},
+                    "image_url": {"url": f"data:image/png;base64,{post_b64}", "detail": _image_detail("verify")},
                 },
             ],
         }
@@ -264,7 +366,7 @@ def verify_transition(
     try:
         content = _call_vlm(messages)["content"]
         data = _extract_json(content)
-    except (json.JSONDecodeError, KeyError) as exc:
+    except (VlmError, json.JSONDecodeError, KeyError) as exc:
         raise VlmError(f"无法解析 VLM 验证结果: {exc}") from exc
 
     return str(data.get("result", "ok")).lower()

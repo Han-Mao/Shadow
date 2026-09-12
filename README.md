@@ -21,7 +21,7 @@
 │   ├── adb.py              # DeviceController 的 ADB 实现
 │   ├── screenshot.py       # 截图采集
 │   ├── accessibility.py    # uiautomator dump 封装
-│   └── emulator.py         # 模拟器生命周期管理
+│   └── emulator.py         # 设备发现与 serial 解析
 ├── api/
 │   └── server.py           # FastAPI：任务与单步端点
 └── models/                 # 数据模型
@@ -51,7 +51,11 @@
 ## 运行
 
 ```powershell
+# 方式一：只装依赖
 pip install -r requirements.txt
+
+# 方式二（推荐）：装成可编辑包，之后从任意目录都能 python -m api.server / pytest，无 cwd 依赖
+pip install -e .
 
 # 配置 VLM（OpenAI 兼容接口）
 $env:VLM_BASE_URL="https://api.openai.com/v1"
@@ -70,8 +74,10 @@ python -m api.server    # 监听 127.0.0.1:8010
 | `VLM_BASE_URL` | VLM 接口地址 | `https://api.openai.com/v1` |
 | `VLM_API_KEY` | VLM API Key | 必填 |
 | `VLM_MODEL` | VLM 模型名 | `gpt-4o` |
+| `VLM_DETAIL_PLAN` / `_DECIDE` / `_VERIFY` | 各阶段图片精度 | `low` / `high` / `low` |
 | `ARTIFACT_DIR` | 截图落盘目录 | `artifacts/shots` |
 | `PORT` | API 端口 | `8010` |
+| `SHADOW_DEBUG` | 置 1 时 500 响应回传异常摘要（默认脱敏） | 未设置 |
 
 ## 冒烟验证
 
@@ -87,14 +93,16 @@ curl -X POST http://127.0.0.1:8010/screenshot
 ### M3 任务闭环
 
 ```powershell
-# 创建任务并自动启动 Agent Loop（同步返回最终状态）
+# 默认后台执行：立即返回 task id，不占用请求线程等整个 loop 跑完
 $task = curl -X POST http://127.0.0.1:8010/tasks -H "Content-Type: application/json" -d '{"instruction":"打开设置并开启飞行模式","max_steps":8}' | ConvertFrom-Json
 
-# 查看任务
-$task.task.id
+# 轮询直到 task.status 变成 done / failed
 curl http://127.0.0.1:8010/tasks/$($task.task.id)
 
-# 获取某一步截图
+# 演示时想要「一条命令拿到最终状态」，加 wait=true（同步等待，默认超时 120s）
+curl -X POST http://127.0.0.1:8010/tasks -H "Content-Type: application/json" -d '{"instruction":"打开设置并开启飞行模式","max_steps":8,"wait":true}'
+
+# 获取某一步截图（step 0 是计划阶段的首屏，可正常取到）
 curl http://127.0.0.1:8010/tasks/$($task.task.id)/shots/1
 
 # 单次观察
@@ -106,8 +114,40 @@ curl -X POST http://127.0.0.1:8010/actions -H "Content-Type: application/json" -
 
 截图落在 `artifacts/shots/`（已被 .gitignore 忽略）。
 
+### 状态码约定
+
+| 码 | 含义 |
+|---|---|
+| `409` | 设备忙：已有任务或写操作在跑。全局只有一台目标设备，并发驱动会让点击互相交错 |
+| `422` | 请求体参数非法（如 `target` 不是坐标/字符串），在进入 handler 前即被拒 |
+| `502` / `503` | 设备不可用 / VLM 调用失败 |
+| `504` | `wait=true` 超时，任务仍在后台跑，可继续轮询 |
+
+## 测试
+
+```powershell
+pip install -r requirements.txt
+python -m pytest -q          # pyproject 已配好 testpaths 与 pythonpath，无需在根目录执行
+```
+
+用例全部使用假设备（`FakeDevice`）与打桩的 VLM，**不需要** adb、模拟器或 API Key，可直接在 CI 跑。
+覆盖：坐标归一化换算、UI 树异常 bounds 容错、执行器参数校验、观察失败收敛、主循环状态机回滚、
+Re-plan 路径的 VLM 验证、设备锁与后台任务模型、VLM 重试策略、API 契约与错误脱敏。
+
 ## 注意事项
 
 - `/text` 仅接受安全 ASCII（字母、数字及 `_.@,/?!`），空格会被转义为 `%s`；中文输入待 M4 通过 ADB Keyboard 广播方案实现。
 - Action Schema 已按 §3.2 全量落地：`tap` / `long_press` / `type` / `swipe` / `back` / `home` / `launch` / `wait` / `done`。
-- 多设备寻址：优先 `ADB_SERIAL`，其次自动检测单一可用设备，否则回退默认。
+- 多设备寻址：优先 `ADB_SERIAL`，其次自动检测单一可用设备，否则回退默认。**当前实现按单设备设计**，
+  所有写操作共用一把设备锁；扩展多设备前需把锁拆成 per-serial。
+- 坐标解析：`target` 可为 `{"x":..,"y":..}`、`"x,y"`、`"x1,y1,x2,y2"`、`"[x1,y1][x2,y2]"` 或元素描述文本。
+  0~1 之间的数值按归一化比例换算，其余按像素处理；换算基准取 `wm size` 的 **Override size**（实际渲染尺寸）。
+  解析失败会抛出明确错误，不会静默回退到屏幕中心。
+- 执行器（`agent/executor.py`）对外承诺「永不抛异常」，任何非法参数都收敛为 `{"ok": false, "error": ...}`，
+  VLM 返回 `wait: "一会儿"` 这类脏数据不会让整个任务以 HTTP 500 中断。
+- 观察阶段同样收敛：截图 / dump 失败记为 `ERROR` 步骤并计入重试熔断，不会 500；任务一旦启动，
+  任何异常都会先把状态落为 `failed` 再抛出，不会留下卡在 `running` 的僵尸任务。
+- `ARTIFACT_DIR` 同时被 `api/server.py` 与 `agent/loop.py` 读取，保证 `/screenshot` 与 Agent 截图落在同一目录。
+- VLM 调用对 429 / 5xx / 网络错误做 3 次指数退避重试；4xx（除 429）不重试。
+- 单步端点（`/observe`、`/actions`）刻意使用独立 Memory，不写全局 store——它们是调试入口，
+  否则每次试探性点击都会在任务列表里留下一批 `__action__` 假任务。

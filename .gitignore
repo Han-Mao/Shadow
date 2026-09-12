@@ -8,7 +8,11 @@ bluewhale-shadow-phone/
 # IDE
 .idea/
 
+# 工作区数据（记忆、会话）
+.workbuddy/
+
 # 运行产物与环境
 __pycache__/
 artifacts/
 .venv/
+.pytest_cache/

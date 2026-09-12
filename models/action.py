@@ -19,8 +19,8 @@ class ActionType(str, Enum):
 
 
 class Point(BaseModel):
-    x: int
-    y: int
+    x: float
+    y: float
 
 
 class Action(BaseModel):

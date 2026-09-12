@@ -1,7 +1,7 @@
 """Action JSON → DeviceController 调用。"""
 from __future__ import annotations
 
-from device.adb import AdbController, AdbError
+from device.adb import DURATION_RANGE_MS, AdbController, AdbError
 from models.action import Action, ActionType, Point
 from vision import grounding
 from vision.grounding import GroundingError
@@ -14,18 +14,46 @@ def _split_launch(value: str) -> tuple[str, str | None]:
     return value, None
 
 
+def _parse_duration(value: str | None, default: int) -> int:
+    """时长参数统一解析。VLM 常返回 "800" / "800ms" / "1秒"，非法值必须转成明确的 AdbError。"""
+    if value is None or str(value).strip() == "":
+        return default
+    try:
+        duration = int(float(str(value).strip()))
+    except (TypeError, ValueError) as exc:
+        raise AdbError(f"时长需为毫秒数，收到 {value!r}") from exc
+
+    low, high = DURATION_RANGE_MS
+    if not low <= duration <= high:
+        raise AdbError(f"时长 {duration}ms 超出允许范围 {low}-{high}ms")
+    return duration
+
+
 def _parse_swipe(target: Point | str | None) -> tuple[int, int, int, int]:
+    """解析滑动起终点。只接受 Point（退化为点按）或 "x1,y1,x2,y2" 字符串。"""
     if isinstance(target, Point):
-        return target.x, target.y, target.x, target.y
+        x, y = round(target.x), round(target.y)
+        return x, y, x, y
+
     if isinstance(target, str):
-        parts = [int(float(p.strip())) for p in target.split(",")]
-        if len(parts) == 4:
-            return tuple(parts)
+        parts = [p.strip() for p in target.replace("，", ",").split(",")]
+        if len(parts) != 4:
+            raise AdbError(f"SWIPE 需要 4 个坐标（x1,y1,x2,y2），收到 {target!r}")
+        try:
+            x1, y1, x2, y2 = (int(float(p)) for p in parts)
+        except (TypeError, ValueError) as exc:
+            raise AdbError(f"SWIPE 坐标无法解析为数字: {target!r}") from exc
+        return x1, y1, x2, y2
+
     raise AdbError("SWIPE 需要起终点坐标，格式：x1,y1,x2,y2")
 
 
 def execute(adb: AdbController, action: Action, ui_tree: str | None = None) -> dict:
-    """执行 Action 并返回结果字典。"""
+    """执行 Action 并返回结果字典。
+
+    约定：本函数**永不抛异常**。任何失败都收敛成 {"ok": False, "error": ...}，
+    否则异常会穿透主循环，让整个任务以 HTTP 500 中断。
+    """
     try:
         match action.type:
             case ActionType.TAP:
@@ -35,13 +63,13 @@ def execute(adb: AdbController, action: Action, ui_tree: str | None = None) -> d
 
             case ActionType.LONG_PRESS:
                 x, y = grounding.resolve_target(adb, action.target, ui_tree)
-                duration = int(action.value) if action.value else 800
+                duration = _parse_duration(action.value, 800)
                 adb.long_press(x, y, duration)
                 return {"ok": True, "x": x, "y": y, "duration": duration}
 
             case ActionType.SWIPE:
                 x1, y1, x2, y2 = _parse_swipe(action.target)
-                duration = int(action.value) if action.value else 300
+                duration = _parse_duration(action.value, 300)
                 adb.swipe(x1, y1, x2, y2, duration)
                 return {"ok": True, "x1": x1, "y1": y1, "x2": x2, "y2": y2, "duration": duration}
 
@@ -67,7 +95,7 @@ def execute(adb: AdbController, action: Action, ui_tree: str | None = None) -> d
                 return {"ok": True, "package": package, "activity": activity}
 
             case ActionType.WAIT:
-                duration = int(action.value) if action.value else 1000
+                duration = _parse_duration(action.value, 1000)
                 adb.wait(duration)
                 return {"ok": True, "duration": duration}
 
@@ -78,3 +106,5 @@ def execute(adb: AdbController, action: Action, ui_tree: str | None = None) -> d
                 raise AdbError(f"未知 Action 类型: {action.type}")
     except (AdbError, GroundingError) as exc:
         return {"ok": False, "error": str(exc)}
+    except Exception as exc:  # noqa: BLE001 - 兜底，保证主循环拿到的永远是结构化结果
+        return {"ok": False, "error": f"执行异常 {type(exc).__name__}: {exc}"}

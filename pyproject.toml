@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bluewhale-shadow-phone"
+version = "0.1.0"
+description = "Bluewhale Shadow Phone —— Android 模拟器上的 GUI Agent（Observe → Think → Act → Verify）"
+requires-python = ">=3.11"
+# 运行依赖与 requirements.txt 保持一致；requirements.txt 额外带 pytest，便于一条命令装齐
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "pydantic>=2.6",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+# 显式声明顶层包，避免 setuptools 自动发现在 _ref_extract/ 等参考目录上踩坑
+[tool.setuptools]
+packages = ["agent", "api", "device", "models", "vision"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
