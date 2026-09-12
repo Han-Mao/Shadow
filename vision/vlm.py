@@ -12,7 +12,7 @@ from typing import Any
 
 import httpx
 
-from models.action import Action, ActionType, Point
+from models.action import Action, ActionType, Decision, Point
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +138,7 @@ def build_decision_prompt(
     ui_tree: str | None,
     history: list[dict[str, Any]],
     plan: list[str],
+    current_step_goal: str = "",
 ) -> str:
     steps = "\n".join(
         f"步骤 {o['step']}: {_format_action(o.get('action'))} -> {o.get('status')} "
@@ -145,10 +146,12 @@ def build_decision_prompt(
         for o in history[-5:]
     )
     plan_text = "\n".join(f"{i+1}. {p}" for i, p in enumerate(plan)) if plan else "无"
+    focus = current_step_goal.strip() or "（尚未确定，请自行判断）"
     tree = _compact_ui_tree(ui_tree)
     return (
         "你正在控制一部 Android 模拟器。任务：\n" + instruction + "\n\n"
-        "整体计划：\n" + plan_text + "\n\n"
+        "整体计划（[状态] 目标）：\n" + plan_text + "\n\n"
+        "当前聚焦步骤：\n" + focus + "\n\n"
         "最近执行记录：\n" + (steps or "无") + "\n\n"
         "当前页面可点击元素（部分）：\n" + (tree or "无") + "\n\n"
         "请以 JSON 格式返回下一步操作，不要包含其他解释：\n"
@@ -157,9 +160,44 @@ def build_decision_prompt(
         '  "action_type": "tap|long_press|type|swipe|back|home|launch|wait|done",\n'
         '  "target": "点击目标的描述或坐标，如 {\"x\":360,\"y\":600} 或 \"搜索按钮\"",\n'
         '  "value": "当 action_type=type 时填写要输入的文本；swipe 时填写 x1,y1,x2,y2；wait 时填写毫秒",\n'
+        '  "step_done": false,\n'
         '  "done": false\n'
         "}\n"
+        "step_done 表示「做完这个动作后，当前聚焦步骤是否已经达成」；done 表示整个任务是否已经完成。\n"
         "坐标优先返回屏幕绝对像素；若不确定，返回可点击元素的文本或 content-desc 描述。"
+    )
+
+
+def build_replan_prompt(context: dict[str, Any]) -> str:
+    """结构化 Re-plan prompt（V2 §十六）。
+
+    明确告诉模型「是这种执行方式失败，不是任务失败」，并列出已经试过的做法，
+    否则它极大概率把同一个动作原样重发一遍。
+    """
+    previous = _format_action(context.get("previous_action"))
+    tried = context.get("failed_strategies") or []
+    tried_text = "\n".join(f"- {item}" for item in tried) if tried else "（暂无）"
+    alternatives = context.get("available_alternatives") or []
+    alternatives_text = "\n".join(f"- {item}" for item in alternatives) if alternatives else "（无）"
+
+    return (
+        "你正在控制一部 Android 模拟器。**任务本身没有失败**，失败的是下面这种执行方式。\n"
+        "请换一种做法，不要重复已经失败过的动作。\n\n"
+        f"任务：{context.get('task', '')}\n"
+        f"当前步骤：{context.get('current_step', '')}\n"
+        f"上一次动作：{previous}\n"
+        f"失败原因：{context.get('failure_reason') or '未知'}\n\n"
+        "已经失败过的做法：\n" + tried_text + "\n\n"
+        "可以尝试的替代手段：\n" + alternatives_text + "\n\n"
+        "请以 JSON 格式返回下一步操作：\n"
+        "{\n"
+        '  "thought": "这次改用哪种定位/路径，以及为什么上次会失败",\n'
+        '  "action_type": "tap|long_press|type|swipe|back|home|launch|wait|done",\n'
+        '  "target": "{\\"x\\":360,\\"y\\":600} 或元素文本描述",\n'
+        '  "value": "type 时填文本；swipe 时填 x1,y1,x2,y2；wait 时填毫秒",\n'
+        '  "step_done": false,\n'
+        '  "done": false\n'
+        "}"
     )
 
 
@@ -278,10 +316,13 @@ def decide_next_action(
     ui_tree: str | None,
     history: list[dict[str, Any]] | None = None,
     plan: list[str] | None = None,
+    current_step_goal: str = "",
 ) -> Action:
     """根据截图与任务历史，调用 VLM 返回下一步 Action。"""
     image_b64 = _encode_image(screenshot_path)
-    prompt = build_decision_prompt(instruction, screenshot_path, ui_tree, history or [], plan or [])
+    prompt = build_decision_prompt(
+        instruction, screenshot_path, ui_tree, history or [], plan or [], current_step_goal
+    )
     messages = [
         {
             "role": "user",
@@ -303,7 +344,40 @@ def decide_next_action(
     except (VlmError, json.JSONDecodeError) as exc:
         raise VlmParseError(f"无法解析 VLM 响应: {exc}") from exc
 
-    return _parse_action(data)
+    return _parse_decision(data)
+
+
+def replan_action(
+    context: dict[str, Any],
+    screenshot_path: str,
+    ui_tree: str | None,
+    history: list[dict[str, Any]] | None = None,
+) -> Action:
+    """结构化 Re-plan：换一种执行方式，而不是重发同一个动作。"""
+    image_b64 = _encode_image(screenshot_path)
+    prompt = build_replan_prompt(context)
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{image_b64}", "detail": _image_detail("decide")},
+                },
+            ],
+        }
+    ]
+
+    try:
+        content = _call_vlm(messages)["content"]
+        data = _extract_json(content)
+    except VlmParseError:
+        raise
+    except (VlmError, json.JSONDecodeError) as exc:
+        raise VlmParseError(f"无法解析 Re-plan 响应: {exc}") from exc
+
+    return _parse_decision(data)
 
 
 def _parse_action(data: dict[str, Any]) -> Action:
@@ -327,7 +401,22 @@ def _parse_action(data: dict[str, Any]) -> Action:
     if data.get("done") and action_type != ActionType.DONE:
         action_type = ActionType.DONE
 
-    return Action(type=action_type, target=target, value=value, reason=reason)
+    # 模型可以自行标注风险等级；给了非法值就当没给，交给 Action.resolved_risk 推断
+    risk = data.get("risk")
+    if risk not in (None, "safe", "caution", "dangerous"):
+        risk = None
+
+    return Action(type=action_type, target=target, value=value, reason=reason, risk=risk)
+
+
+def _parse_decision(data: dict[str, Any]) -> Decision:
+    """把 VLM 的 JSON 解析成 Decision（动作 + 当前步骤是否达成）。"""
+    action = _parse_action(data)
+    return Decision(
+        action=action,
+        step_done=bool(data.get("step_done")),
+        thought=str(data.get("thought") or action.reason or ""),
+    )
 
 
 def verify_transition(
@@ -370,3 +459,52 @@ def verify_transition(
         raise VlmError(f"无法解析 VLM 验证结果: {exc}") from exc
 
     return str(data.get("result", "ok")).lower()
+
+
+RELATION_PROMPT = """你在判断用户新说的话与\"正在执行的任务\"是什么关系。
+
+正在执行的任务：{current}
+用户新说：{new}
+
+关系只能从下面五个里选一个：
+- subtask：新指令是当前任务的一部分或前置步骤（例如「先帮我查一下酒店」）
+- super_task：新指令改变了当前任务的目标，需要重做
+- unrelated：与当前任务无关，是另一件事
+- duplicate：与当前任务重复，没必要再做一遍
+- interrupt：需要立刻打断当前任务，优先做这件
+
+仅返回 JSON，不要解释：
+{{"relation": "subtask", "confidence": 0.0, "reason": "简短理由"}}
+"""
+
+
+def classify_relation(instruction: str, current_instruction: str) -> TaskRelationResult:
+    """让 LLM 判断新指令与当前任务的关系（Classifier 的第三层信号）。
+
+    纯文本调用、不需要截图，成本远低于决策与验证，可以放心在每次注入时调用。
+    """
+    from models.task_relation import TaskRelation, TaskRelationResult
+
+    prompt = RELATION_PROMPT.format(current=current_instruction or "（当前没有正在执行的任务）", new=instruction)
+    try:
+        content = _call_vlm([{"role": "user", "content": prompt}])["content"]
+        data = _extract_json(content)
+    except (VlmError, json.JSONDecodeError) as exc:
+        raise VlmError(f"关系判定失败: {exc}") from exc
+
+    raw_relation = str(data.get("relation", "")).strip().lower()
+    try:
+        relation = TaskRelation(raw_relation)
+    except ValueError:
+        return TaskRelationResult(reason=f"LLM 返回了未知关系：{raw_relation!r}")
+
+    try:
+        confidence = float(data.get("confidence") or 0.0)
+    except (TypeError, ValueError):
+        confidence = 0.5
+
+    return TaskRelationResult(
+        relation=relation,
+        confidence=max(0.0, min(1.0, confidence)),
+        reason=str(data.get("reason") or ""),
+    )

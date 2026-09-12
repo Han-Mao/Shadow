@@ -1,4 +1,8 @@
-"""Observation、AgentState 与执行结果（§3.3 / §3.4）。"""
+"""Observation 与 prompt 摘要。
+
+V2 起 history 归 `storage.trajectory_store.TrajectoryStore` 管理，不再有 AgentState：
+任务状态在 `models.task.Task`，恢复点状态在 `models.checkpoint.Checkpoint`。
+"""
 from __future__ import annotations
 
 from datetime import datetime
@@ -8,10 +12,14 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from .action import Action
-from .task import Task, TaskStatus
 
 
-class StepStatus(str, Enum):
+class StepOutcome(str, Enum):
+    """单次观察 / 执行的结果判定。
+
+    与 `models.task_step.StepStatus` 区分：那个描述「计划步骤走到哪了」。
+    """
+
     OK = "ok"
     ERROR = "error"
     DONE = "done"
@@ -32,14 +40,14 @@ class Observation(BaseModel):
     ui_tree: str | None = None
     action: Action | None = None
     result: dict[str, Any] = Field(default_factory=dict)
-    status: StepStatus = StepStatus.OK
+    status: StepOutcome = StepOutcome.OK
     message: str = ""
     created_at: datetime = Field(default_factory=datetime.now)
 
     def to_prompt_dict(self) -> dict[str, Any]:
         """产出进 prompt 的精简表示。
 
-        mode="json" 让枚举序列化成 "ok" 而不是 StepStatus.OK；result 走白名单裁剪。
+        mode="json" 让枚举序列化成 "ok" 而不是 StepOutcome.OK；result 走白名单裁剪。
         """
         data = self.model_dump(mode="json", include=PROMPT_FIELDS)
         result = self.result or {}
@@ -47,11 +55,6 @@ class Observation(BaseModel):
         return data
 
 
-class AgentState(BaseModel):
-    task: Task
-    history: list[Observation] = Field(default_factory=list)
-    current_step: int = 0
-    retry_count: int = 0
-
-    def compact_history(self, last_n: int = 5) -> list[dict[str, Any]]:
-        return [o.to_prompt_dict() for o in self.history[-last_n:]]
+def compact_observations(history: list[Observation], last_n: int = 5) -> list[dict[str, Any]]:
+    """取最近 N 条观察的精简表示，用于拼 prompt。"""
+    return [o.to_prompt_dict() for o in history[-last_n:]]

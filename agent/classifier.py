@@ -1,0 +1,199 @@
+"""TaskClassifier（V2 §四 / §五）：判断新指令与在跑任务是什么关系。
+
+刻意不做「一次 LLM 定生死」，而是三层融合：
+
+    规则预筛 → 相似度 → LLM 判定 → 融合
+
+理由是单靠 LLM 判关系极不稳定：它容易被措辞带偏，也解释不了「为什么这么判」。
+规则层提供可解释的强证据，相似度层提供客观相关性，LLM 只在两者之上做加权。
+"""
+from __future__ import annotations
+
+import logging
+import re
+from typing import Callable, Iterable
+
+from models.task import Task
+from models.task_relation import TaskRelation, TaskRelationResult
+
+logger = logging.getLogger(__name__)
+
+# 句首出现这些词，几乎可以确定用户是在给当前任务追加子步骤
+SUBTASK_LEADERS = ("先", "先帮我", "先给我", "其中", "顺便", "然后", "接着", "再帮我", "把这个")
+# 出现在句中时只是弱信号（例如「打开设置，先看看网络」）
+SUBTASK_INLINE = ("其中", "顺便", "把这个", "在此基础上")
+
+INTERRUPT_MARKERS = ("马上", "立刻", "立即", "紧急", "现在就要", "赶紧", "停一下", "打断一下", "别管了")
+SUPER_TASK_MARKERS = ("改成", "换成", "不要了", "重来", "重新来", "取消刚才", "我说的不是")
+
+# 融合权重
+LLM_WEIGHT = 0.6
+RULE_WEIGHT = 0.3
+SIMILARITY_WEIGHT = 0.1
+
+RULE_LEADER_SCORE = 0.75
+RULE_INLINE_SCORE = 0.45
+RULE_MARKER_SCORE = 0.8
+
+# 低于这个分就不采信规则结论，退化为「无关任务」
+RULE_MIN_SCORE = 0.4
+# 与已有任务相似到这个程度就判定重复，不再重复执行
+DUPLICATE_SIMILARITY = 0.85
+
+# 这些关系要求两句话确实相关：subtask 是「当前任务的一部分」，
+# 但「先帮我打开微信发消息」对「淘宝搜索运动鞋」也会因为「先」命中规则——
+# 两者毫无交集，这时必须由相似度否决，否则会把无关任务塞进当前计划。
+RELATION_NEEDS_AFFINITY = frozenset({TaskRelation.SUBTASK, TaskRelation.DUPLICATE})
+AFFINITY_FLOOR = 0.08
+
+LLMJudge = Callable[[str, str], TaskRelationResult]
+
+
+def _tokens(text: str) -> set[str]:
+    """中英混合分词：英文按单词，中文按二元组（免分词器依赖，对短指令够用）。"""
+    lowered = (text or "").lower()
+    words = set(re.findall(r"[a-z0-9]+", lowered))
+    cjk = "".join(re.findall(r"[\u4e00-\u9fff]", lowered))
+    bigrams = {cjk[i : i + 2] for i in range(len(cjk) - 1)}
+    return words | bigrams
+
+
+def instruction_similarity(left: str, right: str) -> float:
+    """Jaccard 相似度。0 表示毫无重叠。"""
+    a, b = _tokens(left), _tokens(right)
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+class TaskClassifier:
+    def __init__(self, llm_judge: LLMJudge | None = None) -> None:
+        # 无 LLM 时纯规则运行：本地开发和 CI 都不需要 API Key
+        self._llm_judge = llm_judge
+
+    def classify(
+        self,
+        instruction: str,
+        *,
+        current: Task | None = None,
+        candidates: Iterable[Task] = (),
+    ) -> TaskRelationResult:
+        text = (instruction or "").strip()
+        if not text:
+            return TaskRelationResult(reason="指令为空")
+
+        signals: dict[str, float] = {}
+
+        # ---- 1. 与已有任务重复？ ----
+        for task in candidates:
+            similarity = instruction_similarity(text, task.instruction)
+            if similarity >= DUPLICATE_SIMILARITY:
+                signals["duplicate_similarity"] = round(similarity, 3)
+                return TaskRelationResult(
+                    relation=TaskRelation.DUPLICATE,
+                    confidence=min(0.95, 0.5 + similarity / 2),
+                    reason=f"与任务 {task.id} 的指令高度相似（{similarity:.2f}），不重复执行",
+                    affected_task_id=task.id,
+                    signals=signals,
+                )
+
+        # ---- 2. 规则层 ----
+        rule_scores = self._rule_scores(text)
+        signals.update({f"rule.{k.value}": round(v, 3) for k, v in rule_scores.items()})
+        best_relation, best_rule_score = max(rule_scores.items(), key=lambda item: item[1])
+
+        # ---- 3. 相似度层 ----
+        similarity = instruction_similarity(text, current.instruction) if current else 0.0
+        signals["similarity"] = round(similarity, 3)
+
+        # ---- 4. LLM 层 ----
+        llm_result: TaskRelationResult | None = None
+        if self._llm_judge is not None and current is not None:
+            try:
+                llm_result = self._llm_judge(text, current.instruction)
+                signals[f"llm.{llm_result.relation.value}"] = round(llm_result.confidence, 3)
+            except Exception as exc:  # noqa: BLE001 - LLM 判定失败必须降级到规则层
+                logger.warning("LLM 关系判定失败，回退到规则层: %s", exc)
+                llm_result = None
+
+        # ---- 5. 融合 ----
+        if llm_result is not None:
+            relation = llm_result.relation
+            confidence = (
+                LLM_WEIGHT * llm_result.confidence
+                + RULE_WEIGHT * best_rule_score
+                + SIMILARITY_WEIGHT * similarity
+            )
+            reason = (
+                f"LLM 判定 {llm_result.relation.value}（{llm_result.confidence:.2f}）；"
+                f"规则最高 {best_relation.value}={best_rule_score:.2f}"
+            )
+        elif best_rule_score < RULE_MIN_SCORE:
+            return TaskRelationResult(
+                relation=TaskRelation.UNRELATED,
+                confidence=round(1 - best_rule_score, 3),
+                reason="规则层无强信号，判定为独立新任务",
+                signals=signals,
+            )
+        else:
+            # 无 LLM 时把「规则 + 相似度」重新归一化到 1.0 权重，保持阈值含义一致
+            total_weight = RULE_WEIGHT + SIMILARITY_WEIGHT
+            relation = best_relation
+            confidence = (
+                RULE_WEIGHT * best_rule_score + SIMILARITY_WEIGHT * similarity
+            ) / total_weight
+            reason = f"规则命中 {best_relation.value}（{best_rule_score:.2f}），指令相似度 {similarity:.2f}"
+
+        # ---- 6. 相似度否决 ----
+        if relation in RELATION_NEEDS_AFFINITY and current is not None and similarity < AFFINITY_FLOOR:
+            signals["affinity_veto"] = round(similarity, 3)
+            return TaskRelationResult(
+                relation=TaskRelation.UNRELATED,
+                confidence=round(min(0.85, 0.5 + best_rule_score * 0.3), 3),
+                reason=(
+                    f"倾向判为 {relation.value}，但与当前任务几乎没有共同点"
+                    f"（相似度 {similarity:.2f}），按独立任务处理"
+                ),
+                signals=signals,
+            )
+
+        return TaskRelationResult(
+            relation=relation,
+            confidence=round(min(0.9, confidence), 3),
+            reason=reason,
+            affected_task_id=current.id if current else None,
+            signals=signals,
+        )
+
+    # ---- 规则打分 ----
+
+    @staticmethod
+    def _rule_scores(instruction: str) -> dict[TaskRelation, float]:
+        text = instruction.strip()
+        scores = {
+            TaskRelation.SUBTASK: 0.0,
+            TaskRelation.INTERRUPT: 0.0,
+            TaskRelation.SUPER_TASK: 0.0,
+        }
+
+        for leader in SUBTASK_LEADERS:
+            if text.startswith(leader):
+                scores[TaskRelation.SUBTASK] = max(scores[TaskRelation.SUBTASK], RULE_LEADER_SCORE)
+                break
+        else:
+            for marker in SUBTASK_INLINE:
+                if marker in text:
+                    scores[TaskRelation.SUBTASK] = max(scores[TaskRelation.SUBTASK], RULE_INLINE_SCORE)
+                    break
+
+        for marker in INTERRUPT_MARKERS:
+            if marker in text:
+                scores[TaskRelation.INTERRUPT] = max(scores[TaskRelation.INTERRUPT], RULE_MARKER_SCORE)
+                break
+
+        for marker in SUPER_TASK_MARKERS:
+            if marker in text:
+                scores[TaskRelation.SUPER_TASK] = max(scores[TaskRelation.SUPER_TASK], RULE_MARKER_SCORE)
+                break
+
+        return scores
