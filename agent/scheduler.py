@@ -24,8 +24,21 @@ from models.task import (
     TaskStatus,
     priority_rank,
 )
+from storage.event_log import EventLog, PREEMPT_REQUESTED, QUEUED, RECOVERED, RESUMED, SUSPENDED
 
 logger = logging.getLogger(__name__)
+
+# 抢占延迟的**告警阈值**（秒），不是硬性上限。
+#
+# 为什么做不到硬性上限：协作式抢占靠 runtime 在循环安全点自己让出，
+# 而安全点之间的间隔取决于单条 ADB 命令何时返回（一次 uiautomator dump 就可能几百毫秒）。
+# 命令已经在设备上跑起来了，Python 侧没有安全的方式把它掐断——
+# 强行杀掉 adb 子进程会留下半截状态，比多等一会儿更糟。
+#
+# 所以这里做的是「可观测 + 告警」：把每次抢占的真实延迟记录下来，
+# 超过阈值就打 warning，让「高优任务被长命令堵住」这件事能被看见，
+# 而不是假装它不存在。真正的有界延迟要靠给 ADB 调用加命令级超时来解决。
+MAX_PREEMPTION_LATENCY_SECONDS = 2.0
 
 
 class RuntimeLike(Protocol):
@@ -42,11 +55,13 @@ class TaskScheduler:
         *,
         task_store: Any | None = None,
         idle_poll_seconds: float = 0.2,
+        event_log: EventLog | None = None,
     ) -> None:
         self._runtime = runtime
         self._session = session
         self._task_store = task_store
         self._idle_poll = idle_poll_seconds
+        self._event_log = event_log
 
         self._cond = threading.Condition(threading.RLock())
         self._ready: list[tuple[int, float, int, Task]] = []
@@ -60,6 +75,11 @@ class TaskScheduler:
         self._counter = itertools.count()
         self._stopping = False
         self._worker: threading.Thread | None = None
+
+        # 抢占延迟观测（V2.1 §十四）。见 MAX_PREEMPTION_LATENCY_SECONDS 的注释：
+        # 我们无法打断已经在飞行的单条 ADB 命令，只能**度量**并暴露真实的让出耗时。
+        self._preempt_request_at: dict[str, float] = {}
+        self._last_preemption_latency: float | None = None
 
     # ---- 生命周期 ----
 
@@ -109,19 +129,24 @@ class TaskScheduler:
                     # 用户主动暂停的：重启后保持暂停，不替他做决定
                     self._paused[task.id] = task
                     restored["paused"] += 1
+                    restored_as = "paused"
                 elif task.status is TaskStatus.PAUSED:
                     # 被抢占挂起的：自动恢复，但仍要排在抢占者之后（_pop_next 会做优先级比较）
                     self._suspended.append(task)
                     restored["resuming"] += 1
+                    restored_as = "resuming"
                 else:
                     # created / queued / running / waiting
                     # running 说明上次是进程被杀、动作已中断 —— 交给 Checkpoint 校验后重跑；
                     # waiting 说明在等人工确认，重启后重新决策一次比沿用旧确认更安全
+                    previous = task.status.value
                     task.mark(TaskStatus.QUEUED)
                     self._push_ready(task)
                     restored["queued"] += 1
+                    restored_as = f"queued(from {previous})"
 
                 self._persist(task)
+                self._emit(task.id, RECOVERED, restored_as=restored_as)
 
             self._cond.notify_all()
 
@@ -136,10 +161,15 @@ class TaskScheduler:
 
     # ---- 提交与状态变更 ----
 
+    def _emit(self, task_id: str, kind: str, **data) -> None:
+        if self._event_log is not None:
+            self._event_log.emit(task_id, kind, **data)
+
     def submit(self, task: Task, *, allow_preempt: bool = True) -> Task:
         """把任务放进就绪队列；若正在跑的任务优先级更低且可打断，则请求抢占。"""
         task.mark(TaskStatus.QUEUED)
         self._persist(task)
+        self._emit(task.id, QUEUED, priority=task.priority.value)
 
         with self._cond:
             self._push_ready(task)
@@ -169,6 +199,7 @@ class TaskScheduler:
             self._suspended = [t for t in self._suspended if t.id != task_id]
             task.mark(TaskStatus.PAUSED, paused_reason=PAUSED_BY_USER)
         self._persist(task)
+        self._emit(task_id, SUSPENDED, reason=PAUSED_BY_USER)
         return True
 
     def resume(self, task_id: str) -> bool:
@@ -183,6 +214,7 @@ class TaskScheduler:
             self._push_ready(task)
             self._cond.notify_all()
         self._persist(task)
+        self._emit(task_id, RESUMED)
         return True
 
     def cancel(self, task_id: str) -> bool:
@@ -233,6 +265,8 @@ class TaskScheduler:
                 "suspended": [t.id for t in self._suspended],
                 "completed": list(self._completed[-20:]),
                 "device": self._session.snapshot(),
+                # 抢占延迟可观测（V2.1 §十四）：见 MAX_PREEMPTION_LATENCY_SECONDS 的说明
+                "last_preemption_latency_seconds": self._last_preemption_latency,
             }
 
     def get(self, task_id: str) -> Task | None:
@@ -273,7 +307,18 @@ class TaskScheduler:
         if priority_rank(pending.priority) <= priority_rank(running.priority):
             return False
 
-        return self._session.request_preempt(by_task_id)
+        granted = self._session.request_preempt(by_task_id)
+        if granted:
+            # 记下「请求让出」的时刻（V2.1 §十四），任务真正挂起时再算延迟
+            self._preempt_request_at[running.id] = time.monotonic()
+            self._emit(
+                running.id,
+                PREEMPT_REQUESTED,
+                by_task_id=by_task_id,
+                by_priority=pending.priority.value,
+                running_priority=running.priority.value,
+            )
+        return granted
 
     def _persist(self, task: Task) -> None:
         if self._task_store is not None:
@@ -389,6 +434,7 @@ class TaskScheduler:
             task.mark(TaskStatus.PAUSED, paused_reason=PAUSED_BY_PREEMPTION)
             with self._cond:
                 self._suspended.append(task)
+            self._record_preemption_latency(task.id)
             logger.info("任务 %s 已挂起（让出设备），等待恢复", task.id)
         elif name == "awaiting_confirmation":
             # 等人工确认：既不算完成也不算失败，**不能**放进任何队列——
@@ -402,3 +448,19 @@ class TaskScheduler:
             with self._cond:
                 self._completed.append(task.id)
         self._persist(task)
+
+    def _record_preemption_latency(self, task_id: str) -> None:
+        """结算一次抢占的真实延迟：从「请求让出」到「真的挂起」（V2.1 §十四）。"""
+        requested_at = self._preempt_request_at.pop(task_id, None)
+        if requested_at is None:
+            return  # 这次挂起不是抢占引起的（用户暂停），不计入抢占延迟
+        latency = time.monotonic() - requested_at
+        self._last_preemption_latency = round(latency, 3)
+        if latency > MAX_PREEMPTION_LATENCY_SECONDS:
+            logger.warning(
+                "任务 %s 抢占延迟 %.2fs，超过阈值 %.1fs——"
+                "通常是单条 ADB 命令耗时过长，高优任务被堵在命令返回上",
+                task_id,
+                latency,
+                MAX_PREEMPTION_LATENCY_SECONDS,
+            )

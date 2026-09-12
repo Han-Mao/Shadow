@@ -4,12 +4,15 @@
 接口刻意做成窄方法集，后续要换 SQLite / PostgreSQL / Redis 只需替换实现类。
 """
 from .checkpoint_store import CheckpointStore, RestoreVerdict
+from .event_log import Event, EventLog
 from .json_store import JsonStore
 from .task_store import TaskStore
 from .trajectory_store import TrajectoryStore
 
 __all__ = [
     "CheckpointStore",
+    "Event",
+    "EventLog",
     "JsonStore",
     "RestoreVerdict",
     "TaskStore",

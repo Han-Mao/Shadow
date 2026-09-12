@@ -10,8 +10,9 @@
 from __future__ import annotations
 
 import logging
+import math
 import re
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Sequence
 
 from models.task import Task
 from models.task_relation import TaskRelation, TaskRelationResult
@@ -48,6 +49,21 @@ AFFINITY_FLOOR = 0.08
 
 LLMJudge = Callable[[str, str], TaskRelationResult]
 
+Embedder = Callable[[str], Sequence[float]]
+"""把一句话变成向量。注入后启用语义相似度；不注入就纯 Jaccard（离线可跑，零依赖）。"""
+
+
+def cosine_similarity(left: Sequence[float], right: Sequence[float]) -> float:
+    """余弦相似度。维度不一致或零向量时返回 0，不抛异常——相似度只是信号之一。"""
+    if not left or not right or len(left) != len(right):
+        return 0.0
+    dot = sum(a * b for a, b in zip(left, right))
+    norm_l = math.sqrt(sum(a * a for a in left))
+    norm_r = math.sqrt(sum(b * b for b in right))
+    if norm_l == 0 or norm_r == 0:
+        return 0.0
+    return dot / (norm_l * norm_r)
+
 
 def _tokens(text: str) -> set[str]:
     """中英混合分词：英文按单词，中文按二元组（免分词器依赖，对短指令够用）。"""
@@ -67,9 +83,25 @@ def instruction_similarity(left: str, right: str) -> float:
 
 
 class TaskClassifier:
-    def __init__(self, llm_judge: LLMJudge | None = None) -> None:
+    def __init__(
+        self,
+        llm_judge: LLMJudge | None = None,
+        embedder: Embedder | None = None,
+    ) -> None:
         # 无 LLM 时纯规则运行：本地开发和 CI 都不需要 API Key
         self._llm_judge = llm_judge
+        # 语义相似度是**可选增强**（V2.1 §八）：Jaccard 只认字面重叠，
+        # 「订酒店」和「找住宿」这种同义改写它判为 0；有 embedder 时能补上。
+        self._embedder = embedder
+
+    def _semantic_similarity(self, text: str, other: str) -> float:
+        if self._embedder is None:
+            return 0.0
+        try:
+            return max(0.0, cosine_similarity(self._embedder(text), self._embedder(other)))
+        except Exception as exc:  # noqa: BLE001 - 向量化失败必须降级，不能拖垮注入流程
+            logger.warning("语义相似度计算失败，回退到 Jaccard: %s", exc)
+            return 0.0
 
     def classify(
         self,
@@ -102,9 +134,19 @@ class TaskClassifier:
         signals.update({f"rule.{k.value}": round(v, 3) for k, v in rule_scores.items()})
         best_relation, best_rule_score = max(rule_scores.items(), key=lambda item: item[1])
 
-        # ---- 3. 相似度层 ----
+        # ---- 3. 相似度层：字面 + 语义取较大者 ----
         similarity = instruction_similarity(text, current.instruction) if current else 0.0
         signals["similarity"] = round(similarity, 3)
+
+        semantic = self._semantic_similarity(text, current.instruction) if current else 0.0
+        if self._embedder is not None:
+            signals["semantic_similarity"] = round(semantic, 3)
+
+        # 相关性取两者较大值：Jaccard 认字面重叠，「订酒店」/「找住宿」这类同义改写它判 0；
+        # 语义相似度能补上，但可能把泛泛相关的句子也拉高。任一有证据就算相关，
+        # 两者都证据不足才判无关——所以取 max 而不是取平均。
+        relevance = max(similarity, semantic)
+        signals["relevance"] = round(relevance, 3)
 
         # ---- 4. LLM 层 ----
         llm_result: TaskRelationResult | None = None
@@ -122,7 +164,7 @@ class TaskClassifier:
             confidence = (
                 LLM_WEIGHT * llm_result.confidence
                 + RULE_WEIGHT * best_rule_score
-                + SIMILARITY_WEIGHT * similarity
+                + SIMILARITY_WEIGHT * relevance
             )
             reason = (
                 f"LLM 判定 {llm_result.relation.value}（{llm_result.confidence:.2f}）；"
@@ -140,19 +182,24 @@ class TaskClassifier:
             total_weight = RULE_WEIGHT + SIMILARITY_WEIGHT
             relation = best_relation
             confidence = (
-                RULE_WEIGHT * best_rule_score + SIMILARITY_WEIGHT * similarity
+                RULE_WEIGHT * best_rule_score + SIMILARITY_WEIGHT * relevance
             ) / total_weight
-            reason = f"规则命中 {best_relation.value}（{best_rule_score:.2f}），指令相似度 {similarity:.2f}"
+            reason = (
+                f"规则命中 {best_relation.value}（{best_rule_score:.2f}），"
+                f"相关性 {relevance:.2f}（字面 {similarity:.2f}"
+                + (f" / 语义 {semantic:.2f}" if self._embedder is not None else "")
+                + "）"
+            )
 
         # ---- 6. 相似度否决 ----
-        if relation in RELATION_NEEDS_AFFINITY and current is not None and similarity < AFFINITY_FLOOR:
-            signals["affinity_veto"] = round(similarity, 3)
+        if relation in RELATION_NEEDS_AFFINITY and current is not None and relevance < AFFINITY_FLOOR:
+            signals["affinity_veto"] = round(relevance, 3)
             return TaskRelationResult(
                 relation=TaskRelation.UNRELATED,
                 confidence=round(min(0.85, 0.5 + best_rule_score * 0.3), 3),
                 reason=(
                     f"倾向判为 {relation.value}，但与当前任务几乎没有共同点"
-                    f"（相似度 {similarity:.2f}），按独立任务处理"
+                    f"（相关性 {relevance:.2f}），按独立任务处理"
                 ),
                 signals=signals,
             )

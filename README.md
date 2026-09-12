@@ -62,8 +62,9 @@ VLM 决定「下一步点哪里」，调度与检查点决定「多件事怎么�
 │   ├── action.py           # Action + 风险等级（策略下限）+ 指纹 + 动作效果状态
 │   ├── budget.py           # TaskBudget：三独立预算（动作步数 / 观察 / 模型调用）
 │   ├── retry.py            # ErrorClass + RetryPolicy：错误分类与重试的唯一真相源
+│   ├── verification.py     # ActionDispatch / ActionEffect / GoalVerification 三概念
 │   └── state.py            # Observation / StepOutcome
-├── storage/                # TaskStore / CheckpointStore / TrajectoryStore
+├── storage/                # TaskStore / CheckpointStore / TrajectoryStore / EventLog
 ├── device/
 │   ├── adb.py screenshot.py accessibility.py emulator.py
 │   ├── session.py          # DeviceSession：设备所有权与抢占交接
@@ -128,8 +129,12 @@ python scripts/demo_preemption.py
 ### 3. 每一步都有据可查
 
 - `TaskStep` 记录每个计划步骤的状态、重试次数、最后一次动作与错误
-- `Checkpoint` 保存「恢复所需的最小状态」（当前页、package/activity、最近轨迹）
+- `Checkpoint` 保存「恢复所需的最小状态」（当前页、package/activity、结构指纹、已用预算、最近轨迹）
 - 每个执行完的步骤都进 `TrajectoryStore`，供下一步决策取上下文
+- 关键事件进 `EventLog`（`GET /tasks/{id}/events`）：抢占、对账、危险动作等待、失败原因
+
+**轨迹与事件日志是两回事，不要合并**：轨迹给「下一步怎么决策」看，所以只留最近几条、会被裁剪；
+事件日志给「事后到底发生了什么」看，所以只追加不裁剪。合成一个必然两头不讨好。
 
 ### 4. 服务重启后自愈
 
@@ -172,8 +177,8 @@ python scripts/demo_preemption.py
 | 5 | §6/§7 SUPER_TASK 真重构 | 注入 `SUPER_TASK` 时改写 `instruction`、+1 版本、清空计划与检查点、升 HIGH 优先级；运行中则请求抢占让出，下一安全点落 Checkpoint 后挂起 | `agent/task_manager.py`、`agent/scheduler.py` |
 | 6 | §10/§11 统一风险门禁 | 新增 `AgentRiskGate`；`resolved_risk()` = `max(策略风险, 模型声明风险)`，**模型只能抬不能降**；`/actions` 危险动作直接 403 需人工确认 | `agent/risk_gate.py`、`models/action.py`、`api/server.py` |
 
-**刻意推迟（需另行确认再动）**：UI 指纹 L3 语义校验、StepAttempt/PlanStep 拆分（§20）、
-事件日志（§19）、多设备 Lease、Replay、目录重构（§24）。
+**刻意推迟（第二轮前）**：UI 指纹 L3 语义校验、StepAttempt/PlanStep 拆分（§20）、
+多设备 Lease、Replay、目录重构（§24）。
 
 ## V2.1 第二轮改造
 
@@ -210,6 +215,40 @@ python scripts/demo_preemption.py
   配置了 VLM 后融合分可达 0.78+，正常并入。这是刻意的——证据不足时不擅自改动用户的计划。
 - **SUPER_TASK 需显式放行**：改写正在执行的任务目标不可逆，
   未带 `allow_disruptive=true` 时返回 `needs_confirmation`，一个字都不会改。
+
+## V2.1 第三轮改造
+
+第二轮解决「语义含糊」，第三轮补**可追溯性与可观测性**——
+出问题时能回答「它到底做过什么、为什么这么做」。
+
+| # | 审核项 | 改动 | 落点 |
+|---|---|---|---|
+| 11 | §21 数据结构补全 | `Task` 加 `plan_version` / `active_step_id` / `relation_meta`；`Checkpoint` 加 `action_attempt_id` / `screen_fingerprint` / `semantic_state` / `budget_used` | `models/task.py`、`models/checkpoint.py` |
+| 12 | §19 验证三概念 | 新增 `models/verification.py`：`ActionDispatch`（发出）/ `ActionEffect`（效果）/ `GoalVerification`（目标）三元组 | `models/verification.py`、`agent/verifier.py`、`runtime.py` |
+| 13 | §8 语义相似度 | `TaskClassifier` 可注入 `embedder`；启用后算 `semantic_similarity`，与 Jaccard 取较大值作为相关性。**不注入时行为不变**（离线零依赖） | `agent/classifier.py` |
+| 14 | §23 事件日志 | 新增 `storage/event_log.py`（每任务一个 JSONL，只追加）+ `GET /tasks/{id}/events` | `storage/event_log.py`、`scheduler.py`、`runtime.py`、`api/server.py` |
+| 15 | §14 抢占延迟 | 记录「请求让出 → 真正挂起」的耗时并暴露到 `/scheduler`，超阈值告警 | `agent/scheduler.py` |
+
+### 三个值得单说的点
+
+**1. 验证拆成三层后，`EFFECT_UNKNOWN` 才真正生效。**
+以前 VLM 说「成功」就一律记 `VERIFIED_SUCCESS`。现在 `UI 树没变 + 动作本该改页面`
+会被判 `EFFECT_UNKNOWN`——之后若进程崩溃，从这个恢复点续跑时会触发对账，
+而不是把一次可能根本没生效的点击当成已完成。
+
+**2. `version` 与 `plan_version` 分开。**
+`version` 是**任务目标**的版本（SUPER_TASK 改写目标才 +1），
+`plan_version` 是**计划**的版本（每次 Re-plan / 插入步骤都 +1）。
+不分开的话，「目标没变、只是重新规划过」无法表达，旧 Checkpoint 只能一律作废。
+
+**3. 抢占延迟是**度量**，不是硬性上限。**
+单条 ADB 命令已经在设备上跑起来时，Python 侧没有安全的方式掐断它——
+强行杀掉 adb 子进程会留下半截设备状态，比多等一会儿更糟。
+所以这里做的是「记录真实延迟 + 超过 `MAX_PREEMPTION_LATENCY_SECONDS`(2s) 打 warning」，
+让「高优任务被长命令堵住」这件事能被看见。真正的有界延迟需要给 ADB 调用加命令级超时。
+
+**仍未做（下一批）**：§20 PlanStep/StepAttempt 拆分、§24 目录重构（此前已确认不改）、
+多设备 Lease、Replay（事件日志已就位，它是 Replay 的前置）。
 
 ## 快速开始
 
@@ -256,7 +295,8 @@ python -m api.server    # 监听 127.0.0.1:8010
 | `POST` | `/tasks/{id}/cancel` | 取消 |
 | `POST` | `/tasks/{id}/inject` | **执行中注入新指令**，由任务关系决定并入/排队/抢占 |
 | `POST` | `/tasks/{id}/confirm` | 危险动作的人工确认 |
-| `GET` | `/tasks/{id}/history` | 执行轨迹 |
+| `GET` | `/tasks/{id}/history` | 执行轨迹（给下一步决策看，会被裁剪） |
+| `GET` | `/tasks/{id}/events` | **审计事件流**（只追加，含抢占/对账/失败原因） |
 | `GET` | `/tasks/{id}/checkpoint` | 最新恢复点 |
 | `GET` | `/tasks/{id}/shots/{n}` | 某一步的截图 |
 | `GET` | `/scheduler` | 调度器状态（running / ready / paused / suspended + 设备归属） |
@@ -300,17 +340,19 @@ pip install -r requirements.txt
 python -m pytest -q
 ```
 
-**173 个用例，全部离线**：不需要 adb、模拟器或 API Key。
+**193 个用例，全部离线**：不需要 adb、模拟器或 API Key。
 
 | 文件 | 覆盖 |
 |---|---|
 | `test_models.py` | 任务状态机、步骤依赖、动作风险（策略下限）/指纹、Checkpoint、预算、版本号 |
 | `test_device.py` | ADB 封装、输入通道（含中文）、设备会话所有权与并发 |
 | `test_vision.py` | UI 树容错、坐标落点、VLM 重试、prompt 构造 |
-| `test_classifier.py` | 三层关系判定、相似度否决、**分关系阈值**、二次确认标记 |
-| `test_scheduler.py` | 优先级、暂停/取消、**抢占与恢复**、组合式中断、**启动恢复**（含审批前重启）、设备占用 |
-| `test_runtime.py` | 闭环执行、异常收敛、死循环、HITL、Checkpoint 恢复、**三预算门控**、**动作对账**（继续/重做）、批准一次性 |
-| `test_api.py` | HTTP 契约、状态码语义、错误脱敏、危险动作拦截、SUPER_TASK 改写与二次确认、**依赖链迁移**、版本门控 |
+| `test_verifier.py` | **验证三概念**：发出 / 效果 / 目标，含「VLM 说成功但页面没变 → 效果存疑」 |
+| `test_event_log.py` | 事件日志：顺序、按任务隔离、limit、截断行容错、写失败不抛异常 |
+| `test_classifier.py` | 三层关系判定、相似度否决、**分关系阈值**、二次确认标记、**语义相似度** |
+| `test_scheduler.py` | 优先级、暂停/取消、**抢占与恢复**、组合式中断、**启动恢复**（含审批前重启）、**抢占延迟观测**、设备占用 |
+| `test_runtime.py` | 闭环执行、异常收敛、死循环、HITL、Checkpoint 恢复、**三预算门控**、**动作对账**（继续/重做）、批准一次性、**事件流** |
+| `test_api.py` | HTTP 契约、状态码语义、错误脱敏、危险动作拦截、SUPER_TASK 改写与二次确认、**依赖链迁移**、版本门控、**/events 审计流** |
 
 ## 注意事项
 

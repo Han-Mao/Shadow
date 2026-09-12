@@ -15,7 +15,7 @@ from models.checkpoint import Checkpoint
 from models.state import Observation, StepOutcome
 from models.task import Task, TaskPriority, TaskStatus
 from models.task_step import StepStatus
-from storage import CheckpointStore, TaskStore, TrajectoryStore
+from storage import CheckpointStore, EventLog, TaskStore, TrajectoryStore
 
 
 def observation(step: int, tmp_path, package: str = "com.android.settings") -> Observation:
@@ -93,7 +93,14 @@ def patch_verifier(monkeypatch, outcome: StepOutcome = StepOutcome.OK, message: 
     )
 
 
-def build(tmp_path, *, session: DeviceSession | None = None, checkpoints=None, trajectory=None):
+def build(
+    tmp_path,
+    *,
+    session: DeviceSession | None = None,
+    checkpoints=None,
+    trajectory=None,
+    event_log=None,
+):
     session = session or DeviceSession(FakeDevice())
     runtime = AgentRuntime(
         session,
@@ -101,6 +108,7 @@ def build(tmp_path, *, session: DeviceSession | None = None, checkpoints=None, t
         trajectory=trajectory if trajectory is not None else TrajectoryStore(),
         checkpoints=checkpoints,
         task_store=None,
+        event_log=event_log,
     )
     return session, runtime
 
@@ -724,6 +732,44 @@ def test_reconcile_retries_action_when_it_never_took_effect(monkeypatch, tmp_pat
     assert len(executed) == 1, "只重做一次，不要无限重试"
     assert executed[0].is_same_as(retried), "重做的必须是恢复点里记录的那个动作"
     assert called["generate"] == 0, "只是重做动作，不需要重新规划"
+
+
+# ---------------------------------------------------------------- V2.1：事件日志（§二十三）
+
+
+def test_runtime_emits_lifecycle_events(monkeypatch, tmp_path):
+    """一次执行会留下完整的事件流：启动 → 动作发出 → 验证 → 完成。
+
+    事件日志与轨迹分开的意义就在这里：轨迹只留最近几步给下一步决策，
+    而事件流能事后回答「它到底做过什么、什么时候做的」。
+    """
+    patch_observe(monkeypatch, tmp_path)
+    patch_planner(
+        monkeypatch,
+        goals=["做事"],
+        decisions=[tap(100, 200), Decision(action=Action(type=ActionType.DONE, reason="完成"))],
+    )
+    patch_verifier(monkeypatch)
+
+    event_log = EventLog(tmp_path / "events")
+    session, runtime = build(tmp_path, event_log=event_log)
+    task = Task(instruction="点一下", budget=TaskBudget(max_action_steps=5))
+    session.acquire(task.id)
+    try:
+        outcome = runtime.run(task)
+    finally:
+        session.release(task.id)
+
+    assert outcome is RunOutcome.DONE
+    kinds = event_log.kinds(task.id)
+    assert kinds[0] == "started"
+    assert "action_dispatched" in kinds
+    assert "action_verified" in kinds
+    assert kinds[-1] == "done"
+
+    dispatched = [e for e in event_log.read(task.id) if e.kind == "action_dispatched"][0]
+    assert dispatched.data["action"] == "tap"
+    assert dispatched.data["attempt_id"], "每次尝试都要有自己的 attempt id"
 
 
 # ---------------------------------------------------------------- V2.1：HITL（§25 scenario 10）

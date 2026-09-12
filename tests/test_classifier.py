@@ -100,6 +100,57 @@ def test_llm_support_makes_interrupt_actionable():
     assert result.requires_second_confirmation
 
 
+def test_semantic_similarity_is_off_by_default():
+    """不注入 embedder 时行为完全不变——离线环境不该依赖任何模型或 Key。"""
+    clf = TaskClassifier()
+    result = clf.classify("先帮我订酒店", current=task("帮我规划东京三日游"))
+
+    assert "semantic_similarity" not in result.signals
+    assert "relevance" in result.signals
+    assert result.signals["relevance"] == result.signals["similarity"]
+
+
+def test_embedder_rescues_synonym_rewording():
+    """同义改写：字面判不出关系，语义相似度能把相关性补上来（V2.1 §八）。
+
+    「订酒店」与「找住宿」字面几乎不重叠（Jaccard 约 0.12），纯规则只到约 0.59，
+    够不到 SUBTASK 的 0.65 门槛；注入 embedder 后相关性接近 1，判定成立。
+    这正是上一轮留下的「无 LLM 时 subtask 并入过严」的补丁。
+    """
+    def embed(text: str) -> list[float]:
+        # 同义词映射到同一维度：住宿/酒店 → 0，机票/航班 → 1，东京/大阪 → 2
+        vec = [0.0, 0.0, 0.0, 0.1]
+        for word, idx in (
+            ("住宿", 0), ("酒店", 0), ("机票", 1), ("航班", 1), ("东京", 2), ("大阪", 2)
+        ):
+            if word in text:
+                vec[idx] += 1.0
+        return vec
+
+    current = task("帮我订酒店")
+    literal_only = TaskClassifier().classify("先帮我找住宿", current=current)
+    with_semantic = TaskClassifier(embedder=embed).classify("先帮我找住宿", current=current)
+
+    assert literal_only.relation is TaskRelation.SUBTASK
+    assert not literal_only.is_actionable, "字面不重叠时够不到门槛"
+
+    assert with_semantic.relation is TaskRelation.SUBTASK
+    assert with_semantic.signals["semantic_similarity"] > 0.9
+    assert with_semantic.is_actionable, "语义相关性把置信度抬过门槛"
+
+
+def test_embedder_failure_degrades_to_literal_similarity():
+    """向量化挂掉不能影响注入流程，必须静默退回字面相似度。"""
+    def broken(text: str) -> list[float]:
+        raise RuntimeError("模型未加载")
+
+    clf = TaskClassifier(embedder=broken)
+    result = clf.classify("先帮我订酒店", current=task("帮我规划东京三日游"))
+
+    assert result.relation is TaskRelation.SUBTASK
+    assert result.signals["relevance"] == result.signals["similarity"]
+
+
 def test_super_task_and_interrupt_are_flagged_for_second_confirmation():
     """会改写/打断在跑任务的关系，必须带二次确认标记；SAFE 关系不打扰用户。"""
     interrupt = TaskRelationResult(relation=TaskRelation.INTERRUPT, confidence=0.9)

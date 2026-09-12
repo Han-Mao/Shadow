@@ -9,7 +9,7 @@ from agent.scheduler import TaskScheduler
 from device.session import DeviceSession
 from fakes import FakeDevice
 from models.task import PAUSED_BY_PREEMPTION, PAUSED_BY_USER, Task, TaskPriority, TaskStatus
-from storage import TaskStore
+from storage import EventLog, TaskStore
 
 
 class DoneRuntime:
@@ -145,8 +145,8 @@ class PreemptionRuntime:
         return RunOutcome.DONE
 
 
-def make_scheduler(runtime, session: DeviceSession) -> TaskScheduler:
-    return TaskScheduler(runtime, session, idle_poll_seconds=0.01)
+def make_scheduler(runtime, session: DeviceSession, *, event_log=None) -> TaskScheduler:
+    return TaskScheduler(runtime, session, idle_poll_seconds=0.01, event_log=event_log)
 
 
 # ---------------------------------------------------------------- 基本调度
@@ -294,6 +294,52 @@ def test_preemption_then_resume():
     assert runtime.order == [task_a.id, task_b.id, task_a.id]
     assert task_a.status is TaskStatus.DONE
     assert task_b.status is TaskStatus.DONE
+
+
+def test_preemption_latency_is_measured_and_exposed(tmp_path):
+    """抢占延迟可观测（V2.1 §十四）。
+
+    刻意**不是**硬性上限：单条 ADB 命令在飞行中无法安全掐断，
+    强行杀掉 adb 子进程会留下半截设备状态，比多等一会儿更糟。
+    所以这里做的是「度量 + 超阈值告警」——让「高优任务被长命令堵住」能被看见，
+    而不是假装它不存在。真正的有界延迟要靠命令级超时。
+    """
+    session = DeviceSession(FakeDevice())
+    runtime = ControlledRuntime(session)
+    event_log = EventLog(tmp_path / "events")
+    scheduler = make_scheduler(runtime, session, event_log=event_log)
+
+    task_a = Task(instruction="A 逛淘宝", priority=TaskPriority.NORMAL)
+    scheduler.submit(task_a, allow_preempt=False)
+    scheduler.start()
+    try:
+        assert runtime.a_started.wait(2.0), "A 应该先跑起来"
+        scheduler.submit(Task(instruction="B 发微信", priority=TaskPriority.HIGH))
+        assert runtime.finished.wait(4.0), "A 应该在 B 完成后被恢复"
+    finally:
+        scheduler.stop()
+
+    assert "preempt_requested" in event_log.kinds(task_a.id), "抢占请求必须留痕"
+    latency = scheduler.snapshot()["last_preemption_latency_seconds"]
+    assert latency is not None, "真正挂起后必须结算出延迟"
+    assert latency >= 0
+
+
+def test_user_pause_is_not_counted_as_preemption_latency(tmp_path):
+    """用户暂停也会让任务挂起，但它不是抢占，不该污染抢占延迟指标。"""
+    scheduler = TaskScheduler(
+        DoneRuntime(), DeviceSession(FakeDevice()), event_log=EventLog(tmp_path / "events")
+    )
+    assert scheduler.snapshot()["last_preemption_latency_seconds"] is None
+
+    scheduler._preempt_request_at["t"] = time.monotonic() - 0.5
+    scheduler._record_preemption_latency("t")
+    measured = scheduler.snapshot()["last_preemption_latency_seconds"]
+    assert measured is not None and measured >= 0.4
+
+    # 另一个任务没记录过「请求让出」时刻 → 这次挂起不是抢占引起的，不应覆盖指标
+    scheduler._record_preemption_latency("another-task")
+    assert scheduler.snapshot()["last_preemption_latency_seconds"] == measured
 
 
 def test_high_priority_does_not_preempt_uninterruptible_task():

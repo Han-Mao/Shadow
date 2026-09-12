@@ -29,7 +29,7 @@ from device.session import DeviceSession
 from models.action import Action, ActionRisk, ActionType, Point
 from models.budget import TaskBudget
 from models.task import TaskPriority, TaskStatus
-from storage import CheckpointStore, TaskStore, TrajectoryStore
+from storage import CheckpointStore, EventLog, TaskStore, TrajectoryStore
 from vision.vlm import VlmError, classify_relation
 
 from agent.risk_gate import ActionRiskGate
@@ -51,6 +51,9 @@ session = DeviceSession(adb, serial=adb.serial)
 task_store = TaskStore(STORAGE_DIR / "tasks")
 checkpoint_store = CheckpointStore(STORAGE_DIR / "checkpoints")
 trajectory = TrajectoryStore()
+# 审计/重放用的事件日志（V2.1 §二十三）。与轨迹分开：轨迹服务下一步决策（会被裁剪），
+# 事件日志服务事后追溯（只追加）
+event_log = EventLog(STORAGE_DIR / "events")
 
 runtime = AgentRuntime(
     session,
@@ -58,8 +61,9 @@ runtime = AgentRuntime(
     trajectory=trajectory,
     checkpoints=checkpoint_store,
     task_store=task_store,
+    event_log=event_log,
 )
-scheduler = TaskScheduler(runtime, session, task_store=task_store)
+scheduler = TaskScheduler(runtime, session, task_store=task_store, event_log=event_log)
 input_provider = build_default_input(adb)
 
 # 没有 API Key 时不接 LLM 判定，Classifier 自动退化为「规则 + 相似度」两层
@@ -360,6 +364,24 @@ def task_history(task_id: str, limit: int = 50):
         raise HTTPException(status_code=404, detail="任务不存在")
     entries = trajectory.history(task_id)
     return {"task_id": task_id, "count": len(entries), "history": [o.model_dump() for o in entries[-limit:]]}
+
+
+@app.get("/tasks/{task_id}/events")
+def task_events(task_id: str, limit: int = 200):
+    """审计事件流（V2.1 §二十三）。
+
+    与 `/history` 的区别：history 是给下一步决策看的观察轨迹（会被裁剪），
+    events 是给事后追溯看的只追加事件流（抢占、对账、失败原因都在里面），
+    也是未来做 Replay 的数据源。
+    """
+    if manager.get(task_id) is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    events = event_log.read(task_id, limit=limit)
+    return {
+        "task_id": task_id,
+        "count": len(events),
+        "events": [event.to_dict() for event in events],
+    }
 
 
 @app.get("/tasks/{task_id}/checkpoint")

@@ -25,6 +25,18 @@ from models.retry import (
 from models.state import Observation, StepOutcome
 from models.task import Task, TaskStatus
 from models.task_step import StepStatus, TaskStep
+from storage.event_log import (
+    ACTION_DISPATCHED,
+    ACTION_VERIFIED,
+    CHECKPOINT_SAVED,
+    DONE,
+    FAILED,
+    RECONCILED,
+    STARTED,
+    SUSPENDED,
+    WAITING,
+    EventLog,
+)
 
 from . import executor, observer, planner, reconciliation, verifier
 from .planner import ReplanContext
@@ -72,6 +84,10 @@ class RuntimeState:
     forced_action: Action | None = None
     """对账判定「上次动作未生效」后要强制重做的动作（跳过一次模型决策）。"""
 
+    attempt_seq: int = 0
+    current_attempt_id: str | None = None
+    """当前动作尝试的唯一 id（V2.1 §二十一）：同一步骤的每次重试都不同。"""
+
     recent_actions: deque[Action] = field(default_factory=lambda: deque(maxlen=LOOP_WINDOW))
     failed_strategies: list[str] = field(default_factory=list)
     denied_fingerprints: set[str] = field(default_factory=set)
@@ -88,12 +104,14 @@ class AgentRuntime:
         trajectory: object | None = None,
         checkpoints: object | None = None,
         task_store: object | None = None,
+        event_log: EventLog | None = None,
     ) -> None:
         self._session = session
         self._artifact_dir = Path(artifact_dir)
         self._trajectory = trajectory
         self._checkpoints = checkpoints
         self._task_store = task_store
+        self._event_log = event_log
         self._states: dict[str, RuntimeState] = {}
 
     # ---- 对外 ----
@@ -108,6 +126,7 @@ class AgentRuntime:
         state = self._state_for(task)
         task.mark(TaskStatus.RUNNING)
         self._persist(task)
+        self._emit(task.id, STARTED, version=task.version, instruction=task.instruction)
 
         checkpoint = self._load_checkpoint(task)
         observation: Observation | None = None
@@ -124,6 +143,7 @@ class AgentRuntime:
             if self._session.should_yield(task.id):
                 self._save_checkpoint(task, state, last_observation)
                 logger.info("任务 %s 让出设备（被抢占），等待稍后恢复", task.id)
+                self._emit(task.id, SUSPENDED, reason="preemption", step=state.execution_step)
                 return RunOutcome.SUSPENDED
             if state.observation_count >= task.budget.max_observations:
                 self._save_checkpoint(task, state, last_observation)
@@ -197,6 +217,13 @@ class AgentRuntime:
                 task.mark(TaskStatus.WAITING)
                 self._persist(task)
                 logger.warning("任务 %s 命中危险动作，等待人工确认：%s", task.id, action.type.value)
+                self._emit(
+                    task.id,
+                    WAITING,
+                    reason="dangerous_action",
+                    action=action.type.value,
+                    risk=action.resolved_risk().value,
+                )
                 return RunOutcome.AWAITING_CONFIRMATION
 
             # ---- Act ----
@@ -206,7 +233,17 @@ class AgentRuntime:
                 return self._fail(task, f"已达动作步数上限 {task.budget.max_action_steps}")
             # 命令已发出（executor 永不抛异常，成功与否看 result），但还没验证页面变化。
             # 这中间若进程崩溃，恢复时就会落入 EFFECT_UNKNOWN（V2.1 §五）。
+            state.attempt_seq += 1
+            state.current_attempt_id = f"{task.id}:a{state.attempt_seq}"
             state.last_action_effect = ActionEffectStatus.DISPATCHED
+            self._emit(
+                task.id,
+                ACTION_DISPATCHED,
+                attempt_id=state.current_attempt_id,
+                action=action.type.value,
+                risk=action.resolved_risk().value,
+                step=state.execution_step,
+            )
             result = self._execute(task, action, observation)
             if state.approved_dangerous:
                 state.approved_dangerous = False
@@ -215,15 +252,27 @@ class AgentRuntime:
             # ---- Verify ----
             post, verification = self._verify(task, state, observation, action, result)
             self._append_trajectory(task, post)
+            self._emit(
+                task.id,
+                ACTION_VERIFIED,
+                attempt_id=state.current_attempt_id,
+                outcome=verification.outcome.value,
+                dispatch=verification.dispatch.status.value,
+                effect=verification.effect.status.value,
+                goal_achieved=verification.goal.achieved,
+            )
+
+            # 效果由验证层判定（V2.1 §十九），Runtime 不再自己拍脑袋。
+            # 关键差异：VLM 说「成功」但 UI 树没变时，这里落的是 EFFECT_UNKNOWN 而不是
+            # VERIFIED_SUCCESS——下一轮若崩溃，恢复时会走对账而不是盲目续跑。
+            state.last_action_effect = verification.effect.status
 
             if verification.outcome is StepOutcome.DONE:
-                state.last_action_effect = ActionEffectStatus.VERIFIED_SUCCESS
                 self._close_step(task, step)
                 self._finish(task, state, post, action)
                 return RunOutcome.DONE
 
             if verification.outcome is StepOutcome.OK:
-                state.last_action_effect = ActionEffectStatus.VERIFIED_SUCCESS
                 if decision.step_done:
                     self._close_step(task, step, action)
                 state.retry_count = 0
@@ -232,7 +281,6 @@ class AgentRuntime:
                 continue
 
             # ---- ERROR：先分类，再由策略决定重试 / 换策略 / 找人 / 放弃 ----
-            state.last_action_effect = ActionEffectStatus.VERIFIED_FAILED
             state.failed_strategies.append(self._describe_action(action))
             if step is not None:
                 step.record_failure(verification.message)
@@ -276,6 +324,10 @@ class AgentRuntime:
     def forget(self, task_id: str) -> None:
         self._states.pop(task_id, None)
 
+    def _emit(self, task_id: str, kind: str, **data) -> None:
+        if self._event_log is not None:
+            self._event_log.emit(task_id, kind, **data)
+
     # ---- 阶段 ----
 
     def _state_for(self, task: Task) -> RuntimeState:
@@ -308,6 +360,13 @@ class AgentRuntime:
                 settled = reconciliation.reconcile(checkpoint, observation)
                 logger.warning(
                     "任务 %s 对账结果 %s：%s", task.id, settled.action.value, settled.reason
+                )
+                self._emit(
+                    task.id,
+                    RECONCILED,
+                    verdict=settled.action.value,
+                    reason=settled.reason,
+                    attempt_id=checkpoint.action_attempt_id,
                 )
                 if settled.action is reconciliation.ReconcileAction.CONTINUE:
                     state.last_action_effect = ActionEffectStatus.VERIFIED_SUCCESS
@@ -465,6 +524,7 @@ class AgentRuntime:
         task.mark(TaskStatus.DONE)
         self._persist(task)
         logger.info("任务 %s 完成：%s", task.id, action.reason or "模型判定已完成")
+        self._emit(task.id, DONE, steps=state.execution_step, reason=action.reason)
 
     def _fail(self, task: Task, reason: str) -> RunOutcome:
         """统一的失败收口：**必须同时改任务状态**。
@@ -475,6 +535,7 @@ class AgentRuntime:
         logger.warning("任务 %s 判定失败：%s", task.id, reason)
         task.mark(TaskStatus.FAILED)
         self._persist(task)
+        self._emit(task.id, FAILED, reason=reason)
         return RunOutcome.FAILED
 
     # ---- 失败结算（V2.1 §十二 / §十三）----
@@ -562,9 +623,36 @@ class AgentRuntime:
             task_version=task.version,
             action_effect=state.last_action_effect,
             last_action=action,
+            action_attempt_id=state.current_attempt_id,
+            semantic_state=self._semantic_state(observation, task),
+            budget_used={
+                "action_steps": state.execution_step,
+                "observations": state.observation_count,
+                "model_calls": state.model_call_count,
+            },
         )
         self._checkpoints.save(checkpoint)
         task.checkpoint_id = checkpoint.id
+        self._emit(
+            task.id,
+            CHECKPOINT_SAVED,
+            checkpoint_id=checkpoint.id,
+            effect=checkpoint.action_effect.value,
+            budget_used=checkpoint.budget_used,
+        )
+
+    @staticmethod
+    def _semantic_state(observation: Observation | None, task: Task) -> str:
+        """恢复点上的「当前在干什么」摘要。
+
+        刻意只取廉价信号（页面 + 聚焦步骤），不调 VLM——
+        恢复点每一步都要写，用模型既贵又会让写盘变成网络调用。
+        """
+        if observation is None:
+            return ""
+        page = f"{observation.package}/{observation.activity}".strip("/")
+        step = f" · 步骤 {task.active_step_id}" if task.active_step_id else ""
+        return f"{page}{step}"
 
     def _append_trajectory(self, task: Task, observation: Observation) -> None:
         if self._trajectory is not None:

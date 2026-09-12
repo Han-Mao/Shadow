@@ -81,6 +81,21 @@ class Task(BaseModel):
 
     plan: list[TaskStep] = Field(default_factory=list)
 
+    # 计划版本（V2.1 §二十一）。与 version 的区别：
+    #   version      = **任务目标**的版本（SUPER_TASK 改写目标才 +1）
+    #   plan_version = **计划**的版本（每次重建/插入步骤都 +1）
+    # 分开之后，「目标没变但计划被 Re-plan 过」这件事才有办法表达——
+    # 否则旧 Checkpoint 只能一律作废，连「页面没变、计划也没变」的安全续跑都要放弃。
+    plan_version: int = 0
+
+    # 当前聚焦的步骤（V2.1 §二十一）。由 next_pending_step 选出谁就记谁，
+    # 便于 API / 日志直接回答「现在在干哪一步」，不用再从 plan 里推算一遍。
+    active_step_id: str | None = None
+
+    # 关系判定元数据（V2.1 §二十一）：这个任务是被判成什么关系才产生的。
+    # 出问题时能回溯「它为什么会被并进来 / 为什么会抢占别人」。
+    relation_meta: dict[str, object] = Field(default_factory=dict)
+
     # 最近一次 Checkpoint，用于暂停后恢复
     checkpoint_id: str | None = None
 
@@ -121,8 +136,10 @@ class Task(BaseModel):
     # ---- 步骤 ----
 
     def set_plan(self, goals: list[str]) -> None:
-        """用语义级目标重建计划。"""
+        """用语义级目标重建计划。计划一变，plan_version 就 +1。"""
         self.plan = build_steps(goals)
+        self.plan_version += 1
+        self.active_step_id = None
         self.sync_current_step()
         self.updated_at = datetime.now()
 
@@ -136,13 +153,18 @@ class Task(BaseModel):
         return None
 
     def next_pending_step(self) -> TaskStep | None:
-        """下一个可执行的步骤。依赖未完成的步骤不会被选中。"""
+        """下一个可执行的步骤。依赖未完成的步骤不会被选中。
+
+        顺带把 active_step_id 更新为选中的步骤（V2.1 §二十一）。
+        """
         done_ids = {s.id for s in self.plan if s.status in {StepStatus.DONE, StepStatus.SKIPPED}}
         for step in self.plan:
             if step.status is not StepStatus.PENDING:
                 continue
             if all(dep in done_ids for dep in step.depends_on):
+                self.active_step_id = step.id
                 return step
+        self.active_step_id = None
         return None
 
     def sync_current_step(self) -> None:

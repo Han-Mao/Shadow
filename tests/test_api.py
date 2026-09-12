@@ -15,7 +15,7 @@ from models.state import Observation
 from models.task import PAUSED_BY_PREEMPTION, PAUSED_BY_USER, Task, TaskStatus
 from models.task_relation import TaskRelation, TaskRelationResult
 from models.task_step import StepStatus
-from storage import CheckpointStore, TaskStore, TrajectoryStore
+from storage import CheckpointStore, EventLog, TaskStore, TrajectoryStore
 
 
 @pytest.fixture
@@ -30,20 +30,26 @@ def api(tmp_path, monkeypatch):
     checkpoint_store = CheckpointStore(tmp_path / "checkpoints")
     trajectory = TrajectoryStore()
 
+    event_log = EventLog(tmp_path / "events")
+
     runtime = AgentRuntime(
         session,
         artifact_dir=tmp_path,
         trajectory=trajectory,
         checkpoints=checkpoint_store,
         task_store=task_store,
+        event_log=event_log,
     )
-    scheduler = TaskScheduler(runtime, session, task_store=task_store, idle_poll_seconds=0.01)
+    scheduler = TaskScheduler(
+        runtime, session, task_store=task_store, idle_poll_seconds=0.01, event_log=event_log
+    )
     manager = TaskManager(store=task_store, scheduler=scheduler, classifier=TaskClassifier())
 
     monkeypatch.setattr(server, "session", session)
     monkeypatch.setattr(server, "task_store", task_store)
     monkeypatch.setattr(server, "checkpoint_store", checkpoint_store)
     monkeypatch.setattr(server, "trajectory", trajectory)
+    monkeypatch.setattr(server, "event_log", event_log)
     monkeypatch.setattr(server, "runtime", runtime)
     monkeypatch.setattr(server, "scheduler", scheduler)
     monkeypatch.setattr(server, "manager", manager)
@@ -290,6 +296,33 @@ def test_inject_subtask_below_threshold_does_not_touch_running_plan(api):
         assert "先帮我查东京酒店" not in goals, "证据不足时不该动用户的计划"
     finally:
         session.release("__manual__")
+
+
+def test_events_endpoint_returns_audit_stream(api):
+    """/events 返回只追加的审计事件流（V2.1 §二十三）。
+
+    与 /history 的区别：history 是给下一步决策看的观察轨迹（会被裁剪），
+    events 是给事后追溯看的事件流（抢占、对账、失败原因都在里面）。
+    """
+    client, _, session, *_ = api
+    session.acquire("__manual__")  # 占住设备，任务停在队列里，避免后台线程干扰断言
+    try:
+        created = client.post("/tasks", json={"instruction": "打开设置"}).json()
+
+        resp = client.get(f"/tasks/{created['id']}/events")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["task_id"] == created["id"]
+        assert body["count"] >= 1
+        kinds = [e["kind"] for e in body["events"]]
+        assert "queued" in kinds
+    finally:
+        session.release("__manual__")
+
+
+def test_events_endpoint_404_for_unknown_task(api):
+    client, *_ = api
+    assert client.get("/tasks/does-not-exist/events").status_code == 404
 
 
 def test_inject_unrelated_spawns_new_task(api):

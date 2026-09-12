@@ -79,6 +79,7 @@ class TaskManager:
         priority: TaskPriority = TaskPriority.NORMAL,
         parent_task_id: str | None = None,
         submit: bool = True,
+        relation_meta: dict | None = None,
     ) -> Task:
         task = Task(
             instruction=instruction,
@@ -87,6 +88,7 @@ class TaskManager:
             priority=priority,
             parent_task_id=parent_task_id,
             root_task_id=parent_task_id,
+            relation_meta=dict(relation_meta or {}),
         )
         task.mark(TaskStatus.CREATED)
         self._store.save(task)
@@ -230,6 +232,14 @@ class TaskManager:
             budget=TaskBudget(max_action_steps=max_steps),
             priority=new_priority,
             parent_task_id=current.id if relation.relation is TaskRelation.SUBTASK else None,
+            # 记下「它是被判成什么关系才产生的」，事后能回溯为什么它抢占了别人
+            relation_meta={
+                "relation": relation.relation.value,
+                "confidence": relation.confidence,
+                "reason": relation.reason,
+                "signals": relation.signals,
+                "against_task_id": current.id if current else None,
+            },
         )
 
         preempted = (

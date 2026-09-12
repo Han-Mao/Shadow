@@ -83,7 +83,9 @@ def reconcile(checkpoint: Checkpoint, observation: Observation) -> ReconcileVerd
             f"页面已从 {checkpoint.package} 切到 {observation.package}，重新规划",
         )
 
-    before = ui_fingerprint(checkpoint.ui_snapshot)
+    # 优先用恢复点存好的结构指纹，省掉把几万字符的 XML 再解析一遍；
+    # 老恢复点没有这个字段时才回退到从 ui_snapshot 现算。
+    before = checkpoint.screen_fingerprint or ui_fingerprint(checkpoint.ui_snapshot)
     after = ui_fingerprint(observation.ui_tree)
 
     if not before or not after:

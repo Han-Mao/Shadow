@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 from .action import Action, ActionEffectStatus
 from .state import Observation
 from .task_step import StepStatus
+from vision.fingerprint import ui_fingerprint
 
 # UI 树快照只用于「页面是否还是当初那一屏」的比对，没必要留全量
 UI_SNAPSHOT_LIMIT = 20_000
@@ -46,6 +47,20 @@ class Checkpoint(BaseModel):
     action_effect: ActionEffectStatus = ActionEffectStatus.NOT_STARTED
     last_action: Action | None = None
 
+    # 本次动作的唯一尝试 id（V2.1 §二十一）：同一步骤的每次重试各有自己的 attempt，
+    # 对账时能精确知道「恢复的是哪一次尝试」，而不是笼统的「第几步」。
+    action_attempt_id: str | None = None
+
+    # L2 结构指纹（V2.1 §四）：存指纹而不是整棵 UI 树——
+    # 省空间，而且恢复时可以直接比对，不必再把几万字符的 XML 解析一遍。
+    screen_fingerprint: str = ""
+
+    # 语义状态摘要（V2.1 §二十一）：当前页大致在做什么，恢复时快速重建上下文。
+    semantic_state: str = ""
+
+    # 已消耗预算快照（V2.1 §二十一）：恢复后才知道还剩多少动作 / 观察 / 模型调用。
+    budget_used: dict[str, int] = Field(default_factory=dict)
+
     created_at: datetime = Field(default_factory=datetime.now)
 
     @classmethod
@@ -60,11 +75,16 @@ class Checkpoint(BaseModel):
         task_version: int = 1,
         action_effect: ActionEffectStatus = ActionEffectStatus.NOT_STARTED,
         last_action: Action | None = None,
+        action_attempt_id: str | None = None,
+        semantic_state: str = "",
+        budget_used: dict[str, int] | None = None,
     ) -> "Checkpoint":
         """从一次观察中提取恢复所需的最小状态。"""
         snapshot = None
+        fingerprint = ""
         if observation is not None and observation.ui_tree:
             snapshot = observation.ui_tree[:UI_SNAPSHOT_LIMIT]
+            fingerprint = ui_fingerprint(observation.ui_tree)
 
         return cls(
             id=new_checkpoint_id(task_id, step),
@@ -79,6 +99,10 @@ class Checkpoint(BaseModel):
             history_tail=list(history_tail or [])[-HISTORY_TAIL_SIZE:],
             action_effect=action_effect,
             last_action=last_action,
+            action_attempt_id=action_attempt_id,
+            screen_fingerprint=fingerprint,
+            semantic_state=semantic_state,
+            budget_used=dict(budget_used or {}),
         )
 
     def same_screen_as(self, observation: Observation) -> bool:
@@ -104,5 +128,8 @@ class Checkpoint(BaseModel):
             "package": self.package,
             "activity": self.activity,
             "step_states": {k: v.value for k, v in self.step_states.items()},
+            "action_effect": self.action_effect.value,
+            "screen_fingerprint": self.screen_fingerprint[:12],
+            "budget_used": dict(self.budget_used),
             "created_at": self.created_at.isoformat(),
         }
