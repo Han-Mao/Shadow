@@ -14,6 +14,7 @@ from datetime import datetime
 from enum import Enum
 
 from models.budget import TaskBudget
+from models.retry import DEFAULT_POLICY
 from models.task import Task, TaskPriority, TaskStatus, priority_rank
 from models.task_relation import TaskRelation, TaskRelationResult
 from models.task_step import StepStatus, TaskStep
@@ -30,6 +31,8 @@ class InjectAction(str, Enum):
     SUPERSEDED = "superseded"
     """SUPER_TASK：新指令是父任务，重构了当前任务的目标（不另起任务）。"""
     DUPLICATE_IGNORED = "duplicate_ignored"
+    NEEDS_CONFIRMATION = "needs_confirmation"
+    """判定置信度达标，但该关系会改写/打断在跑任务，需调用方显式放行后才生效。"""
 
 
 class InjectResult:
@@ -55,6 +58,7 @@ class InjectResult:
             "action": self.action.value,
             "task_id": self.task.id if self.task else None,
             "message": self.message,
+            "requires_confirmation": self.action is InjectAction.NEEDS_CONFIRMATION,
         }
 
 
@@ -141,8 +145,14 @@ class TaskManager:
         current_task_id: str | None = None,
         priority: TaskPriority | None = None,
         max_steps: int = 10,
+        allow_disruptive: bool = False,
     ) -> InjectResult:
-        """执行过程中插入新指令，由任务关系决定落点。"""
+        """执行过程中插入新指令，由任务关系决定落点。
+
+        SUPER_TASK 会**改写正在执行任务的目标**——这是不可逆操作（旧目标就丢了），
+        所以除了要过专属置信度门槛，还必须由调用方显式传 ``allow_disruptive=True``
+        放行；否则返回 ``NEEDS_CONFIRMATION``，什么都不会改（V2.1 §九）。
+        """
         current = self.get(current_task_id) if current_task_id else self.active_task()
 
         # 重复检测要把当前任务也算进来：用户对同一个任务又说一遍同样的话，
@@ -176,9 +186,21 @@ class TaskManager:
 
         if (
             relation.relation is TaskRelation.SUPER_TASK
+            and relation.is_actionable
             and current is not None
             and not current.is_terminal
         ):
+            if relation.requires_second_confirmation and not allow_disruptive:
+                return InjectResult(
+                    relation=relation,
+                    action=InjectAction.NEEDS_CONFIRMATION,
+                    task=current,
+                    message=(
+                        f"判定为父任务但改写目标不可逆，需二次确认后再执行"
+                        f"（{relation.describe()}，任务 {current.id} 未被修改）"
+                    ),
+                )
+
             # 新指令是「父任务」：重构当前任务目标，而不是另起一个任务（V2.1 §六/§七）。
             current.instruction = instruction
             current.version += 1            # 版本+1，旧 Checkpoint / 旧计划随之失效
@@ -240,7 +262,11 @@ class TaskManager:
             (i for i, s in enumerate(task.plan) if s.status is StepStatus.PENDING),
             len(task.plan),
         )
-        step = TaskStep(id=f"s{index + 1}_{uuid.uuid4().hex[:3]}", goal=instruction, max_retries=2)
+        step = TaskStep(
+            id=f"s{index + 1}_{uuid.uuid4().hex[:3]}",
+            goal=instruction,
+            max_retries=DEFAULT_POLICY.step_max_retries,
+        )
 
         if index < len(task.plan):
             following = task.plan[index]

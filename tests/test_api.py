@@ -14,6 +14,7 @@ from models.action import Action, ActionType, Decision
 from models.state import Observation
 from models.task import PAUSED_BY_PREEMPTION, PAUSED_BY_USER, Task, TaskStatus
 from models.task_relation import TaskRelation, TaskRelationResult
+from models.task_step import StepStatus
 from storage import CheckpointStore, TaskStore, TrajectoryStore
 
 
@@ -185,8 +186,23 @@ def test_cancel_finished_task_returns_409(api, monkeypatch, tmp_path):
 # ---------------------------------------------------------------- 指令注入
 
 
-def test_inject_subtask_merges_into_running_task(api):
-    client, _, session, *_ = api
+def test_inject_subtask_merges_into_running_task(api, monkeypatch):
+    """SUBTASK 被并入当前任务计划。
+
+    V2.1 §九：并入计划要求 0.65 的置信度。纯规则最高只到约 0.60
+    （融合上限 = (0.3*0.75 + 0.1*sim)/0.4），所以这里点亮 LLM 层，
+    对应生产环境配了 VLM 的情形。
+    """
+    client, _, session, _, manager = api
+    monkeypatch.setattr(
+        manager,
+        "_classifier",
+        TaskClassifier(
+            llm_judge=lambda instruction, current: TaskRelationResult(
+                relation=TaskRelation.SUBTASK, confidence=0.9, reason="东京三日游的一部分"
+            )
+        ),
+    )
     # 占住设备，让任务停在队列里；否则 worker 立刻跑它，假设备必然观察失败 → 任务已终态
     session.acquire("__manual__")
     try:
@@ -199,10 +215,79 @@ def test_inject_subtask_merges_into_running_task(api):
         body = resp.json()
         assert body["action"] == "merged"
         assert body["relation"] == "subtask"
+        assert body["confidence"] >= 0.65
 
         detail = client.get(f"/tasks/{created['id']}").json()
         goals = [step["goal"] for step in detail["plan"]]
         assert "先帮我查东京酒店" in goals
+    finally:
+        session.release("__manual__")
+
+
+def test_inject_subtask_migrates_dependency_chain(api, monkeypatch):
+    """Scenario 9：SUBTASK 插入后，串行依赖链必须迁移到新步骤上。
+
+    只断言「步骤被插进来了」是不够的——真正会出错的是依赖：
+    后续步骤若仍依赖被新步骤绕开的旧前驱，计划要么卡死，要么执行顺序错乱。
+    """
+    client, server, session, _, manager = api
+    monkeypatch.setattr(
+        manager,
+        "_classifier",
+        TaskClassifier(
+            llm_judge=lambda instruction, current: TaskRelationResult(
+                relation=TaskRelation.SUBTASK, confidence=0.9, reason="东京行程的一部分"
+            )
+        ),
+    )
+    session.acquire("__manual__")
+    try:
+        created = client.post("/tasks", json={"instruction": "帮我规划东京三日游"}).json()
+        task = manager.get(created["id"])
+        task.set_plan(["查机票", "订酒店"])
+        # 第一步已完成 → 新步骤插到「下一个待执行步骤」之前，也就是 index 1
+        task.plan[0].mark(StepStatus.DONE)
+        server.task_store.save(task)
+
+        resp = client.post(
+            f"/tasks/{created['id']}/inject", json={"instruction": "先帮我查东京酒店"}
+        )
+        assert resp.status_code == 200
+        assert resp.json()["action"] == "merged"
+
+        plan = manager.get(created["id"]).plan
+        assert [s.goal for s in plan] == ["查机票", "先帮我查东京酒店", "订酒店"]
+
+        inserted, following = plan[1], plan[2]
+        assert inserted.depends_on == [plan[0].id], "新步骤必须接上原本的前驱"
+        assert following.depends_on == [inserted.id], "原后续步骤必须改为依赖新插入的步骤"
+    finally:
+        session.release("__manual__")
+
+
+def test_inject_subtask_below_threshold_does_not_touch_running_plan(api):
+    """够不到 SUBTASK 门槛时，宁可另起任务，也不擅自改动正在跑的计划。
+
+    没有 LLM 时纯规则融合约 0.60 < 0.65，属「证据不够」：
+    悄悄往用户正在执行的计划里插一步，比各跑各的风险高。
+    """
+    client, _, session, *_ = api
+    session.acquire("__manual__")
+    try:
+        created = client.post("/tasks", json={"instruction": "帮我规划东京三日游"}).json()
+
+        resp = client.post(
+            f"/tasks/{created['id']}/inject", json={"instruction": "先帮我查东京酒店"}
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["relation"] == "subtask"
+        assert body["action"] != "merged"
+        assert body["action"] in {"spawned", "preempted"}
+
+        detail = client.get(f"/tasks/{created['id']}").json()
+        goals = [step["goal"] for step in detail["plan"]]
+        assert "先帮我查东京酒店" not in goals, "证据不足时不该动用户的计划"
     finally:
         session.release("__manual__")
 
@@ -492,7 +577,8 @@ def test_inject_super_task_rewrites_task_goal_and_bumps_version(api, monkeypatch
         task.version = 1
 
         resp = client.post(
-            f"/tasks/{created['id']}/inject", json={"instruction": "改成搜索高铁"}
+            f"/tasks/{created['id']}/inject",
+            json={"instruction": "改成搜索高铁", "allow_disruptive": True},
         )
         assert resp.status_code == 200
         body = resp.json()
@@ -504,6 +590,48 @@ def test_inject_super_task_rewrites_task_goal_and_bumps_version(api, monkeypatch
         assert reloaded.plan == [], "旧计划必须失效"
         assert reloaded.checkpoint_id is None, "旧 Checkpoint 必须失效"
         assert reloaded.instruction == "改成搜索高铁", "目标必须被改写"
+    finally:
+        session.release("__manual__")
+
+
+def test_inject_super_task_needs_confirmation_without_explicit_allow(api, monkeypatch):
+    """改写别人正在跑的任务目标不可逆，必须调用方显式放行（V2.1 §九）。
+
+    没带 allow_disruptive 时应当原样返回 needs_confirmation，
+    **一个字都不能改**——否则「疑似父任务」就会把用户原来的目标冲掉。
+    """
+    client, _, session, _, manager = api
+
+    class _SuperTaskClassifier:
+        def classify(self, instruction, *, current=None, candidates=()):
+            return TaskRelationResult(
+                relation=TaskRelation.SUPER_TASK,
+                confidence=0.9,
+                affected_task_id=current.id if current else None,
+                reason="改成搜索高铁",
+            )
+
+    monkeypatch.setattr(manager, "_classifier", _SuperTaskClassifier())
+
+    session.acquire("__manual__")
+    try:
+        created = client.post("/tasks", json={"instruction": "在淘宝搜索机票"}).json()
+        task = manager.get(created["id"])
+        task.set_plan(["查机票"])
+        task.version = 1
+
+        resp = client.post(
+            f"/tasks/{created['id']}/inject", json={"instruction": "改成搜索高铁"}
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["action"] == "needs_confirmation"
+        assert body["requires_confirmation"] is True
+
+        reloaded = manager.get(created["id"])
+        assert reloaded.instruction == "在淘宝搜索机票", "未放行时目标不得被改写"
+        assert reloaded.version == 1, "未放行时不得 +1"
+        assert [s.goal for s in reloaded.plan] == ["查机票"], "未放行时计划不得变动"
     finally:
         session.release("__manual__")
 

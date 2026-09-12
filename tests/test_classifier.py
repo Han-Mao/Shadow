@@ -36,8 +36,35 @@ def test_leading_marker_is_strong_subtask_signal():
 
     assert result.relation is TaskRelation.SUBTASK
     assert result.confidence >= 0.5
-    assert result.is_actionable
     assert result.signals["rule.subtask"] > 0
+
+
+def test_subtask_below_threshold_is_not_actionable():
+    """够不到 SUBTASK 专属门槛（0.65）就不并入计划，改为各跑各的（V2.1 §九）。
+
+    纯规则的融合上限是 (0.3*0.75 + 0.1*sim)/0.4，这条样本约 0.60——
+    「像一个子步骤」不等于「确实是该任务的一部分」，证据不足就不动用户的计划。
+    """
+    clf = TaskClassifier()
+    result = clf.classify("先帮我查东京酒店", current=task("帮我规划东京三日游"))
+
+    assert result.threshold == 0.65
+    assert result.confidence < result.threshold
+    assert not result.is_actionable
+
+
+def test_llm_support_makes_subtask_actionable():
+    """LLM 认同后融合分越过 0.65，才真正具备并入资格。"""
+    clf = TaskClassifier(
+        llm_judge=lambda instruction, current: TaskRelationResult(
+            relation=TaskRelation.SUBTASK, confidence=0.9, reason="东京行程的一部分"
+        )
+    )
+    result = clf.classify("先帮我查东京酒店", current=task("帮我规划东京三日游"))
+
+    assert result.relation is TaskRelation.SUBTASK
+    assert result.is_actionable
+    assert result.confidence >= 0.65
 
 
 def test_inline_marker_is_weaker_than_leading_marker():
@@ -51,7 +78,37 @@ def test_interrupt_markers_win():
     clf = TaskClassifier()
     result = clf.classify("马上打开微信给张三发消息", current=task("在淘宝搜运动鞋"))
     assert result.relation is TaskRelation.INTERRUPT
+    assert result.confidence >= 0.5
+    assert result.threshold == 0.80
+    # INTERRUPT 的语义是「急」，内容往往与当前任务无关（sim≈0），
+    # 纯规则融合只到 0.60，够不到 0.80 门槛。
+    # 注意：这不影响抢占——抢占由优先级决定，不由 is_actionable 决定。
+    assert not result.is_actionable
+
+
+def test_llm_support_makes_interrupt_actionable():
+    """LLM 明确判定为打断后，融合分越过 0.80 门槛。"""
+    clf = TaskClassifier(
+        llm_judge=lambda instruction, current: TaskRelationResult(
+            relation=TaskRelation.INTERRUPT, confidence=0.95, reason="用户要求马上处理"
+        )
+    )
+    result = clf.classify("马上打开微信给张三发消息", current=task("在淘宝搜运动鞋"))
+
+    assert result.relation is TaskRelation.INTERRUPT
     assert result.is_actionable
+    assert result.requires_second_confirmation
+
+
+def test_super_task_and_interrupt_are_flagged_for_second_confirmation():
+    """会改写/打断在跑任务的关系，必须带二次确认标记；SAFE 关系不打扰用户。"""
+    interrupt = TaskRelationResult(relation=TaskRelation.INTERRUPT, confidence=0.9)
+    super_task = TaskRelationResult(relation=TaskRelation.SUPER_TASK, confidence=0.9)
+    subtask = TaskRelationResult(relation=TaskRelation.SUBTASK, confidence=0.9)
+
+    assert interrupt.requires_second_confirmation
+    assert super_task.requires_second_confirmation
+    assert not subtask.requires_second_confirmation
 
 
 def test_super_task_markers():

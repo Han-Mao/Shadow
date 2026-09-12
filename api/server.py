@@ -122,6 +122,9 @@ class InjectRequest(BaseModel):
     instruction: str
     priority: TaskPriority | None = None
     max_steps: int = Field(default=10, ge=1, le=50)
+    # SUPER_TASK 会改写正在执行的任务目标（不可逆）。默认 False：
+    # 命中 SUPER_TASK 时先返回 needs_confirmation，由调用方确认后再带 true 重发。
+    allow_disruptive: bool = False
 
 
 class ConfirmRequest(BaseModel):
@@ -346,6 +349,7 @@ def inject_task(task_id: str, req: InjectRequest):
         current_task_id=task_id,
         priority=req.priority,
         max_steps=req.max_steps,
+        allow_disruptive=req.allow_disruptive,
     )
     return result.model_dump()
 

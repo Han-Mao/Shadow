@@ -16,3 +16,4 @@ __pycache__/
 artifacts/
 .venv/
 .pytest_cache/
+.pytest_tmp.log

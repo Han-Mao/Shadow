@@ -7,6 +7,7 @@ from enum import Enum
 from pydantic import BaseModel, Field
 
 from .action import Action
+from .retry import DEFAULT_POLICY
 
 
 class StepStatus(str, Enum):
@@ -27,12 +28,16 @@ def new_step_id(index: int) -> str:
     return f"s{index}"
 
 
-def build_steps(goals: list[str], *, max_retries: int = 2) -> list["TaskStep"]:
+def build_steps(goals: list[str], *, max_retries: int | None = None) -> list["TaskStep"]:
     """把语义级目标列表转成带状态与依赖的步骤序列。
 
     默认串行依赖（s2 依赖 s1）：手机 GUI 任务的步骤几乎都是顺序的，
     并行依赖关系留给后续按需声明。
+
+    ``max_retries`` 不传时取 `DEFAULT_POLICY.step_max_retries`——步骤级重试上限
+    与 Runtime 共用同一份策略，不再各处硬编码（V2.1 §十二）。
     """
+    retries = DEFAULT_POLICY.step_max_retries if max_retries is None else max_retries
     steps: list[TaskStep] = []
     for i, goal in enumerate(goals, start=1):
         steps.append(
@@ -40,7 +45,7 @@ def build_steps(goals: list[str], *, max_retries: int = 2) -> list["TaskStep"]:
                 id=new_step_id(i),
                 goal=str(goal).strip(),
                 depends_on=[new_step_id(i - 1)] if i > 1 else [],
-                max_retries=max_retries,
+                max_retries=retries,
             )
         )
     return steps
@@ -55,7 +60,7 @@ class TaskStep(BaseModel):
     depends_on: list[str] = Field(default_factory=list)
 
     retry_count: int = 0
-    max_retries: int = 2
+    max_retries: int = DEFAULT_POLICY.step_max_retries
 
     last_action: Action | None = None
     last_error: str | None = None

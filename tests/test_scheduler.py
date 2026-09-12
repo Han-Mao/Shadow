@@ -4,7 +4,7 @@ from __future__ import annotations
 import threading
 import time
 
-from agent.runtime import RunOutcome
+from agent.runtime import AgentRuntime, RunOutcome
 from agent.scheduler import TaskScheduler
 from device.session import DeviceSession
 from fakes import FakeDevice
@@ -640,3 +640,27 @@ def test_pause_reason_is_recorded_and_cleared(tmp_path):
     scheduler.resume(task.id)
     assert task.paused_reason is None
     assert task.status is TaskStatus.QUEUED
+
+
+def test_recover_requeues_waiting_task_and_drops_approval(tmp_path):
+    """Scenario 11：在等人工确认时重启 → 任务重新入队，但**不保留**那次审批。
+
+    沿用旧审批等于替用户做决定：那次确认只在当时的页面上下文里成立，
+    重启后页面可能早就变了，必须重新确认一次，比沿用旧结论安全。
+    """
+    store = TaskStore(tmp_path / "tasks")
+    task = Task(instruction="去付款")
+    task.mark(TaskStatus.WAITING)
+    store.save(task)
+
+    scheduler = TaskScheduler(DoneRuntime(), DeviceSession(FakeDevice()), task_store=store)
+    assert scheduler.recover()["queued"] == 1, "等待确认的任务必须重新入队，不能卡在 WAITING 没人管"
+
+    reloaded = store.load(task.id)
+    assert reloaded.status is TaskStatus.QUEUED
+
+    # 审批只活在内存里（RuntimeState 不落盘）：
+    # 新建一个 runtime 等价于进程重启，此时不该还认得旧的确认
+    fresh = AgentRuntime(DeviceSession(FakeDevice()), artifact_dir=tmp_path)
+    assert fresh.pending_confirmation(task.id) is None
+    assert fresh.confirm(task.id, approved=True) is False, "重启后不该还认旧审批"

@@ -52,6 +52,7 @@ VLM 决定「下一步点哪里」，调度与检查点决定「多件事怎么�
 │   ├── task_manager.py     # 任务生命周期与指令注入
 │   ├── classifier.py       # 任务关系识别（三层融合）
 │   ├── risk_gate.py        # 统一风险门禁（策略风险 = 下限，模型只能抬不能降）
+│   ├── reconciliation.py   # 动作对账：EFFECT_UNKNOWN → 继续/重做/重规划/找人
 │   └── scheduler.py        # 优先级队列 / 抢占 / 恢复
 ├── models/
 │   ├── task.py             # Task + 8 态状态机 + 优先级 + 预算 + 版本号
@@ -60,6 +61,7 @@ VLM 决定「下一步点哪里」，调度与检查点决定「多件事怎么�
 │   ├── checkpoint.py       # Checkpoint：恢复所需的最小状态 + 版本门控
 │   ├── action.py           # Action + 风险等级（策略下限）+ 指纹 + 动作效果状态
 │   ├── budget.py           # TaskBudget：三独立预算（动作步数 / 观察 / 模型调用）
+│   ├── retry.py            # ErrorClass + RetryPolicy：错误分类与重试的唯一真相源
 │   └── state.py            # Observation / StepOutcome
 ├── storage/                # TaskStore / CheckpointStore / TrajectoryStore
 ├── device/
@@ -67,6 +69,7 @@ VLM 决定「下一步点哪里」，调度与检查点决定「多件事怎么�
 │   ├── session.py          # DeviceSession：设备所有权与抢占交接
 │   └── input.py            # InputProvider：ASCII 与中文输入通道
 ├── vision/                 # vlm / grounding / parser
+│   └── fingerprint.py      # UI 结构指纹：恢复校验的 L2（比 package 细、比 VLM 便宜）
 ├── api/server.py           # FastAPI
 ├── scripts/demo_preemption.py   # 抢占恢复演示（离线可跑）
 └── tests/                  # 154 个离线用例
@@ -169,8 +172,44 @@ python scripts/demo_preemption.py
 | 5 | §6/§7 SUPER_TASK 真重构 | 注入 `SUPER_TASK` 时改写 `instruction`、+1 版本、清空计划与检查点、升 HIGH 优先级；运行中则请求抢占让出，下一安全点落 Checkpoint 后挂起 | `agent/task_manager.py`、`agent/scheduler.py` |
 | 6 | §10/§11 统一风险门禁 | 新增 `AgentRiskGate`；`resolved_risk()` = `max(策略风险, 模型声明风险)`，**模型只能抬不能降**；`/actions` 危险动作直接 403 需人工确认 | `agent/risk_gate.py`、`models/action.py`、`api/server.py` |
 
-**刻意推迟（需另行确认再动）**：RetryPolicy/ErrorClass（§12/§13）、UI 指纹 L3 语义校验、完整 Reconciliation、
-StepAttempt/PlanStep 拆分（§20）、事件日志（§19）、多设备 Lease、Replay、目录重构（§24）。
+**刻意推迟（需另行确认再动）**：UI 指纹 L3 语义校验、StepAttempt/PlanStep 拆分（§20）、
+事件日志（§19）、多设备 Lease、Replay、目录重构（§24）。
+
+## V2.1 第二轮改造
+
+第一轮把「不能错」的骨架补齐后，第二轮处理「语义含糊」的部分。
+
+| # | 审核项 | 改动 | 落点 |
+|---|---|---|---|
+| 7 | §12/§13 重试语义 | 新增 `models/retry.py`：`ErrorClass`（TRANSIENT / ACTION_REJECTED / PARSE_ERROR / USER_DENIED / UNKNOWN / FATAL）+ `RetryPolicy` 唯一真相源。步骤级 `max_retries` 从策略派生，不再 Runtime 写 3、TaskStep 写 2 | `models/retry.py`、`task_step.py`、`runtime.py` |
+| 8 | §五 完整对账 | 新增 `agent/reconciliation.py`：EFFECT_UNKNOWN 拆成 **已成功→继续 / 未成功→重做 / 页面不符→重规划 / 无法判断→找人** 四条路，替代原来只有「清空计划重规划」一条 | `agent/reconciliation.py`、`runtime.py` |
+| 9 | §四 L2 结构指纹 | 新增 `vision/fingerprint.py`：取 class/text/content-desc/resource-id 做指纹，**刻意不含 bounds**（同页重绘 bounds 必然抖动，硬比会让 L2 永远判「变了」） | `vision/fingerprint.py` |
+| 10 | §9 分关系阈值 | `is_actionable` 从统一 0.5 改为按关系查表：DUPLICATE 0.90 / SUPER_TASK 0.85 / INTERRUPT 0.80 / SUBTASK 0.65。INTERRUPT、SUPER_TASK 带二次确认标记 | `models/task_relation.py`、`task_manager.py`、`api/server.py` |
+
+### 两个关键语义变化
+
+**1. 错误先分类，再决定重试。** 以前 ADB 超时、付款被拒、JSON 解析失败、用户拒绝全都 `retry_count += 1`：
+
+| 错误类别 | 应对 | 理由 |
+|---|---|---|
+| TRANSIENT（超时/离线） | 同一动作再试 | 抖动重试通常能过 |
+| ACTION_REJECTED（付款被拒） | 换策略 | 重试同一动作只会重复触发副作用 |
+| PARSE_ERROR（解析失败） | 重规划 | 要的是新决策，不是重发旧动作 |
+| USER_DENIED（人工否决） | 换策略 | 绝不能换个说法再问一次 |
+| UNKNOWN | 试探 1 次后转人工 | 判不出类别就别空转 |
+| FATAL | 立即放弃 | 不可逆 |
+
+**2. 危险动作在无法确认成功时，绝不自动重试。** 对账若发现「页面没变、动作可能没生效」，
+普通动作重做一次；但危险动作（付款/发送/删除）一律转人工确认——
+宁可多问一次人，也不能重复扣款、重复下单。
+
+### 行为变化提醒
+
+- **无 LLM 时关系判定更保守**：纯规则融合上限约 0.60（公式 `(0.3×rule + 0.1×sim)/0.4`），
+  够不到 SUBTASK 的 0.65 门槛，因此**不会**并入在跑任务的计划，改为各跑各的。
+  配置了 VLM 后融合分可达 0.78+，正常并入。这是刻意的——证据不足时不擅自改动用户的计划。
+- **SUPER_TASK 需显式放行**：改写正在执行的任务目标不可逆，
+  未带 `allow_disruptive=true` 时返回 `needs_confirmation`，一个字都不会改。
 
 ## 快速开始
 
@@ -261,17 +300,17 @@ pip install -r requirements.txt
 python -m pytest -q
 ```
 
-**161 个用例，全部离线**：不需要 adb、模拟器或 API Key。
+**173 个用例，全部离线**：不需要 adb、模拟器或 API Key。
 
 | 文件 | 覆盖 |
 |---|---|
 | `test_models.py` | 任务状态机、步骤依赖、动作风险（策略下限）/指纹、Checkpoint、预算、版本号 |
 | `test_device.py` | ADB 封装、输入通道（含中文）、设备会话所有权与并发 |
 | `test_vision.py` | UI 树容错、坐标落点、VLM 重试、prompt 构造 |
-| `test_classifier.py` | 三层关系判定与相似度否决 |
-| `test_scheduler.py` | 优先级、暂停/取消、**抢占与恢复**、组合式中断（B 失败/取消）、**启动恢复**、设备占用 |
-| `test_runtime.py` | 闭环执行、异常收敛、死循环、HITL、Checkpoint 恢复、**三预算门控**、恢复重规划 |
-| `test_api.py` | HTTP 契约、状态码语义、错误脱敏、危险动作拦截、SUPER_TASK 改写、版本门控 |
+| `test_classifier.py` | 三层关系判定、相似度否决、**分关系阈值**、二次确认标记 |
+| `test_scheduler.py` | 优先级、暂停/取消、**抢占与恢复**、组合式中断、**启动恢复**（含审批前重启）、设备占用 |
+| `test_runtime.py` | 闭环执行、异常收敛、死循环、HITL、Checkpoint 恢复、**三预算门控**、**动作对账**（继续/重做）、批准一次性 |
+| `test_api.py` | HTTP 契约、状态码语义、错误脱敏、危险动作拦截、SUPER_TASK 改写与二次确认、**依赖链迁移**、版本门控 |
 
 ## 注意事项
 

@@ -16,11 +16,17 @@ from pathlib import Path
 from device.session import DeviceBusyError, DeviceSession
 from models.action import Action, ActionType, ActionRisk, ActionEffectStatus, Decision
 from models.checkpoint import Checkpoint
+from models.retry import (
+    DEFAULT_POLICY,
+    ErrorClass,
+    RetryAction,
+    classify_error,
+)
 from models.state import Observation, StepOutcome
 from models.task import Task, TaskStatus
 from models.task_step import StepStatus, TaskStep
 
-from . import executor, observer, planner, verifier
+from . import executor, observer, planner, reconciliation, verifier
 from .planner import ReplanContext
 
 logger = logging.getLogger(__name__)
@@ -28,7 +34,8 @@ logger = logging.getLogger(__name__)
 # 与 api/server.py 读同一个环境变量，否则 /screenshot 与 Agent 截图会落到不同目录
 ARTIFACT_DIR = Path(os.getenv("ARTIFACT_DIR", "artifacts/shots"))
 
-MAX_RETRY_COUNT = 3
+# 重试行为只由这一份策略决定（V2.1 §十二），不再在这里硬编码次数
+RETRY_POLICY = DEFAULT_POLICY
 # 最近 LOOP_WINDOW 个动作里，同一个指纹出现 LOOP_REPEAT_THRESHOLD 次即判定死循环
 LOOP_WINDOW = 4
 LOOP_REPEAT_THRESHOLD = 3
@@ -62,6 +69,9 @@ class RuntimeState:
 
     retry_count: int = 0
     prepared: bool = False
+    forced_action: Action | None = None
+    """对账判定「上次动作未生效」后要强制重做的动作（跳过一次模型决策）。"""
+
     recent_actions: deque[Action] = field(default_factory=lambda: deque(maxlen=LOOP_WINDOW))
     failed_strategies: list[str] = field(default_factory=list)
     denied_fingerprints: set[str] = field(default_factory=set)
@@ -125,23 +135,28 @@ class AgentRuntime:
             # ---- Observe ----
             observation = self._observe(task, state)
             if observation is None:
-                state.retry_count += 1
-                if state.retry_count >= MAX_RETRY_COUNT:
-                    return self._fail(task, f"连续观察失败 {state.retry_count} 次")
+                # 观察失败基本都是设备/ADB 抖动，按瞬时错误处理
+                outcome = self._settle_failure(task, state, ErrorClass.TRANSIENT, "观察失败")
+                if outcome is not None:
+                    return outcome
                 continue
             last_observation = observation
 
             if not state.prepared:
-                self._prepare(task, state, observation, checkpoint)
+                prepared_outcome = self._prepare(task, state, observation, checkpoint)
                 state.prepared = True
+                if prepared_outcome is not None:
+                    return prepared_outcome
 
             # ---- Think ----
             step = task.next_pending_step()
-            decision = self._decide(task, state, observation, step)
+            decision = self._forced_decision(state) or self._decide(task, state, observation, step)
             if decision is None:
-                state.retry_count += 1
-                if state.retry_count >= MAX_RETRY_COUNT:
-                    return self._fail(task, "连续规划失败，无法确定下一步")
+                outcome = self._settle_failure(
+                    task, state, ErrorClass.PARSE_ERROR, "规划失败，无法确定下一步"
+                )
+                if outcome is not None:
+                    return outcome
                 continue
 
             action = decision.action
@@ -163,9 +178,11 @@ class AgentRuntime:
                 state.recent_actions.clear()
                 retried = self._replan(task, state, observation, step, reason)
                 if retried is None:
-                    state.retry_count += 1
-                    if state.retry_count >= MAX_RETRY_COUNT:
-                        return self._fail(task, "换策略失败，无法继续")
+                    outcome = self._settle_failure(
+                        task, state, ErrorClass.PARSE_ERROR, "换策略失败"
+                    )
+                    if outcome is not None:
+                        return outcome
                     continue
                 decision, action = retried, retried.action
                 if action.type is ActionType.DONE:
@@ -214,16 +231,25 @@ class AgentRuntime:
                 self._save_checkpoint(task, state, post, action)
                 continue
 
-            # ---- ERROR：记失败策略，准备换路子 ----
+            # ---- ERROR：先分类，再由策略决定重试 / 换策略 / 找人 / 放弃 ----
             state.last_action_effect = ActionEffectStatus.VERIFIED_FAILED
-            state.retry_count += 1
             state.failed_strategies.append(self._describe_action(action))
             if step is not None:
                 step.record_failure(verification.message)
-            logger.warning("任务 %s 第 %d 步失败：%s", task.id, state.execution_step, verification.message)
+            error_class = classify_error(verification.message)
+            logger.warning(
+                "任务 %s 第 %d 步失败[%s]：%s",
+                task.id,
+                state.execution_step,
+                error_class.value,
+                verification.message,
+            )
             self._save_checkpoint(task, state, post, action)
-            if state.retry_count >= MAX_RETRY_COUNT:
-                return self._fail(task, f"连续失败 {state.retry_count} 次（{verification.message}）")
+            outcome = self._settle_failure(
+                task, state, error_class, verification.message, pending=action
+            )
+            if outcome is not None:
+                return outcome
             continue
 
     def pending_confirmation(self, task_id: str) -> Action | None:
@@ -265,28 +291,49 @@ class AgentRuntime:
         state: RuntimeState,
         observation: Observation,
         checkpoint: Checkpoint | None,
-    ) -> None:
-        """首次进入循环时决定：接着旧计划跑，还是重新规划。"""
+    ) -> RunOutcome | None:
+        """首次进入循环时决定：接着旧计划跑、重做上次动作、找人确认，还是重新规划。
+
+        有返回值时表示任务应当就此挂起（等人确认），调用方直接把它当作 run 的结论。
+        """
         if task.plan and checkpoint is not None and self._checkpoints is not None:
             verdict = self._checkpoints.validate(checkpoint, observation, task_version=task.version)
-            if verdict.value == "resume" and checkpoint.action_effect is not ActionEffectStatus.DISPATCHED:
-                logger.info("任务 %s 从恢复点继续（%s）", task.id, task.plan_progress())
-                return
-            if verdict.value == "resume" and checkpoint.action_effect is ActionEffectStatus.DISPATCHED:
-                # 上次动作只 dispatch 未验证（EFFECT_UNKNOWN）：绝不能基于旧 action 盲目续跑，
-                # 否则「提交订单」这类动作可能被重复执行。清空计划，让 planner 按当前页面重新判断。
-                state.last_action_effect = ActionEffectStatus.EFFECT_UNKNOWN
-                logger.warning(
-                    "任务 %s 恢复点 %s 上次动作仅 dispatch 未验证（EFFECT_UNKNOWN），不盲目续跑，重新规划",
-                    task.id,
-                    checkpoint.id,
-                )
-            else:
+            if verdict.value != "resume":
                 logger.info("恢复点已失效（%s），任务 %s 重新规划", verdict.value, task.id)
-            task.plan = []
+                task.plan = []
+            elif reconciliation.needs_reconciliation(checkpoint):
+                # 上次动作「已 dispatch 未验证」→ EFFECT_UNKNOWN。
+                # 先对账再决定，而不是一律清空计划重规划（V2.1 §五）。
+                state.last_action_effect = ActionEffectStatus.EFFECT_UNKNOWN
+                settled = reconciliation.reconcile(checkpoint, observation)
+                logger.warning(
+                    "任务 %s 对账结果 %s：%s", task.id, settled.action.value, settled.reason
+                )
+                if settled.action is reconciliation.ReconcileAction.CONTINUE:
+                    state.last_action_effect = ActionEffectStatus.VERIFIED_SUCCESS
+                    logger.info(
+                        "任务 %s 确认上次动作已生效，从恢复点继续（%s）",
+                        task.id,
+                        task.plan_progress(),
+                    )
+                    return None
+                if settled.action is reconciliation.ReconcileAction.RETRY:
+                    # 保留原计划，下一轮直接重做这个动作（不惊动模型）
+                    state.forced_action = settled.retry_action
+                    return None
+                if settled.action is reconciliation.ReconcileAction.ASK_HUMAN:
+                    state.pending_confirmation = checkpoint.last_action
+                    task.mark(TaskStatus.WAITING)
+                    self._persist(task)
+                    logger.warning("任务 %s 无法判断上次动作是否生效，等待人工确认", task.id)
+                    return RunOutcome.AWAITING_CONFIRMATION
+                task.plan = []
+            else:
+                logger.info("任务 %s 从恢复点继续（%s）", task.id, task.plan_progress())
+                return None
 
         if task.plan:
-            return
+            return None
 
         try:
             state.model_call_count += 1
@@ -429,6 +476,52 @@ class AgentRuntime:
         task.mark(TaskStatus.FAILED)
         self._persist(task)
         return RunOutcome.FAILED
+
+    # ---- 失败结算（V2.1 §十二 / §十三）----
+
+    def _settle_failure(
+        self,
+        task: Task,
+        state: RuntimeState,
+        error_class: ErrorClass,
+        message: str,
+        *,
+        pending: Action | None = None,
+    ) -> RunOutcome | None:
+        """按统一策略结算一次失败：返回 None 表示继续循环，否则是终止结论。
+
+        重试预算只在**这一处**递增，不再有 RuntimeState（原 MAX=3）与
+        TaskStep（原 max_retries=2）两套计数互相打架。
+        """
+        decision = RETRY_POLICY.decide(error_class, state.retry_count)
+        state.retry_count += 1
+        logger.info(
+            "任务 %s 失败结算：%s → %s（第 %d 次）",
+            task.id,
+            error_class.value,
+            decision.action.value,
+            state.retry_count,
+        )
+        if decision.action is RetryAction.ABORT:
+            return self._fail(task, f"{message}：{decision.reason}")
+        if decision.action is RetryAction.ASK_HUMAN:
+            if pending is not None:
+                state.pending_confirmation = pending
+            task.mark(TaskStatus.WAITING)
+            self._persist(task)
+            logger.warning("任务 %s 无法自行决断，转人工确认：%s", task.id, decision.reason)
+            return RunOutcome.AWAITING_CONFIRMATION
+        # RETRY / REPLAN 的具体动作由所在阶段执行，这里只记账与放行
+        return None
+
+    @staticmethod
+    def _forced_decision(state: RuntimeState) -> Decision | None:
+        """取出对账要求强制重做的动作（取完即清，避免无限重做同一个动作）。"""
+        if state.forced_action is None:
+            return None
+        action = state.forced_action
+        state.forced_action = None
+        return Decision(action=action, step_done=False, thought="重试上次未生效的动作")
 
     # ---- 辅助 ----
 
