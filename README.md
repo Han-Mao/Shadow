@@ -1,4 +1,4 @@
-# Bluewhale Shadow Phone — V2
+#Shadow Phone — V2
 
 > **Shadow 是一个面向 Android 的任务级 Agent Runtime。**
 > 它通过任务关系识别、动态调度、Checkpoint 与抢占恢复，让 Agent 在连续执行复杂手机任务的同时，
