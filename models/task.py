@@ -7,6 +7,7 @@ from enum import Enum
 
 from pydantic import BaseModel, Field
 
+from .budget import TaskBudget
 from .task_step import StepStatus, TaskStep, build_steps
 
 
@@ -68,8 +69,15 @@ class Task(BaseModel):
     parent_task_id: str | None = None
     root_task_id: str | None = None
 
-    max_steps: int = 10
     current_step: int = 0
+
+    # 资源预算：动作 / 观察 / 模型调用三个独立上限（V2.1 §二），取代单一的 max_steps。
+    # 旧代码里 max_steps 实际统计的是 Observe 次数，并非动作数，预算语义是错的。
+    budget: TaskBudget = Field(default_factory=TaskBudget)
+
+    # 版本号（V2.1 §十七）：SUPER_TASK / re-plan / 计划变更 / 优先级变更 / 人工干预时 +1。
+    # 旧 Checkpoint / Decision 如果版本不匹配，一律作废，防止旧指令误执行。
+    version: int = 1
 
     plan: list[TaskStep] = Field(default_factory=list)
 

@@ -26,10 +26,13 @@ from device.adb import AdbController, AdbError
 from device.emulator import resolve_serial
 from device.input import build_default_input
 from device.session import DeviceSession
-from models.action import Action, ActionType, Point
+from models.action import Action, ActionRisk, ActionType, Point
+from models.budget import TaskBudget
 from models.task import TaskPriority, TaskStatus
 from storage import CheckpointStore, TaskStore, TrajectoryStore
 from vision.vlm import VlmError, classify_relation
+
+from agent.risk_gate import ActionRiskGate
 
 logger = logging.getLogger(__name__)
 
@@ -209,6 +212,15 @@ def execute_action(req: ActionRequest):
         raise HTTPException(status_code=400, detail=f"Action 参数非法: {exc}") from exc
 
     with device_access() as device:
+        # 统一风险门禁：危险动作不能绕过 HITL 直接执行（V2.1 §十）。
+        # 之前这里在 execute 之后才回传 risk，等于外部调用能静默执行危险动作。
+        risk = ActionRiskGate.assess(action)
+        if risk is ActionRisk.DANGEROUS:
+            raise HTTPException(
+                status_code=403,
+                detail="危险动作需经人工确认：请通过 POST /tasks 触发任务流程，"
+                "再由 /tasks/{id}/confirm 放行",
+            )
         pre = observer.observe(adb, ARTIFACT_DIR, step=0)
         result = executor.execute(device, action, pre.ui_tree)
         post = observer.observe(adb, ARTIFACT_DIR, step=0, suffix="post") if result.get("ok") else pre
@@ -220,7 +232,7 @@ def execute_action(req: ActionRequest):
 
     payload = post.model_dump(exclude={"ui_tree"})
     payload["verification"] = verdict.model_dump()
-    payload["risk"] = action.resolved_risk().value
+    payload["risk"] = risk.value
     return payload
 
 
@@ -248,7 +260,7 @@ def create_task(req: TaskRequest):
     task = manager.create(
         req.instruction,
         context=req.context,
-        max_steps=req.max_steps,
+        budget=TaskBudget(max_action_steps=req.max_steps),
         priority=req.priority,
     )
     if req.wait:

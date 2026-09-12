@@ -13,6 +13,7 @@ from fakes import FakeDevice
 from models.action import Action, ActionType, Decision
 from models.state import Observation
 from models.task import PAUSED_BY_PREEMPTION, PAUSED_BY_USER, Task, TaskStatus
+from models.task_relation import TaskRelation, TaskRelationResult
 from storage import CheckpointStore, TaskStore, TrajectoryStore
 
 
@@ -436,3 +437,101 @@ def test_lifespan_does_not_resume_user_paused_tasks(tmp_path, monkeypatch):
     assert payload["status"] == "paused"
     assert task.id in scheduler_state["paused"]
     assert scheduler_state["running"] is None
+
+
+# ---------------------------------------------------------------- V2.1：Risk Gate 统一（§十 / §十一）
+
+
+def test_actions_blocks_dangerous_without_confirmation(api):
+    """/actions 直控端点也必须过 Risk Gate：危险动作不能绕过 HITL 直接执行。"""
+    client, *_ = api
+    resp = client.post("/actions", json={"type": "tap", "target": "确认付款"})
+    assert resp.status_code == 403
+    assert "人工确认" in resp.json()["detail"]
+
+
+def test_model_cannot_downgrade_dangerous_risk():
+    """模型在 action 上声明 risk=safe，不能把危险动作降权（V2.1 §十一）。"""
+    from models.action import ActionRisk, Point
+
+    action = Action(
+        type=ActionType.TAP,
+        target=Point(x=1, y=1),
+        value="确认付款",
+        risk=ActionRisk.SAFE,
+    )
+    assert action.resolved_risk() is ActionRisk.DANGEROUS
+
+
+# ---------------------------------------------------------------- V2.1：SUPER_TASK 真正重构（§六/§七/§25 scenario 7·8）
+
+
+def test_inject_super_task_rewrites_task_goal_and_bumps_version(api, monkeypatch):
+    """SUPER_TASK 把新指令改写成当前任务目标，version+1，旧计划与旧 Checkpoint 失效。
+
+    之前这里只是新建一个任务（create），根本没重构当前任务——正是建议指出的最大缺口。
+    """
+    client, server, session, scheduler, manager = api
+
+    class _SuperTaskClassifier:
+        def classify(self, instruction, *, current=None, candidates=()):
+            return TaskRelationResult(
+                relation=TaskRelation.SUPER_TASK,
+                confidence=0.9,
+                affected_task_id=current.id if current else None,
+                reason="改成搜索高铁",
+            )
+
+    monkeypatch.setattr(manager, "_classifier", _SuperTaskClassifier())
+
+    session.acquire("__manual__")  # 让任务停在队列，便于断言
+    try:
+        created = client.post("/tasks", json={"instruction": "在淘宝搜索北京到上海的机票"}).json()
+        task = manager.get(created["id"])
+        task.set_plan(["查机票", "比价格"])
+        task.version = 1
+
+        resp = client.post(
+            f"/tasks/{created['id']}/inject", json={"instruction": "改成搜索高铁"}
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["action"] == "superseded"
+        assert body["relation"] == "super_task"
+
+        reloaded = manager.get(created["id"])
+        assert reloaded.version == 2, "SUPER_TASK 必须 version+1"
+        assert reloaded.plan == [], "旧计划必须失效"
+        assert reloaded.checkpoint_id is None, "旧 Checkpoint 必须失效"
+        assert reloaded.instruction == "改成搜索高铁", "目标必须被改写"
+    finally:
+        session.release("__manual__")
+
+
+# ---------------------------------------------------------------- V2.1：Checkpoint 版本校验（§18 / §25 scenario 8）
+
+
+def test_checkpoint_validate_rejects_stale_version(tmp_path):
+    """Checkpoint 版本与当前任务版本不一致 → STALE，不能 resume（防旧指令误执行）。
+
+    即便页面恰好没变，旧计划对应的旧恢复点也绝不能续跑（V2.1 §十八）。
+    """
+    from models.state import Observation
+    from storage.checkpoint_store import CheckpointStore, RestoreVerdict
+
+    store = CheckpointStore(tmp_path / "checkpoints")
+    obs = Observation(
+        step=1,
+        screenshot_path=str(tmp_path / "s.png"),
+        package="com.android.settings",
+        activity=".Main",
+    )
+    cp = runtime_mod.Checkpoint.capture(
+        task_id="t1", step=1, step_states={}, observation=obs, task_version=1
+    )
+    store.save(cp)
+
+    # 版本一致、页面一致 → 可以续跑
+    assert store.validate(cp, obs, task_version=1) is RestoreVerdict.RESUME
+    # 任务已发生 SUPER_TASK（version 升到 2）→ 旧 checkpoint 即使页面相同也必须失效
+    assert store.validate(cp, obs, task_version=2) is RestoreVerdict.STALE

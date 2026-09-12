@@ -13,6 +13,7 @@ import uuid
 from datetime import datetime
 from enum import Enum
 
+from models.budget import TaskBudget
 from models.task import Task, TaskPriority, TaskStatus, priority_rank
 from models.task_relation import TaskRelation, TaskRelationResult
 from models.task_step import StepStatus, TaskStep
@@ -26,6 +27,8 @@ class InjectAction(str, Enum):
     MERGED = "merged"
     SPAWNED = "spawned"
     PREEMPTED = "preempted"
+    SUPERSEDED = "superseded"
+    """SUPER_TASK：新指令是父任务，重构了当前任务的目标（不另起任务）。"""
     DUPLICATE_IGNORED = "duplicate_ignored"
 
 
@@ -68,7 +71,7 @@ class TaskManager:
         instruction: str,
         *,
         context: str = "",
-        max_steps: int = 10,
+        budget: TaskBudget | None = None,
         priority: TaskPriority = TaskPriority.NORMAL,
         parent_task_id: str | None = None,
         submit: bool = True,
@@ -76,7 +79,7 @@ class TaskManager:
         task = Task(
             instruction=instruction,
             context=context,
-            max_steps=max_steps,
+            budget=budget or TaskBudget(),
             priority=priority,
             parent_task_id=parent_task_id,
             root_task_id=parent_task_id,
@@ -171,6 +174,30 @@ class TaskManager:
                 message=f"并入任务 {current.id}，插入步骤 {step.id}：{instruction}",
             )
 
+        if (
+            relation.relation is TaskRelation.SUPER_TASK
+            and current is not None
+            and not current.is_terminal
+        ):
+            # 新指令是「父任务」：重构当前任务目标，而不是另起一个任务（V2.1 §六/§七）。
+            current.instruction = instruction
+            current.version += 1            # 版本+1，旧 Checkpoint / 旧计划随之失效
+            current.plan = []               # 旧计划作废，恢复时重新规划新目标
+            current.checkpoint_id = None    # 旧 Checkpoint 因版本不匹配自动失效
+            current.priority = TaskPriority.HIGH
+            self._store.save(current)
+            if current.status is TaskStatus.RUNNING:
+                # 正在跑：请求它在下一个安全点让位，让出后会从新目标重跑（plan 已清空）
+                self._scheduler.preempt_running()
+            else:
+                self._scheduler.submit(current, allow_preempt=False)
+            return InjectResult(
+                relation=relation,
+                action=InjectAction.SUPERSEDED,
+                task=current,
+                message=f"任务 {current.id} 被重构为新目标（v{current.version}）：{instruction}",
+            )
+
         new_priority = priority or (
             TaskPriority.HIGH
             if relation.relation in {TaskRelation.INTERRUPT, TaskRelation.SUPER_TASK}
@@ -178,7 +205,7 @@ class TaskManager:
         )
         new_task = self.create(
             instruction,
-            max_steps=max_steps,
+            budget=TaskBudget(max_action_steps=max_steps),
             priority=new_priority,
             parent_task_id=current.id if relation.relation is TaskRelation.SUBTASK else None,
         )

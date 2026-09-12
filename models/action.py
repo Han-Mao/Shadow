@@ -27,6 +27,35 @@ class ActionRisk(str, Enum):
     DANGEROUS = "dangerous"
 
 
+# effective_risk 取「服务端规则」与「模型建议」中更严格的一个：DANGEROUS > CAUTION > SAFE
+_RISK_RANK = {ActionRisk.SAFE: 0, ActionRisk.CAUTION: 1, ActionRisk.DANGEROUS: 2}
+
+
+def _risk_rank(risk: "ActionRisk") -> int:
+    return _RISK_RANK[risk]
+
+
+class ActionEffectStatus(str, Enum):
+    """一次动作「到底有没有在设备上生效」的判定（V2.1 §五）。
+
+    手机 Agent 最大的恢复难题不是「当前页面是什么」，而是「上一次动作到底执行没执行」。
+    例如进程在「点击提交订单」之后、拿到验证截图之前崩溃：重启时只知道 Step = 提交订单，
+    却不知道订单到底提交没提交——若直接重试就会重复下单。
+
+    - NOT_STARTED      ：还没发出去
+    - DISPATCHED       ：ADB 命令已发出（executor 返回 ok），但还没验证页面变化
+    - EFFECT_UNKNOWN   ：dispatch 后进程崩溃 / 拿不到验证观察 → 重启即落入此态，绝不能默认 retry
+    - VERIFIED_SUCCESS ：验证通过（页面确实按预期变化）
+    - VERIFIED_FAILED  ：验证失败
+    """
+
+    NOT_STARTED = "not_started"
+    DISPATCHED = "dispatched"
+    EFFECT_UNKNOWN = "effect_unknown"
+    VERIFIED_SUCCESS = "verified_success"
+    VERIFIED_FAILED = "verified_failed"
+
+
 # 不改设备状态、或可轻易撤销的动作
 SAFE_ACTION_TYPES = frozenset({ActionType.BACK, ActionType.HOME, ActionType.WAIT, ActionType.DONE})
 # 会改变设备状态，但通常可撤销
@@ -58,11 +87,12 @@ class Action(BaseModel):
     # 留空则由 resolved_risk 按类型 + 关键词推断；显式指定优先（人工标注的动作）
     risk: ActionRisk | None = None
 
-    def resolved_risk(self) -> ActionRisk:
-        """推断动作风险等级。"""
-        if self.risk is not None:
-            return self.risk
+    def policy_risk(self) -> ActionRisk:
+        """服务端规则推断的风险等级（类型 + 关键词），**不采纳**模型在 `risk` 上的声明。
 
+        模型可以**建议**风险（在 action 上写 `risk="caution"`），但不能把危险动作声称为 safe——
+        否则外部调用能静默执行「确认付款」之类动作（V2.1 §十一：Server Policy > Model Suggestion）。
+        """
         haystack = " ".join(
             str(part).lower() for part in (self.value, self.target, self.reason) if part is not None
         )
@@ -73,6 +103,17 @@ class Action(BaseModel):
         if self.type in CAUTION_ACTION_TYPES:
             return ActionRisk.CAUTION
         return ActionRisk.CAUTION
+
+    def resolved_risk(self) -> ActionRisk:
+        """effective_risk = max(policy_risk, model_risk)。
+
+        模型声明的 `risk` 只是「建议」：它可以把风险**说高**（要求更严格确认），
+        但**不能把危险动作说低**。例如 `{"type":"tap","target":"确认付款","risk":"safe"}`
+        仍会被判定为 DANGEROUS——这是 HITL 门禁不被绕过的底线。
+        """
+        if self.risk is None:
+            return self.policy_risk()
+        return max(self.policy_risk(), self.risk, key=_risk_rank)
 
     @property
     def fingerprint(self) -> str:

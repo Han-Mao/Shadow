@@ -51,13 +51,15 @@ VLM 决定「下一步点哪里」，调度与检查点决定「多件事怎么�
 │   ├── verifier.py         # 多级验证：Device → UI Tree → VLM
 │   ├── task_manager.py     # 任务生命周期与指令注入
 │   ├── classifier.py       # 任务关系识别（三层融合）
+│   ├── risk_gate.py        # 统一风险门禁（策略风险 = 下限，模型只能抬不能降）
 │   └── scheduler.py        # 优先级队列 / 抢占 / 恢复
 ├── models/
-│   ├── task.py             # Task + 8 态状态机 + 优先级
+│   ├── task.py             # Task + 8 态状态机 + 优先级 + 预算 + 版本号
 │   ├── task_step.py        # TaskStep：计划是可追踪的状态机，不是字符串列表
 │   ├── task_relation.py    # TaskRelation：5 种任务关系
-│   ├── checkpoint.py       # Checkpoint：恢复所需的最小状态
-│   ├── action.py           # Action + 风险等级 + 指纹
+│   ├── checkpoint.py       # Checkpoint：恢复所需的最小状态 + 版本门控
+│   ├── action.py           # Action + 风险等级（策略下限）+ 指纹 + 动作效果状态
+│   ├── budget.py           # TaskBudget：三独立预算（动作步数 / 观察 / 模型调用）
 │   └── state.py            # Observation / StepOutcome
 ├── storage/                # TaskStore / CheckpointStore / TrajectoryStore
 ├── device/
@@ -145,11 +147,30 @@ python scripts/demo_preemption.py
 
 ### 5. 执行安全
 
-- **风险分级**：`safe / caution / dangerous`，命中「发送/支付/删除/下单」等关键词升级为危险动作
+- **风险分级**：`safe / caution / dangerous`。`resolved_risk()` 取 **策略风险（下限）与模型声明风险的较大值**：
+  命中「发送/支付/删除/下单」等关键词即升级为危险动作；模型可以显式把风险抬到更高，
+  **但绝不允许把策略判定的危险动作降级成安全**（防止模型乱标 SAFE 绕过 HITL）。
 - **HITL 门禁**：危险动作挂起任务等人工确认，批准才放行；被否决的动作进黑名单，
   下次再出现直接换策略，不会陷入「请求确认 → 否决 → 再请求」的空转
 - **死循环检测**：连续 3 次做出语义相同的动作（坐标容差 24px）即强制换策略，
   而不是继续 retry 同一个动作
+
+## V2.1 第一轮改造（依据 `v2.1审核建议.md`）
+
+审核文档共 27 节、分三轮。本轮只落地**第一轮 6 项「必须先改」**的缺口，刻意不做第二轮/第三轮的大改写
+（文档本身也警告「不要一次改所有东西」）。变更全部向后兼容：公开 API 仍暴露 `max_steps`，内部映射为 `budget.max_action_steps`。
+
+| # | 审核项 | 改动 | 落点文件 |
+|---|---|---|---|
+| 1 | §2 步数拆成三种预算 | 新增 `TaskBudget`（动作步数 / 观察次数 / 模型调用 三个独立上限）；Runtime 分别计数与熔断 | `models/budget.py`、`models/task.py`、`agent/runtime.py` |
+| 2 | §17 任务版本号 | `Task.version` 单调递增；SUPER_TASK 改写目标时 `+1`，用于使旧计划/旧检查点失效 | `models/task.py`、`agent/task_manager.py` |
+| 3 | §18 检查点版本门控 | `Checkpoint.task_version`；`validate()` 先比对版本，不一致直接 `STALE`，旧恢复点**绝对不续用** | `models/checkpoint.py`、`storage/checkpoint_store.py` |
+| 4 | §5 动作效果状态 | `ActionEffectStatus`（NOT_STARTED/DISPATCHED/EFFECT_UNKNOWN/VERIFIED_*）；恢复时若上一步只 DISPATCHED，判 `EFFECT_UNKNOWN`、清空计划重规划，**绝不盲目重试** | `models/action.py`、`agent/runtime.py` |
+| 5 | §6/§7 SUPER_TASK 真重构 | 注入 `SUPER_TASK` 时改写 `instruction`、+1 版本、清空计划与检查点、升 HIGH 优先级；运行中则请求抢占让出，下一安全点落 Checkpoint 后挂起 | `agent/task_manager.py`、`agent/scheduler.py` |
+| 6 | §10/§11 统一风险门禁 | 新增 `AgentRiskGate`；`resolved_risk()` = `max(策略风险, 模型声明风险)`，**模型只能抬不能降**；`/actions` 危险动作直接 403 需人工确认 | `agent/risk_gate.py`、`models/action.py`、`api/server.py` |
+
+**刻意推迟（需另行确认再动）**：RetryPolicy/ErrorClass（§12/§13）、UI 指纹 L3 语义校验、完整 Reconciliation、
+StepAttempt/PlanStep 拆分（§20）、事件日志（§19）、多设备 Lease、Replay、目录重构（§24）。
 
 ## 快速开始
 
@@ -240,17 +261,17 @@ pip install -r requirements.txt
 python -m pytest -q
 ```
 
-**154 个用例，全部离线**：不需要 adb、模拟器或 API Key。
+**161 个用例，全部离线**：不需要 adb、模拟器或 API Key。
 
 | 文件 | 覆盖 |
 |---|---|
-| `test_models.py` | 任务状态机、步骤依赖、动作风险与指纹、Checkpoint |
+| `test_models.py` | 任务状态机、步骤依赖、动作风险（策略下限）/指纹、Checkpoint、预算、版本号 |
 | `test_device.py` | ADB 封装、输入通道（含中文）、设备会话所有权与并发 |
 | `test_vision.py` | UI 树容错、坐标落点、VLM 重试、prompt 构造 |
 | `test_classifier.py` | 三层关系判定与相似度否决 |
 | `test_scheduler.py` | 优先级、暂停/取消、**抢占与恢复**、组合式中断（B 失败/取消）、**启动恢复**、设备占用 |
-| `test_runtime.py` | 闭环执行、异常收敛、死循环、HITL、Checkpoint 恢复 |
-| `test_api.py` | HTTP 契约、状态码语义、错误脱敏 |
+| `test_runtime.py` | 闭环执行、异常收敛、死循环、HITL、Checkpoint 恢复、**三预算门控**、恢复重规划 |
+| `test_api.py` | HTTP 契约、状态码语义、错误脱敏、危险动作拦截、SUPER_TASK 改写、版本门控 |
 
 ## 注意事项
 

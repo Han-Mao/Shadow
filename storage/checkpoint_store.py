@@ -23,6 +23,10 @@ class RestoreVerdict(str, Enum):
     REPLAN = "replan"
     """页面已经变了（或丢失恢复点），必须重新规划。"""
 
+    STALE = "stale"
+    """恢复点版本与当前任务版本不一致（例如刚发生过 SUPER_TASK / re-plan），
+    旧计划对应的旧恢复点绝对不能续用，必须重新规划。"""
+
 
 class CheckpointStore:
     def __init__(self, root: str | Path) -> None:
@@ -64,14 +68,28 @@ class CheckpointStore:
                 continue
         return None
 
-    def validate(self, checkpoint: Checkpoint | None, observation: Observation) -> RestoreVerdict:
-        """判断能否从恢复点继续。
+    def validate(
+        self,
+        checkpoint: Checkpoint | None,
+        observation: Observation,
+        task_version: int | None = None,
+    ) -> RestoreVerdict:
+        """判断能否从恢复点继续（V2.1 §十八：版本是第一道闸门）。
 
-        只看 package / activity 这类廉价且稳定的信号。UI 树快照不参与判定——
-        同一页面重绘后 bounds 会有细微差异，硬比会永远判为「不一致」，导致每次都 Re-plan。
+        顺序：版本 → 页面（package/activity）。版本不匹配直接 STALE，不比较页面——
+        旧计划对应的恢复点即使页面恰好没变，续跑也会用错的目标。
         """
         if checkpoint is None:
             return RestoreVerdict.REPLAN
+
+        if task_version is not None and checkpoint.task_version != task_version:
+            logger.info(
+                "恢复点 %s 已失效（checkpoint 版本 %s != 任务版本 %s），转入 Re-plan",
+                checkpoint.id,
+                checkpoint.task_version,
+                task_version,
+            )
+            return RestoreVerdict.STALE
 
         if checkpoint.same_screen_as(observation):
             logger.info("恢复点 %s 校验通过，继续执行", checkpoint.id)

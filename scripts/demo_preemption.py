@@ -31,6 +31,7 @@ from agent.classifier import TaskClassifier  # noqa: E402
 from device.session import DeviceSession  # noqa: E402
 from models.action import Action, ActionType, Decision, Point  # noqa: E402
 from models.state import Observation, StepOutcome  # noqa: E402
+from models.budget import TaskBudget
 from models.task import Task, TaskPriority  # noqa: E402
 from storage import CheckpointStore, TaskStore, TrajectoryStore  # noqa: E402
 
@@ -121,7 +122,7 @@ def main() -> None:
     try:
         log.info("")
         log.info("用户：#1 帮我在淘宝搜索一双黑色运动鞋")
-        task_a = manager.create("帮我在淘宝搜索一双黑色运动鞋", max_steps=8, priority=TaskPriority.NORMAL)
+        task_a = manager.create("帮我在淘宝搜索一双黑色运动鞋", budget=TaskBudget(max_action_steps=8), priority=TaskPriority.NORMAL)
 
         # 等 A 真的跑起来（拿到设备）
         deadline = time.monotonic() + 5

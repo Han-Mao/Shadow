@@ -209,6 +209,18 @@ class TaskScheduler:
         """让当前任务让位给指定任务。"""
         return self._maybe_preempt_by_id(by_task_id)
 
+    def preempt_running(self) -> bool:
+        """让当前正在运行的任务在下一个安全点让位。
+
+        用于 SUPER_TASK：任务目标已被改写，需要让出设备、从新目标重新规划（V2.1 §七）。
+        与 `preempt(by_task_id)` 不同——这里没有「优先级比较」，被抢占的就是 running 自身。
+        """
+        with self._cond:
+            running = self._running
+        if running is None or not running.interruptible:
+            return False
+        return self._session.request_preempt(running.id)
+
     # ---- 查询 ----
 
     def snapshot(self) -> dict[str, Any]:

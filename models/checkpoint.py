@@ -7,6 +7,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from .action import Action, ActionEffectStatus
 from .state import Observation
 from .task_step import StepStatus
 
@@ -25,6 +26,10 @@ class Checkpoint(BaseModel):
     id: str
     task_id: str
 
+    # 关联的 Task 版本（V2.1 §十八）。恢复时若与当前 task.version 不一致，
+    # 说明任务目标已变（SUPER_TASK / re-plan 等），旧恢复点必须作废，不能盲续。
+    task_version: int = 1
+
     current_step: int = 0
     step_states: dict[str, StepStatus] = Field(default_factory=dict)
 
@@ -35,6 +40,11 @@ class Checkpoint(BaseModel):
     ui_snapshot: str | None = None
 
     history_tail: list[Observation] = Field(default_factory=list)
+
+    # 上次动作的执行效果判定（V2.1 §五）。DISPATCHED 时进程崩溃 → 恢复即 EFFECT_UNKNOWN，
+    # 绝不能默认重试，必须重新观察对账，否则「提交订单」这类动作可能被重复执行。
+    action_effect: ActionEffectStatus = ActionEffectStatus.NOT_STARTED
+    last_action: Action | None = None
 
     created_at: datetime = Field(default_factory=datetime.now)
 
@@ -47,6 +57,9 @@ class Checkpoint(BaseModel):
         step_states: dict[str, StepStatus],
         observation: Observation | None,
         history_tail: list[Observation] | None = None,
+        task_version: int = 1,
+        action_effect: ActionEffectStatus = ActionEffectStatus.NOT_STARTED,
+        last_action: Action | None = None,
     ) -> "Checkpoint":
         """从一次观察中提取恢复所需的最小状态。"""
         snapshot = None
@@ -56,6 +69,7 @@ class Checkpoint(BaseModel):
         return cls(
             id=new_checkpoint_id(task_id, step),
             task_id=task_id,
+            task_version=task_version,
             current_step=step,
             step_states=dict(step_states),
             screenshot_path=observation.screenshot_path if observation else None,
@@ -63,6 +77,8 @@ class Checkpoint(BaseModel):
             activity=observation.activity if observation else "",
             ui_snapshot=snapshot,
             history_tail=list(history_tail or [])[-HISTORY_TAIL_SIZE:],
+            action_effect=action_effect,
+            last_action=last_action,
         )
 
     def same_screen_as(self, observation: Observation) -> bool:

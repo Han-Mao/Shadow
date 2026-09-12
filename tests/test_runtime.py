@@ -9,7 +9,8 @@ from agent.verifier import Verification
 from device.adb import AdbError
 from device.session import DeviceSession
 from fakes import FakeDevice
-from models.action import Action, ActionType, Decision, Point
+from models.action import Action, ActionEffectStatus, ActionType, Decision, Point
+from models.budget import TaskBudget
 from models.state import Observation, StepOutcome
 from models.task import Task, TaskPriority, TaskStatus
 from models.task_step import StepStatus
@@ -90,7 +91,7 @@ def test_runtime_completes_task_and_closes_steps(monkeypatch, tmp_path):
     patch_verifier(monkeypatch)
 
     session, runtime = build(tmp_path)
-    task = Task(instruction="打开设置", max_steps=5)
+    task = Task(instruction="打开设置", budget=TaskBudget(max_action_steps=5))
     session.acquire(task.id)
     try:
         outcome = runtime.run(task)
@@ -115,7 +116,7 @@ def test_runtime_advances_step_when_model_reports_step_done(monkeypatch, tmp_pat
     patch_verifier(monkeypatch)
 
     session, runtime = build(tmp_path)
-    task = Task(instruction="两步任务", max_steps=5)
+    task = Task(instruction="两步任务", budget=TaskBudget(max_action_steps=5))
     session.acquire(task.id)
     try:
         runtime.run(task)
@@ -140,7 +141,7 @@ def test_runtime_fails_after_repeated_observation_errors(monkeypatch, tmp_path):
     patch_planner(monkeypatch, decisions=[])
 
     session, runtime = build(tmp_path)
-    task = Task(instruction="观察必失败", max_steps=5)
+    task = Task(instruction="观察必失败", budget=TaskBudget(max_action_steps=5))
     session.acquire(task.id)
     try:
         outcome = runtime.run(task)
@@ -163,7 +164,7 @@ def test_runtime_replans_after_failed_action(monkeypatch, tmp_path):
     patch_verifier(monkeypatch)
 
     session, runtime = build(tmp_path)
-    task = Task(instruction="重试", max_steps=5)
+    task = Task(instruction="重试", budget=TaskBudget(max_action_steps=5))
     session.acquire(task.id)
     try:
         outcome = runtime.run(task)
@@ -185,7 +186,7 @@ def test_runtime_gives_up_after_max_retries(monkeypatch, tmp_path):
     patch_verifier(monkeypatch, StepOutcome.ERROR, "页面没变")
 
     session, runtime = build(tmp_path)
-    task = Task(instruction="一直失败", max_steps=20)
+    task = Task(instruction="一直失败", budget=TaskBudget(max_action_steps=20))
     session.acquire(task.id)
     try:
         outcome = runtime.run(task)
@@ -211,7 +212,7 @@ def test_runtime_detects_loop_and_forces_replan(monkeypatch, tmp_path):
     patch_verifier(monkeypatch)
 
     session, runtime = build(tmp_path)
-    task = Task(instruction="循环任务", max_steps=20)
+    task = Task(instruction="循环任务", budget=TaskBudget(max_action_steps=20))
     session.acquire(task.id)
     try:
         outcome = runtime.run(task)
@@ -234,7 +235,7 @@ def test_loop_detection_counts_jittered_coordinates_as_same_action(monkeypatch, 
     patch_verifier(monkeypatch)
 
     session, runtime = build(tmp_path)
-    task = Task(instruction="抖动循环", max_steps=20)
+    task = Task(instruction="抖动循环", budget=TaskBudget(max_action_steps=20))
     session.acquire(task.id)
     try:
         outcome = runtime.run(task)
@@ -260,7 +261,7 @@ def test_dangerous_action_waits_for_confirmation(monkeypatch, tmp_path):
     patch_verifier(monkeypatch)
 
     session, runtime = build(tmp_path)
-    task = Task(instruction="给张三发消息", max_steps=5)
+    task = Task(instruction="给张三发消息", budget=TaskBudget(max_action_steps=5))
     session.acquire(task.id)
 
     outcome = runtime.run(task)
@@ -292,7 +293,7 @@ def test_rejected_dangerous_action_does_not_run(monkeypatch, tmp_path):
     patch_verifier(monkeypatch)
 
     session, runtime = build(tmp_path)
-    task = Task(instruction="下单", max_steps=10)
+    task = Task(instruction="下单", budget=TaskBudget(max_action_steps=10))
     session.acquire(task.id)
 
     assert runtime.run(task) is RunOutcome.AWAITING_CONFIRMATION
@@ -323,7 +324,7 @@ def test_runtime_suspends_when_asked_to_yield(monkeypatch, tmp_path):
 
     checkpoints = CheckpointStore(tmp_path / "checkpoints")
     session, runtime = build(tmp_path, checkpoints=checkpoints)
-    task = Task(instruction="逛淘宝", max_steps=5)
+    task = Task(instruction="逛淘宝", budget=TaskBudget(max_action_steps=5))
     session.acquire(task.id)
     session.request_preempt("高优先级任务")
 
@@ -355,7 +356,7 @@ def test_runtime_stops_at_max_steps(monkeypatch, tmp_path):
     patch_verifier(monkeypatch)
 
     session, runtime = build(tmp_path)
-    task = Task(instruction="长任务", max_steps=3)
+    task = Task(instruction="长任务", budget=TaskBudget(max_action_steps=3))
     session.acquire(task.id)
     try:
         outcome = runtime.run(task)
@@ -387,7 +388,7 @@ def test_resume_keeps_plan_when_screen_matches(monkeypatch, tmp_path):
     )
     patch_verifier(monkeypatch)
 
-    task = Task(instruction="原本的任务", max_steps=5)
+    task = Task(instruction="原本的任务", budget=TaskBudget(max_action_steps=5))
     task.set_plan(["第一步", "第二步"])
     checkpoint = runtime_mod.Checkpoint.capture(
         task_id=task.id,
@@ -428,7 +429,7 @@ def test_resume_replans_when_screen_changed(monkeypatch, tmp_path):
     )
     patch_verifier(monkeypatch)
 
-    task = Task(instruction="原本的任务", max_steps=5)
+    task = Task(instruction="原本的任务", budget=TaskBudget(max_action_steps=5))
     task.set_plan(["第一步", "第二步"])
     checkpoint = runtime_mod.Checkpoint.capture(
         task_id=task.id,
@@ -464,7 +465,7 @@ def test_trajectory_records_each_executed_step(monkeypatch, tmp_path):
 
     trajectory = TrajectoryStore()
     session, runtime = build(tmp_path, trajectory=trajectory)
-    task = Task(instruction="两步任务", max_steps=5)
+    task = Task(instruction="两步任务", budget=TaskBudget(max_action_steps=5))
     session.acquire(task.id)
     try:
         runtime.run(task)
@@ -474,3 +475,83 @@ def test_trajectory_records_each_executed_step(monkeypatch, tmp_path):
     entries = trajectory.history(task.id)
     assert entries, "执行轨迹必须被记录下来，否则决策没有上下文"
     assert entries[-1].action is not None
+
+
+# ---------------------------------------------------------------- V2.1：Action Effect 恢复对账
+
+
+def test_resume_replans_when_last_action_only_dispatched(monkeypatch, tmp_path):
+    """恢复点记录上次动作只 dispatch 未验证（EFFECT_UNKNOWN，V2.1 §五）：
+
+    绝不能基于旧 action 盲目续跑，否则「提交订单」可能被重复执行。
+    正确做法：清空计划，让 planner 基于当前页面重新判断。
+    """
+    checkpoints = CheckpointStore(tmp_path / "checkpoints")
+    patch_observe(monkeypatch, tmp_path, package="com.android.settings")
+
+    called = {"generate": 0}
+
+    def counting_generate(*args, **kwargs):
+        called["generate"] += 1
+        return ["重新规划出来的步骤"]
+
+    monkeypatch.setattr(runtime_mod.planner, "generate_plan", counting_generate)
+    monkeypatch.setattr(
+        runtime_mod.planner,
+        "plan_next_action",
+        lambda *a, **k: Decision(action=Action(type=ActionType.DONE, reason="完成")),
+    )
+    patch_verifier(monkeypatch)
+
+    task = Task(instruction="原本的任务", budget=TaskBudget(max_action_steps=5))
+    task.set_plan(["第一步", "第二步"])
+    obs = observation(1, tmp_path, package="com.android.settings")
+    checkpoint = runtime_mod.Checkpoint.capture(
+        task_id=task.id,
+        step=1,
+        step_states=task.step_states(),
+        observation=obs,
+        action_effect=ActionEffectStatus.DISPATCHED,
+    )
+    checkpoints.save(checkpoint)
+    task.checkpoint_id = checkpoint.id
+
+    session, runtime = build(tmp_path, checkpoints=checkpoints)
+    session.acquire(task.id)
+    try:
+        outcome = runtime.run(task)
+    finally:
+        session.release(task.id)
+
+    assert outcome is RunOutcome.DONE
+    assert called["generate"] == 1, "DISPATCHED 恢复点必须重新规划，不能盲目续跑旧计划"
+
+
+# ---------------------------------------------------------------- V2.1：预算拆分（§二 / §25 scenario 12）
+
+
+def test_runtime_stops_at_action_budget_not_observation_budget(monkeypatch, tmp_path):
+    """达到动作步数上限即终止，而非观察次数上限。
+
+    旧实现里 max_steps 实际统计的是 Observe 次数；V2.1 拆成三个独立预算，
+    这里把观察预算给足，只压动作预算，确认是「动作数」先触顶（scenario 12）。
+    """
+    patch_observe(monkeypatch, tmp_path)
+    patch_planner(monkeypatch, goals=["长任务"], decisions=[tap(i * 40, i * 40) for i in range(50)])
+    patch_verifier(monkeypatch)
+
+    trajectory = TrajectoryStore()
+    session, runtime = build(tmp_path, trajectory=trajectory)
+    task = Task(
+        instruction="长任务",
+        budget=TaskBudget(max_action_steps=3, max_observations=500, max_model_calls=500),
+    )
+    session.acquire(task.id)
+    try:
+        outcome = runtime.run(task)
+    finally:
+        session.release(task.id)
+
+    assert outcome is RunOutcome.FAILED
+    executed = [e for e in trajectory.history(task.id) if e.action is not None]
+    assert len(executed) == 3, "动作预算为 3，应恰好执行 3 个动作后终止"

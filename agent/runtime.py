@@ -14,7 +14,7 @@ from enum import Enum
 from pathlib import Path
 
 from device.session import DeviceBusyError, DeviceSession
-from models.action import Action, ActionType, ActionRisk, Decision
+from models.action import Action, ActionType, ActionRisk, ActionEffectStatus, Decision
 from models.checkpoint import Checkpoint
 from models.state import Observation, StepOutcome
 from models.task import Task, TaskStatus
@@ -47,9 +47,19 @@ class RunOutcome(str, Enum):
 
 @dataclass
 class RuntimeState:
-    """单个任务的运行时状态。不落盘——恢复靠 Checkpoint，不靠这份内存。"""
+    """单个任务的运行时状态。不落盘——恢复靠 Checkpoint，不靠这份内存。
 
-    step_index: int = 0
+    V2.1 §二：预算拆成三个互相独立的计数，不再用一个 step_index 包打天下。
+    - execution_step   ：真正执行了多少个 Agent Action（Observe / DONE 都不算）
+    - observation_count：观察了多少次（观察失败也消耗）
+    - model_call_count ：调用了多少次 VLM
+    """
+
+    execution_step: int = 0
+    observation_count: int = 0
+    model_call_count: int = 0
+    last_action_effect: ActionEffectStatus = ActionEffectStatus.NOT_STARTED
+
     retry_count: int = 0
     prepared: bool = False
     recent_actions: deque[Action] = field(default_factory=lambda: deque(maxlen=LOOP_WINDOW))
@@ -105,9 +115,12 @@ class AgentRuntime:
                 self._save_checkpoint(task, state, last_observation)
                 logger.info("任务 %s 让出设备（被抢占），等待稍后恢复", task.id)
                 return RunOutcome.SUSPENDED
-            if state.step_index >= task.max_steps:
+            if state.observation_count >= task.budget.max_observations:
                 self._save_checkpoint(task, state, last_observation)
-                return self._fail(task, f"已达步数上限 {task.max_steps}")
+                return self._fail(task, f"已达观察次数上限 {task.budget.max_observations}")
+            if state.model_call_count >= task.budget.max_model_calls:
+                self._save_checkpoint(task, state, last_observation)
+                return self._fail(task, f"已达模型调用上限 {task.budget.max_model_calls}")
 
             # ---- Observe ----
             observation = self._observe(task, state)
@@ -170,6 +183,13 @@ class AgentRuntime:
                 return RunOutcome.AWAITING_CONFIRMATION
 
             # ---- Act ----
+            state.execution_step += 1
+            if state.execution_step > task.budget.max_action_steps:
+                self._save_checkpoint(task, state, observation, action)
+                return self._fail(task, f"已达动作步数上限 {task.budget.max_action_steps}")
+            # 命令已发出（executor 永不抛异常，成功与否看 result），但还没验证页面变化。
+            # 这中间若进程崩溃，恢复时就会落入 EFFECT_UNKNOWN（V2.1 §五）。
+            state.last_action_effect = ActionEffectStatus.DISPATCHED
             result = self._execute(task, action, observation)
             if state.approved_dangerous:
                 state.approved_dangerous = False
@@ -180,25 +200,28 @@ class AgentRuntime:
             self._append_trajectory(task, post)
 
             if verification.outcome is StepOutcome.DONE:
+                state.last_action_effect = ActionEffectStatus.VERIFIED_SUCCESS
                 self._close_step(task, step)
                 self._finish(task, state, post, action)
                 return RunOutcome.DONE
 
             if verification.outcome is StepOutcome.OK:
+                state.last_action_effect = ActionEffectStatus.VERIFIED_SUCCESS
                 if decision.step_done:
                     self._close_step(task, step, action)
                 state.retry_count = 0
                 state.failed_strategies.clear()
-                self._save_checkpoint(task, state, post)
+                self._save_checkpoint(task, state, post, action)
                 continue
 
             # ---- ERROR：记失败策略，准备换路子 ----
+            state.last_action_effect = ActionEffectStatus.VERIFIED_FAILED
             state.retry_count += 1
             state.failed_strategies.append(self._describe_action(action))
             if step is not None:
                 step.record_failure(verification.message)
-            logger.warning("任务 %s 第 %d 步失败：%s", task.id, state.step_index, verification.message)
-            self._save_checkpoint(task, state, post)
+            logger.warning("任务 %s 第 %d 步失败：%s", task.id, state.execution_step, verification.message)
+            self._save_checkpoint(task, state, post, action)
             if state.retry_count >= MAX_RETRY_COUNT:
                 return self._fail(task, f"连续失败 {state.retry_count} 次（{verification.message}）")
             continue
@@ -245,17 +268,28 @@ class AgentRuntime:
     ) -> None:
         """首次进入循环时决定：接着旧计划跑，还是重新规划。"""
         if task.plan and checkpoint is not None and self._checkpoints is not None:
-            verdict = self._checkpoints.validate(checkpoint, observation)
-            if getattr(verdict, "value", verdict) == "resume":
+            verdict = self._checkpoints.validate(checkpoint, observation, task_version=task.version)
+            if verdict.value == "resume" and checkpoint.action_effect is not ActionEffectStatus.DISPATCHED:
                 logger.info("任务 %s 从恢复点继续（%s）", task.id, task.plan_progress())
                 return
-            logger.info("恢复点已失效，任务 %s 重新规划", task.id)
+            if verdict.value == "resume" and checkpoint.action_effect is ActionEffectStatus.DISPATCHED:
+                # 上次动作只 dispatch 未验证（EFFECT_UNKNOWN）：绝不能基于旧 action 盲目续跑，
+                # 否则「提交订单」这类动作可能被重复执行。清空计划，让 planner 按当前页面重新判断。
+                state.last_action_effect = ActionEffectStatus.EFFECT_UNKNOWN
+                logger.warning(
+                    "任务 %s 恢复点 %s 上次动作仅 dispatch 未验证（EFFECT_UNKNOWN），不盲目续跑，重新规划",
+                    task.id,
+                    checkpoint.id,
+                )
+            else:
+                logger.info("恢复点已失效（%s），任务 %s 重新规划", verdict.value, task.id)
             task.plan = []
 
         if task.plan:
             return
 
         try:
+            state.model_call_count += 1
             goals = planner.generate_plan(
                 task.instruction, observation.screenshot_path, observation.ui_tree
             )
@@ -268,13 +302,13 @@ class AgentRuntime:
         logger.info("任务 %s 计划：%s", task.id, task.plan_progress())
 
     def _observe(self, task: Task, state: RuntimeState, suffix: str = "") -> Observation | None:
-        state.step_index += 1
+        state.observation_count += 1
         try:
             return observer.observe(
-                self._session.controller, self._artifact_dir, state.step_index, suffix=suffix
+                self._session.controller, self._artifact_dir, state.observation_count, suffix=suffix
             )
         except Exception as exc:  # noqa: BLE001 - 设备抖动不能穿透到 API
-            logger.warning("任务 %s 第 %d 步观察失败: %s", task.id, state.step_index, exc)
+            logger.warning("任务 %s 第 %d 次观察失败: %s", task.id, state.observation_count, exc)
             return None
 
     def _decide(
@@ -286,6 +320,7 @@ class AgentRuntime:
     ) -> Decision | None:
         history = self._prompt_context(task)
         try:
+            state.model_call_count += 1
             return planner.plan_next_action(
                 task.instruction,
                 observation.screenshot_path,
@@ -313,6 +348,7 @@ class AgentRuntime:
             failure_reason=reason,
             failed_strategies=list(state.failed_strategies),
         )
+        state.model_call_count += 1
         try:
             decision = planner.replan(
                 context, observation.screenshot_path, observation.ui_tree, self._prompt_context(task)
@@ -420,16 +456,19 @@ class AgentRuntime:
         return self._checkpoints.load(task.id, task.checkpoint_id)
 
     def _save_checkpoint(
-        self, task: Task, state: RuntimeState, observation: Observation | None
+        self, task: Task, state: RuntimeState, observation: Observation | None, action: Action | None = None
     ) -> None:
         if self._checkpoints is None:
             return
         checkpoint = Checkpoint.capture(
             task_id=task.id,
-            step=state.step_index,
+            step=state.execution_step,
             step_states=task.step_states(),
             observation=observation,
             history_tail=self._trajectory.tail(task.id, 5) if self._trajectory else [],
+            task_version=task.version,
+            action_effect=state.last_action_effect,
+            last_action=action,
         )
         self._checkpoints.save(checkpoint)
         task.checkpoint_id = checkpoint.id

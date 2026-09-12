@@ -117,9 +117,19 @@ def test_action_risk_inference():
     assert Action(type=ActionType.TYPE, value="delete account").resolved_risk() is ActionRisk.DANGEROUS
 
 
-def test_explicit_risk_wins_over_inference():
+def test_model_cannot_downgrade_policy_risk():
+    """V2.1 §10/§11：策略风险是下限，模型声明的低风险不能把危险动作降级成安全。
+
+    模型若乱标 SAFE，命中「发送」这类不可撤销关键词的策略动作仍须判为 DANGEROUS。
+    """
     action = Action(type=ActionType.TAP, value="发送", risk=ActionRisk.SAFE)
-    assert action.resolved_risk() is ActionRisk.SAFE
+    assert action.resolved_risk() is ActionRisk.DANGEROUS
+
+
+def test_model_can_raise_policy_risk():
+    """模型可以把策略判为 CAUTION/SAFE 的动作显式抬到 DANGEROUS（走人工确认路径）。"""
+    action = Action(type=ActionType.TAP, target=Point(x=1, y=2), risk=ActionRisk.DANGEROUS)
+    assert action.resolved_risk() is ActionRisk.DANGEROUS
 
 
 def test_fingerprint_is_stable_for_identical_actions():
