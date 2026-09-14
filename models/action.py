@@ -122,6 +122,51 @@ SENSITIVE_PACKAGE_MARKERS = (
     "securities", "stock", "insurance", "billing",
 )
 
+# ---- 副作用幂等性（V2.7 P1-2）----
+#
+# 审核指出：**「风险等级」解决的是「能不能做」，「幂等性」解决的是「做过但不知道结果时
+# 能不能再做一次」。** 两者不能混为一谈——同属 DANGEROUS 的动作里，「查余额」和「转账」
+# 在 EFFECT_UNKNOWN 之后的正确处置完全不同。
+
+
+class SideEffectClass(str, Enum):
+    READ_ONLY = "read_only"
+    """不改变外部世界：观察、返回、回桌面。重做没有任何副作用。"""
+
+    IDEMPOTENT_WRITE = "idempotent_write"
+    """会改页面，但重做等价：打开某页面、切 Tab、划动、点击进入下一步。"""
+
+    NON_IDEMPOTENT_WRITE = "non_idempotent_write"
+    """重做会产生「第二条」：发消息、点赞、关注、收藏、分享、提交表单。"""
+
+    IRREVERSIBLE = "irreversible"
+    """不可撤销：支付、转账、下单、删除、注销、解绑。"""
+
+
+IRREVERSIBLE_KEYWORDS = (
+    "支付", "付款", "下单", "购买", "结算", "转账", "汇款", "提现", "扣款", "退款",
+    "删除", "移除", "注销", "解绑", "解约", "退订", "清空", "格式化", "免密",
+    "pay", "purchase", "checkout", "check out", "transfer", "withdraw", "delete",
+    "remove", "unbind", "reset",
+)
+
+NON_IDEMPOTENT_KEYWORDS = (
+    "发送", "提交", "点赞", "关注", "收藏", "分享", "转发", "评论", "报名", "预约",
+    "确认", "同意", "授权", "订购", "订阅", "邀请", "添加好友", "发布", "投币",
+    "send", "submit", "like", "follow", "share", "comment", "confirm", "agree",
+    "accept", "subscribe", "invite", "post",
+)
+
+# 只读 / 导航类动作类型：重做它们不会改变外部世界
+READ_ONLY_ACTION_TYPES = frozenset(
+    {ActionType.WAIT, ActionType.BACK, ActionType.HOME, ActionType.DONE, ActionType.DONE_REQUEST}
+)
+
+# 会改变页面的基础动作类型（点击 / 输入 / 划动）
+MUTATING_ACTION_TYPES = frozenset(
+    {ActionType.TAP, ActionType.LONG_PRESS, ActionType.TYPE, ActionType.SWIPE, ActionType.LAUNCH}
+)
+
 # 坐标量化粒度：落在同一个 16px 网格里的点击视为同一个动作。
 # 用向下取整而不是 round——round 在桶边界上会因 1px 抖动跳到相邻桶，让循环检测漏判。
 _FINGERPRINT_QUANTUM = 16
@@ -206,6 +251,37 @@ class Action(BaseModel):
         仍会被判定为 DANGEROUS——这是 HITL 门禁不被绕过的底线。
         """
         return strictest(self.policy_risk(), self.model_risk())
+
+    # ---- 副作用幂等性（V2.7 P1-2）----
+
+    def side_effect(self) -> SideEffectClass:
+        """这次动作的副作用类型：决定「EFFECT_UNKNOWN 之后能不能再做一次」。
+
+        与 `risk` 分工不同——风险管「能不能做」，幂等性管「做过但不知道结果时能不能再
+        做一次」。派生规则刻意保守（拿不准就往重里判）：不可逆关键词 → IRREVERSIBLE；
+        非幂等关键词 → NON_IDEMPOTENT_WRITE；只读 / 导航动作类型 → READ_ONLY；
+        其余会改页面的动作 → IDEMPOTENT_WRITE。
+        """
+        haystack = self._policy_haystack()
+        if any(keyword in haystack for keyword in IRREVERSIBLE_KEYWORDS):
+            return SideEffectClass.IRREVERSIBLE
+        if any(keyword in haystack for keyword in NON_IDEMPOTENT_KEYWORDS):
+            return SideEffectClass.NON_IDEMPOTENT_WRITE
+        if self.type in READ_ONLY_ACTION_TYPES:
+            return SideEffectClass.READ_ONLY
+        return SideEffectClass.IDEMPOTENT_WRITE
+
+    def is_safe_to_retry(self) -> bool:
+        """效果未知时，能不能自动再执行一次（V2.7 P1-2）。
+
+        只有**重做等价**的动作可以：只读动作重做没有副作用；打开页面 / 切 Tab / 划动
+        这类重做也等价。而「发消息」「点关注」「提交表单」重做会产生第二条，
+        「支付」「删除」重做更是不可逆——这两类一律交给人，不自动重试。
+        """
+        return self.side_effect() in (
+            SideEffectClass.READ_ONLY,
+            SideEffectClass.IDEMPOTENT_WRITE,
+        )
 
     @property
     def is_completion_request(self) -> bool:

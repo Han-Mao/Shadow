@@ -85,7 +85,7 @@ VLM 决定「下一步点哪里」，调度与检查点决定「多件事怎么�
 ├── scripts/
 │   ├── demo_preemption.py  # 抢占恢复演示（离线可跑）
 │   └── replay_task.py      # 命令行回放一个任务的事件流
-└── tests/                  # 428 个离线用例
+└── tests/                  # 432 个离线用例
 ```
 
 ## 职责边界
@@ -402,7 +402,7 @@ Scheduler
 等原设备回来（V2.3 起），改派等于把任务上下文悄悄丢到另一台手机上。
 
 单设备时只有一条车道，与旧实现逐字等价——这一点由当时的 257 个既有测试守着
-（V2.6 修复轮之后合计 428 个）。
+（V2.7 修复轮之后合计 432 个）。
 
 ### 多设备暴露出的两个正确性问题
 
@@ -714,6 +714,68 @@ runtime.run(): 有恢复点 → 走既有对账（validate + needs_reconciliatio
 注释，说明为什么这里不带 CAS、以及什么时候必须改。触发条件只有两个——**多进程 /
 多实例部署**，或**存储换成 SQLite**；届时把写入统一收口成一个协议，而不是逐点补参数。
 
+## V2.7 修复轮（依据 `v2.7审查建议.md`）
+
+这轮文档自己声明「无法 clone，结论基于已读代码」，所以**逐条核对比以往更重要**。
+12 条技术项：**2 条代码里已经做了**、**4 条本轮修掉**、其余 6 条属「有理由的延期」或代码质量项。
+
+### 本轮修掉的四条
+
+**P0-3 已绑定任务绝不回退默认设备。** `_session_for()` 原来是
+`self._pool.get(task.device_serial) or self._default_session` —— 绑定设备消失后会**悄悄**
+换成默认设备。这是跨设备上下文污染：A 任务停在微信页面、B 任务停在支付页面，把 A 的
+恢复点拿到 B 上接着点，等于把任务丢进别人的手机。现在：已绑定 → 找不到就抛
+`DeviceUnavailableError`（交给调度器落 `DEVICE_UNAVAILABLE`、等原设备回来）；
+**只有尚未绑定**的任务才允许分配默认设备。两条新用例分别钉住「绑定的不回退」与
+「未绑定的照常」。
+
+**P0-2 人工批准只能放行「那一个」动作。** 原来的 `approved_dangerous: bool` 是个开关：
+批准「确认付款」之后，**紧接着出现的任何危险动作**都会被静默放行——模型换个策略给出
+「删除账户」，也照样直接执行。现在改成 `ApprovalGrant`：绑定**动作指纹 + 目标版本 +
+计划版本**，放行前逐项匹配，对不上就作废并重新请求确认，而且**匹配成功即消费**（一次性）。
+
+**P1-2 引入副作用幂等性，与风险等级分开。** 审核这句话是对的：
+「风险等级解决*能不能做*，幂等性解决*做过但不知道结果时能不能再做*」。
+新增 `SideEffectClass`（`read_only` / `idempotent_write` / `non_idempotent_write` /
+`irreversible`）与 `Action.side_effect()`，派生规则保守（拿不准往重里判）。
+对账判定 `RETRY` 之前先看它：非幂等 / 不可逆一律转人工，不再「重做一次」。
+
+这条补的是一个真实盲区：`DANGEROUS_KEYWORDS` 覆盖了支付 / 发送 / 删除，但**点赞、关注、
+收藏、分享、评论**不在里面——风险不高，可重做一次就是第二条。
+
+**P1-8 确认令牌改为显式申请。** 原来 `GET /tasks/{id}` 会把可用的确认令牌直接放进响应。
+那意味着日志、前端状态、代理缓存、浏览器调试工具都可能留下一张「能放行真实危险动作」的
+凭据。现在 GET 只给元数据（含 `token_endpoint`），令牌改用新增的
+`POST /tasks/{id}/confirmation-token` 显式申请，并且申请本身进审计。
+
+### 代码里已经做了的（审核担心，但不必改）
+
+| 审查项 | 现有实现 |
+|---|---|
+| P1-1 抢占被长 ADB 阻塞 | `adb.deadline_budget(seconds)` 给整段采集加总预算，每条命令超时取 `min(自己的, 剩余预算)`；采集类 6s、写类 15s。另有抢占延迟观测与超阈值告警 |
+| P1-10 完成验证过度依赖页面变化 | `goal_verifier` 的三条独立证据里「页面推进过」只是其中之一；strict 模式还要求计划跑完 + 可核验声明与真实页面相符——页面变化**单独**不足以放行完成 |
+
+### 有理由的延期（附触发条件）
+
+| 审查项 | 为什么先不做 / 打算什么时候做 |
+|---|---|
+| P0-1 运行时状态只在内存 | 这些状态丢失的方向是**保守**的：`pending_confirmation` / `approved_dangerous` 丢了意味着**重新请人确认**，不是悄悄放行。唯一真实的副作用是 `denied_fingerprints` 丢失后可能再问一次已被否决的动作（骚扰，不危险）。修法（确认状态持久化）应该和 P0-2 的凭证一起设计——本轮先把凭证做成**可持久化的形状**（`ApprovalGrant` 已是 dataclass），落盘是下一步 |
+| P1-3 / P1-4 关系判定 | 缺口真实（`relevance = max(similarity, semantic)` 偏激进；字面否决会误杀「先帮我订酒店」这类依赖关系）。但它要改的是 LLM prompt 与判定阶段划分，属算法改版，不该和并发修复混在一轮 |
+| P1-5 状态迁移分散 | 已有唯一实现 `Task.transition_to()` + `source` 审计 + 终态硬闸；「事件驱动迁移」是更大的重构 |
+| P1-6 队列与持久化非原子 | 单进程内每 lane 单 worker + `lane.running` 单一，「两个 worker 拥有同一任务」不会发生；**跨进程**才需要 Task Lease —— 与 V2.6 §8 同一条触发条件 |
+| P1-9 checkpoint 门控 | `task_version` 已门控（不匹配直接 STALE）；`plan_version` **刻意不门控**（页面没变就该能续跑，V2.2 §十一 的取舍）；`action_attempt_id` 通过 `needs_reconciliation` 参与「先对账、再继续」 |
+| P2-1 / 2 / 3 | runtime 过大、错误分类依赖文本、fingerprint 语义分层——代码质量项，进待办 |
+
+### 对审核最后五条不变量的对照
+
+| 不变量 | 现状 |
+|---|---|
+| 一个任务同一时刻最多一个执行者 | ✅ 每设备一条 lane、单 worker、`lane.running` 单一（跨进程需 Lease） |
+| 已绑定任务绝不在其他设备执行 | ✅ 本轮修掉：调度层早已硬拒绝改派，现在 runtime 也堵住了回退 |
+| 未确认效果前不得盲目重做非幂等动作 | ✅ 本轮修掉（`Action.is_safe_to_retry`） |
+| 人工批准只对指定动作尝试有效 | ✅ 本轮修掉（`ApprovalGrant` 指纹 + 双版本绑定） |
+| 状态 / Checkpoint / 事件日志能解释同一条历史 | ✅ 事件流自足（`action_dispatched` 带 target/value/fingerprint、`action_verified` 带 layer/screenshot）；`source` 覆盖全部状态迁移 |
+
 ## 快速开始
 
 ```powershell
@@ -768,7 +830,8 @@ python -m api.server    # 监听 127.0.0.1:8010
 | `POST` | `/tasks/{id}/resume` | 恢复 |
 | `POST` | `/tasks/{id}/cancel` | 取消 |
 | `POST` | `/tasks/{id}/inject` | **执行中注入新指令**，由任务关系决定并入/排队/抢占 |
-| `POST` | `/tasks/{id}/confirm` | 危险动作的人工确认 / 完成裁定。启用鉴权时需带 `token` |
+| `POST` | `/tasks/{id}/confirmation-token` | **显式申请确认令牌**（V2.7 P1-8）。`GET /tasks/{id}` 只给元数据，不再下发可使用的令牌 |
+| `POST` | `/tasks/{id}/confirm` | 危险动作的人工确认 / 完成裁定 / 崩溃恢复放行。启用鉴权时需带 `token` |
 | `GET` | `/tasks/{id}/history` | 执行轨迹（给下一步决策看，会被裁剪） |
 | `GET` | `/tasks/{id}/events` | **审计事件流**（只追加，含抢占/对账/风险判定/完成驳回） |
 | `GET` | `/tasks/{id}/replay` | **回放**：`format=markdown` 给人看，默认 JSON 给程序用 |
@@ -834,7 +897,7 @@ pip install -r requirements.txt
 python -m pytest -q
 ```
 
-**428 个用例，全部离线**：不需要 adb、模拟器或 API Key。
+**432 个用例，全部离线**：不需要 adb、模拟器或 API Key。
 
 | 文件 | 覆盖 |
 |---|---|

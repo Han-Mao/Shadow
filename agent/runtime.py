@@ -18,7 +18,7 @@ from device.pool import DevicePool, storage_hint
 from device.session import DeviceBusyError, DeviceSession
 from models.action import Action, ActionType, ActionRisk, ActionEffectStatus, Decision
 from models.checkpoint import Checkpoint
-from models.exceptions import PersistenceError
+from models.exceptions import DeviceUnavailableError, PersistenceError
 from models.retry import (
     DEFAULT_POLICY,
     ErrorClass,
@@ -138,7 +138,40 @@ class RuntimeState:
     failed_strategies: list[str] = field(default_factory=list)
     denied_fingerprints: set[str] = field(default_factory=set)
     pending_confirmation: Action | None = None
-    approved_dangerous: bool = False
+    # 人工放行凭据（V2.7 P0-2）：绑定到**具体那一个动作**，不是「下一个危险动作」。
+    # 原来的 `approved_dangerous: bool` 只要为真就放行随后任何危险动作——批准「付款」
+    # 可能被用来放行紧接着出现的「删除」。改成凭证 + 逐项匹配 + 放行即消费。
+    approval: ApprovalGrant | None = None
+    # 请求确认那一刻的目标 / 计划版本，用来构造上面的放行凭据
+    pending_task_version: int = 0
+    pending_plan_version: int = 0
+
+
+@dataclass
+class ApprovalGrant:
+    """一次人工放行：**只对这一个动作、这一版目标与这一版计划有效**（V2.7 P0-2）。
+
+    布尔开关表达不了「批准的是哪一个动作」，于是批准完 A 之后紧接着出现的 B 也会被
+    静默放行。凭证化之后放行前必须逐项匹配，而且**匹配成功即消费**——人工批准是
+    「这一次可以」，不是「这个任务以后都可以」。
+    """
+
+    action_fingerprint: str
+    task_version: int
+    plan_version: int
+
+    def matches(self, action: Action, task: Task) -> bool:
+        return (
+            self.action_fingerprint == action.fingerprint
+            and self.task_version == task.version
+            and self.plan_version == task.plan_version
+        )
+
+    def describe(self) -> str:
+        return (
+            f"fingerprint={self.action_fingerprint} "
+            f"task_version={self.task_version} plan_version={self.plan_version}"
+        )
 
 
 class AgentRuntime:
@@ -168,13 +201,29 @@ class AgentRuntime:
         self._recovery_notes: dict[str, str] = {}
 
     def _session_for(self, task: Task) -> DeviceSession:
-        """按任务绑定的设备取会话（V2.1 §十三）。
+        """按任务绑定的设备取会话（V2.1 §十三 / V2.7 P0-3）。
 
         刻意**不做缓存**：多设备下 runtime 会被多个 worker 线程并发调用，
         缓存就是共享可变状态，而共享状态正是并发 bug 的来源。
         从池里按 serial 查一下的成本可以忽略。
+
+        **已绑定的任务绝不回退到别的设备**（V2.7 P0-3）。原来的
+        `self._pool.get(...) or self._default_session` 在「绑定设备不在池里」时会悄悄换成
+        默认设备——那是跨设备上下文污染：A 任务停在微信页面、B 任务停在支付页面，
+        把 A 的恢复点拿到 B 上接着点，等于把任务丢进别人的手机。
+        已绑定的任务只有两种结局：**用原设备**，或 `DEVICE_UNAVAILABLE`
+        （异常抛给调度器的失败分流，落 `DEVICE_UNAVAILABLE` 等原设备回来）。
+        只有**尚未绑定**的任务才允许分配默认设备。
         """
-        return self._pool.get(task.device_serial) or self._default_session
+        if task.device_serial:
+            session = self._pool.get(task.device_serial)
+            if session is None:
+                raise DeviceUnavailableError(task.id, task.device_serial)
+            return session
+        if self._default_session is None:
+            # 池里一台设备都没有：同样是「没有可用设备」，而不是「随便找一台」
+            raise DeviceUnavailableError(task.id, "（未绑定且设备池为空）")
+        return self._default_session
 
     # ---- 对外 ----
 
@@ -406,21 +455,43 @@ class AgentRuntime:
                     target=self._action_target(action),
                 )
 
-            if assessment.requires_confirmation and not state.approved_dangerous:
-                state.pending_confirmation = action
-                self._save_checkpoint(task, state, observation)
-                task.mark(TaskStatus.WAITING, source="runtime")
-                self._persist(task)
-                logger.warning("任务 %s 命中危险动作，等待人工确认：%s", task.id, action.type.value)
-                self._emit(
-                    task.id,
-                    WAITING,
-                    reason="dangerous_action",
-                    action=action.type.value,
-                    risk=assessment.effective.value,
-                    why=assessment.describe(),
-                )
-                return RunOutcome.AWAITING_CONFIRMATION
+            if assessment.requires_confirmation:
+                if state.approval is not None and state.approval.matches(action, task):
+                    # 一次性：放行即消费，绝不复用（V2.7 P0-2）
+                    logger.info(
+                        "任务 %s 的危险动作已获人工放行，本次放行即消费：%s",
+                        task.id,
+                        action.type.value,
+                    )
+                    state.approval = None
+                else:
+                    if state.approval is not None:
+                        # 批准的不是这个动作（动作本身 / 目标版本 / 计划版本任一变过）
+                        # → 凭证作废，重新请求确认（V2.7 P0-2）
+                        logger.warning(
+                            "任务 %s 的人工放行凭证与本动作不匹配（%s），作废并重新请求确认",
+                            task.id,
+                            state.approval.describe(),
+                        )
+                        state.approval = None
+                    state.pending_confirmation = action
+                    state.pending_task_version = task.version
+                    state.pending_plan_version = task.plan_version
+                    self._save_checkpoint(task, state, observation)
+                    task.mark(TaskStatus.WAITING, source="runtime")
+                    self._persist(task)
+                    logger.warning(
+                        "任务 %s 命中危险动作，等待人工确认：%s", task.id, action.type.value
+                    )
+                    self._emit(
+                        task.id,
+                        WAITING,
+                        reason="dangerous_action",
+                        action=action.type.value,
+                        risk=assessment.effective.value,
+                        why=assessment.describe(),
+                    )
+                    return RunOutcome.AWAITING_CONFIRMATION
 
             # ---- Act ----
             state.execution_step += 1
@@ -447,9 +518,8 @@ class AgentRuntime:
                 reason=action.reason,
             )
             result = self._execute(task, action, observation, session)
-            if state.approved_dangerous:
-                state.approved_dangerous = False
-                state.pending_confirmation = None
+            # 放行凭据已经在「放行那一刻」消费掉了（V2.7 P0-2），这里只需清掉待确认占位
+            state.pending_confirmation = None
             # 人工的完成认定只对「紧接着的那次完成申请」有效，
             # 一旦又去执行新动作，就说明任务其实还没结束
             state.goal_approved_by_human = False
@@ -590,13 +660,21 @@ class AgentRuntime:
             )
             return True
         pending = state.pending_confirmation
-        state.approved_dangerous = True
+        if pending is None:
+            return False
+        # 记下「批准的到底是哪一个动作、哪一版目标与计划」（V2.7 P0-2）：
+        # 放行时逐项比对，动作 / 目标 / 计划任一变过就作废——绝不拿来放行别的危险动作。
+        state.approval = ApprovalGrant(
+            action_fingerprint=pending.fingerprint,
+            task_version=state.pending_task_version,
+            plan_version=state.pending_plan_version,
+        )
         self._emit(
             task_id,
             CONFIRMED,
             approved=True,
-            action=pending.type.value if pending else "",
-            risk=pending.resolved_risk().value if pending else "",
+            action=pending.type.value,
+            risk=pending.resolved_risk().value,
         )
         return True
 
@@ -780,6 +858,21 @@ class AgentRuntime:
             return None
 
         if settled.action is reconciliation.ReconcileAction.RETRY:
+            action = settled.retry_action or checkpoint.last_action
+            if action is not None and not action.is_safe_to_retry():
+                # V2.7 P1-2：「重做」只对**重做等价**的动作安全。发消息 / 点赞 / 提交表单
+                # 这类非幂等动作、以及支付 / 删除这类不可逆动作，页面没变并不代表没生效——
+                # 重做就是第二条消息、第二笔订单。此时唯一正确的答案是问人。
+                return self._ask_human(
+                    task,
+                    state,
+                    action,
+                    reason="effect_unknown",
+                    message=(
+                        f"动作（{action.type.value}）效果未知，且副作用类型为 "
+                        f"{action.side_effect().value}——重做可能重复产生副作用，转人工确认"
+                    ),
+                )
             # 保留原计划，下一轮直接重做这个动作（不惊动模型）
             state.forced_action = settled.retry_action
             state.pending_effect_reconcile = False

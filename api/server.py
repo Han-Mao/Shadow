@@ -697,11 +697,11 @@ def get_task(task_id: str, request: Request):
     pending = runtime.pending_confirmation(task_id)
     if pending is not None:
         item = pending.model_dump(mode="json")
-        # 确认令牌绑定「调用方身份 + 任务 + 哪个动作 + 任务版本 + 有效期」（V2.2 §五）：
-        # 换个动作、任务被改写、换个人来提交、或者过期了，令牌都失效
-        item["token"] = auth.issue_confirmation_token(
-            principal.name, task_id, pending.fingerprint, task.version
-        )
+        # V2.7 P1-8：**GET 不再下发可直接使用的确认令牌**。响应会进日志、前端状态、
+        # 代理缓存和浏览器调试工具，而这是一张「能放行真实危险动作」的凭据。
+        # 这里只给元数据，令牌改为 POST 显式申请。
+        item.pop("token", None)
+        item["token_endpoint"] = f"/tasks/{task_id}/confirmation-token"
         item["token_expires_in_seconds"] = auth.CONFIRM_TTL_SECONDS
         payload["pending_confirmation"] = item
     payload["confirmation_kind"] = manager.confirmation_kind(task_id)
@@ -738,6 +738,42 @@ def cancel_task(task_id: str, request: Request):
     if not manager.cancel(task_id):
         raise HTTPException(status_code=409, detail="任务当前无法取消（可能已结束）")
     return {"ok": True, "task": manager.get(task_id).model_dump(mode="json")}
+
+
+@app.post("/tasks/{task_id}/confirmation-token")
+def issue_task_confirmation_token(task_id: str, request: Request):
+    """为当前待确认事项**显式申请**一张一次性令牌（V2.7 P1-8）。
+
+    为什么不跟 `GET /tasks/{id}` 一起返回：拿到令牌就能放行真实危险动作，而 GET 响应会
+    被写进日志、前端状态、代理缓存和调试工具。显式 POST 让「要动手机」这件事在审计里
+    看得见，获取时机也可控。
+
+    令牌绑定「调用方身份 + task_id + 动作指纹（或确认类型）+ 任务版本 + 有效期」，
+    并且是一次性的——消费后再用同一张票会被拒（V2.4 §九）。
+    """
+    task = require_task_access(task_id, request)
+    principal = current_principal(request)
+    kind = manager.confirmation_kind(task_id)
+    if kind == "none":
+        raise HTTPException(status_code=409, detail="该任务当前没有待确认的动作或裁定")
+
+    pending = runtime.pending_confirmation(task_id)
+    fingerprint = pending.fingerprint if pending is not None else kind
+    token = auth.issue_confirmation_token(principal.name, task_id, fingerprint, task.version)
+    if _AUDIT:
+        audit_log.record(
+            method="POST",
+            path=request.url.path,
+            principal=principal.name,
+            status=200,
+            note=f"confirmation token issued (kind={kind})",
+        )
+    return {
+        "token": token,
+        "expires_in_seconds": auth.CONFIRM_TTL_SECONDS,
+        "kind": kind,
+        "task_id": task_id,
+    }
 
 
 @app.post("/tasks/{task_id}/confirm")
