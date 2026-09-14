@@ -181,6 +181,9 @@ class AgentRuntime(
         logger.warning("任务 %s 崩溃重启且无可信恢复点，转人工确认", task.id)
         with self._states_lock:
             self._recovery_notes[task.id] = reason
+        # 把「上次动作效果未知」这件事落到 Task 上（V2.8 §八）：人工批准继续后它不能丢，
+        # 否则重新规划时模型不知道崩溃前可能有未决副作用，可能把同一条消息发第二遍。
+        task.recovery_note = reason
         # 这次标记已经处理过了，人工放行后不该被同一个门禁拦第二次
         task.recovery_required = False
         task.apply_event(TaskEvent.AWAITING_CONFIRMATION, source="runtime")

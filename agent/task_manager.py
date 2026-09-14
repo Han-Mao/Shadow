@@ -273,7 +273,11 @@ class TaskManager:
 
             if kind == "recovery":
                 # 人确认「可以继续」→ 重新规划：旧的 plan 是在崩溃前那份状态上排的，
-                # 沿用它等于假装那次中断没发生过（V2.6 §七）
+                # 沿用它等于假装那次中断没发生过（V2.6 §七）。
+                # V2.8 §八：**但「继续」不等于「上次副作用已忽略」**——`recovery_note`
+                # 里记着「上次动作效果未知」，这里**刻意不清空**，让它跟着任务进下一轮，
+                # runtime 重新规划时会把它作为 Re-plan 上下文，让模型先核验当前状态
+                # 而不是直接重复上次的动作（否则「发送/下单/支付/删除」可能做第二遍）。
                 task.recovery_required = False
                 task.plan = []
                 task.plan_version += 1

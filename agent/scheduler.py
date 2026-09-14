@@ -832,6 +832,12 @@ class TaskScheduler:
 
                 if lane.ready:
                     task = heapq.heappop(lane.ready)[3]
+                    # V2.8 §四：与 suspended 分支对齐——取出时若已终态 / 已取消，跳过并
+                    # 继续取下一个。持久化降级可能在「入队之后、worker 取出之前」把任务
+                    # 从队列清掉，但 ready 堆是惰性清理的，这里兜底防「取到一个 DEGRADED
+                    # / CANCELLED 的任务去执行」。
+                    if task.is_terminal or task.status is TaskStatus.CANCELLED:
+                        continue
                     lane.running = task
                     return task
 

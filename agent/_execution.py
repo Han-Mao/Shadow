@@ -64,6 +64,16 @@ class ExecutionMixin:
         state.run_version = task.version
         # 载入跨重启存活的决策状态（V2.7 P0-1）：用户否决过的动作，重启之后依然算数
         state.denied_fingerprints.update(task.denied_fingerprints)
+        # V2.8 §八：崩溃恢复批准后，`recovery_note` 记录了「上次动作效果未知」。
+        # 把它转成 Re-plan 理由，让 planner 先核验当前状态、而不是直接重复上次动作——
+        # 否则「发送 / 下单 / 支付 / 删除」这类不可逆动作可能被做第二遍。
+        if task.recovery_note:
+            state.pending_replan_reason = (
+                f"崩溃恢复后继续执行，但上次动作效果未知：{task.recovery_note}"
+                "（请先核验当前页面状态，不要直接重复上一个动作）"
+            )
+            # 消费一次：这条说明已转交 planner，不需要反复叠加
+            task.recovery_note = ""
         # 本任务跑在哪台设备上，由绑定决定——多设备时 worker 线程各跑各的，
         # 所以这个 session 只作为**局部变量**贯穿本次 run，不进实例状态
         session = self._session_for(task)

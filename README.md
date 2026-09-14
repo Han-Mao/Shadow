@@ -85,7 +85,7 @@ VLM 决定「下一步点哪里」，调度与检查点决定「多件事怎么�
 ├── scripts/
 │   ├── demo_preemption.py  # 抢占恢复演示（离线可跑）
 │   └── replay_task.py      # 命令行回放一个任务的事件流
-└── tests/                  # 447 个离线用例
+└── tests/                  # 448 个离线用例
 ```
 
 ## 职责边界
@@ -402,7 +402,7 @@ Scheduler
 等原设备回来（V2.3 起），改派等于把任务上下文悄悄丢到另一台手机上。
 
 单设备时只有一条车道，与旧实现逐字等价——这一点由当时的 257 个既有测试守着
-（V2.7 修复轮之后合计 447 个）。
+（V2.7 修复轮之后合计 448 个）。
 
 ### 多设备暴露出的两个正确性问题
 
@@ -833,7 +833,7 @@ runtime.run(): 有恢复点 → 走既有对账（validate + needs_reconciliatio
 拆解方法：**只做物理移动，不改任何行为**。方法之间通过 `self` 互相引用（`_emit` /
 `_persist` / `_save_checkpoint` / `_ask_human`），用 mixin 共享同一实例——所以
 `AgentRuntime` 的公共 API（`run` / `confirm` / `forget` / `is_goal_decision` /
-`last_goal_check` / `pending_confirmation` / `recovery_pending`）逐字不变，447 个用例
+`last_goal_check` / `pending_confirmation` / `recovery_pending`）逐字不变，448 个用例
 零回归就是证明。
 
 **P1-5（事件驱动状态迁移）本轮不做，如实说明**：文档建议把 Runtime / Scheduler 的
@@ -876,6 +876,27 @@ Runtime / Scheduler / TaskManager 三处全部写入点，回归风险远大于�
 | P1-7 | is_read_only 只停在 docstring，未真正参与加锁决策 | **已修**：`device_access` 加 `operation` 参数，加锁前用 `is_read_only` 真正校验——只读操作误包进加锁路径会抛 500 暴露接线错误；`/tap`/`/text`/`/back` 显式传操作名 |
 | P1-9 | validate 只校验 task_version+页面，未校验 plan_version 与 action_attempt_id | **已修**：补 `plan_version` 门控（不匹配 STALE）。`action_attempt_id` 已通过 `needs_reconciliation` 参与「先对账、再继续」，无需重复门控 |
 | P2-2 | 结构化字段优先，但执行阶段依赖 dispatch.error_class 是否传入 | **已修**：VLM ERROR 分支（动作发出但页面未达预期）的 dispatch 补 `error_class=action_rejected`，不再回退文本匹配 |
+
+## V2.8 修复轮（依据 `v2.8审查建议.md`）
+
+这份文档**引用的是 V2.7 之前的代码**——它声称「仍存在」的两个 P0（设备回退、`approved_dangerous: bool`）在上一轮已经修掉。逐条核对 HEAD 后，实际待修的是 2 条，其余要么已修、要么是有理由的延期：
+
+| 条目 | 文档判断 | HEAD 实况与处置 |
+|---|---|---|
+| §二 P0 设备回退 | 仍存在 `pool.get() or default_session` | **已修**（V2.7 P0-3）：已绑定找不到就抛 `DeviceUnavailableError`，文档引用的是旧代码 |
+| §三 P0 `approved_dangerous: bool` | 仍使用 bool | **已修**（V2.7 P0-2 + 补强）：已是 `ApprovalGrant`（含 task_id/attempt_seq），文档引用旧代码 |
+| §四 P1 提交非原子、队列未清理 | persist 失败后 ready 残留 | **已修**：`_persist_or_degrade` 失败会 `_drop_from_queues` 清理；本轮再补 `_pop_next` ready 分支的终态/取消过滤，与 suspended 分支对齐 |
+| §五 P1 execution_epoch | 旧上下文继续产生动作 | **延期**：已由三层兜住（run_version 围栏 + 安全点 status 检查 + `session.owned` 复核）。加 epoch 侵入面大、收益边际，与 TaskLease 同属多进程才需要 |
+| §六 P1 抢占 handoff_target | `_preempt_for` 无交接承诺 | **已覆盖**：抢占者先入 ready 再请求抢占，A 让出后 `_pop_next` 的优先级比较保证抢占者优先。`_preempt_for` 只是「通知让出」标记，交接靠优先级排序 |
+| §七 P1 EFFECT_UNKNOWN 幂等性 | 危险等级≠幂等性 | **已修**（V2.7 P1-2）：`SideEffectClass` + `is_safe_to_retry`，RETRY 前先过它，非幂等转人工 |
+| §八 P1 恢复批准语义 | 「继续」被等价「上次可忽略」 | **已修**：新增 `Task.recovery_note`，崩溃恢复时记「上次动作效果未知」，人工批准后**不清空**，runtime 重新规划时转成 Re-plan 理由让模型先核验 |
+| §九 P2 page_seen_changed | 页面变化被当过强证据 | **延期**：`page_seen_changed` 只是 GoalVerifier 三条独立证据之一，strict 模式还要求计划跑完 + 可核验声明。拆 environment/goal_progress 是 P2 增强 |
+| §十 P2 UI 语义角色 | 关键词覆盖不足 | **延期**：UI 语义角色（submit/purchase/delete 等）需要 VLM 或 UI 树 role 标注，属模型增强 |
+
+### 本轮真实改动（2 处 + 1 处语义加固）
+
+1. **§四**：`_pop_next` 的 ready 分支补终态/取消过滤（`is_terminal or CANCELLED → continue`），与 suspended 分支对齐——防止「持久化降级后 ready 堆里还残留的 DEGRADED/CANCELLED 任务被取出执行」。
+2. **§八**：`Task.recovery_note` 字段 + `_gate_crash_recovery` 写入 + `resolve_confirmation` 批准后保留 + `run()` 转成 Re-plan 理由并消费。把「人工批准继续 ≠ 上次副作用已忽略」从一句注释变成**可持久化、可追溯的事实**。
 
 ### 对审核最后五条不变量的对照
 
@@ -1008,7 +1029,7 @@ pip install -r requirements.txt
 python -m pytest -q
 ```
 
-**447 个用例，全部离线**：不需要 adb、模拟器或 API Key。
+**448 个用例，全部离线**：不需要 adb、模拟器或 API Key。
 
 | 文件 | 覆盖 |
 |---|---|
