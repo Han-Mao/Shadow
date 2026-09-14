@@ -43,9 +43,23 @@ DUPLICATE_SIMILARITY = 0.85
 
 # 这些关系要求两句话确实相关：subtask 是「当前任务的一部分」，
 # 但「先帮我打开微信发消息」对「淘宝搜索运动鞋」也会因为「先」命中规则——
-# 两者毫无交集，这时必须由相似度否决，否则会把无关任务塞进当前计划。
+# 两者毫无交集，这时必须否决，否则会把无关任务塞进当前计划。
 RELATION_NEEDS_AFFINITY = frozenset({TaskRelation.SUBTASK, TaskRelation.DUPLICATE})
-AFFINITY_FLOOR = 0.08
+
+# 相关性下限（V2.2 §八；V2.7 P1-3 重新定位）。
+#
+# 以前它是**唯一的否决器**：`relevance = max(字面, 语义)` 低于它就一票否决。审核指出
+# 两个方向都有问题：
+#   - 字面相似度不该单独当否决器——「帮我规划去上海的旅行」+「先帮我订酒店」几乎零
+#     重叠，却是真的依赖关系；
+#   - `max` 取最大值又偏激进——「给妈妈发微信」+「给爸爸发微信」字面很高，却是两件事。
+# 所以它现在的含义收窄为：**既没有明确语言标记、也没有共享实词时**，相关性要有多高
+# 才承认「这和当前任务是同一件事」。
+AFFINITY_FLOOR = 0.35
+
+# LLM 判成「需要相关性」的那两类关系（SUBTASK / DUPLICATE）时，置信度到多少才算
+# **明确表达了依赖**——用来豁免上面的相关性否决（V2.7 P1-4）。
+LLM_DEPENDENT_CONFIDENCE = 0.6
 
 LLMJudge = Callable[[str, str], TaskRelationResult]
 
@@ -80,6 +94,19 @@ def instruction_similarity(left: str, right: str) -> float:
     if not a or not b:
         return 0.0
     return len(a & b) / len(a | b)
+
+
+def shared_terms(left: str, right: str) -> set[str]:
+    """两句话共享的**实词**（V2.7 P1-3）。
+
+    这是「共享对象」的最粗糙证据：长度 ≥ 2 的 token 交集（中文按二元组天然 ≥ 2 字，
+    英文单词要求两个字母以上，滤掉 a / is 这类噪声）。
+
+    审核把它的必要性说得很准：字面相似度适合当**相关性证据**，不适合单独当**关系判定器**。
+    真实的依赖关系经常几乎零字面重叠（「帮我规划一次去上海的旅行」+「先帮我订酒店」），
+    而字面高度相似又可能是两件独立的事（「给妈妈发微信」+「给爸爸发微信」）。
+    """
+    return {token for token in (_tokens(left) & _tokens(right)) if len(token) >= 2}
 
 
 class TaskClassifier:
@@ -191,18 +218,34 @@ class TaskClassifier:
                 + "）"
             )
 
-        # ---- 6. 相似度否决 ----
-        if relation in RELATION_NEEDS_AFFINITY and current is not None and relevance < AFFINITY_FLOOR:
-            signals["affinity_veto"] = round(relevance, 3)
-            return TaskRelationResult(
-                relation=TaskRelation.UNRELATED,
-                confidence=round(min(0.85, 0.5 + best_rule_score * 0.3), 3),
-                reason=(
-                    f"倾向判为 {relation.value}，但与当前任务几乎没有共同点"
-                    f"（相关性 {relevance:.2f}），按独立任务处理"
-                ),
-                signals=signals,
+        # ---- 6. 相关性 + 共享对象 + 明确依赖（V2.7 P1-3 / P1-4）----
+        #
+        # 审核把两件事分得很准，这里一起处理：
+        #   P1-4「相似度适合当相关性证据，不适合单独当否决器」
+        #        → 有明确语言标记（「先…」「顺便…」）或 LLM 明确判依赖时，豁免否决；
+        #   P1-3「max 取最大值偏激进」
+        #        → 除此之外还要看「有没有共享实词」，防止字面撞车被误并进来。
+        shared = shared_terms(text, current.instruction) if current is not None else set()
+        signals["shared_terms"] = float(len(shared))
+
+        if relation in RELATION_NEEDS_AFFINITY and current is not None:
+            llm_says_dependent = (
+                llm_result is not None
+                and llm_result.relation in RELATION_NEEDS_AFFINITY
+                and llm_result.confidence >= LLM_DEPENDENT_CONFIDENCE
             )
+            explicit_dependency = best_rule_score >= RULE_INLINE_SCORE or llm_says_dependent
+            if relevance < AFFINITY_FLOOR and not explicit_dependency and not shared:
+                signals["affinity_veto"] = round(relevance, 3)
+                return TaskRelationResult(
+                    relation=TaskRelation.UNRELATED,
+                    confidence=round(min(0.85, 0.5 + best_rule_score * 0.3), 3),
+                    reason=(
+                        f"倾向判为 {relation.value}，但既没有明确的语言标记，"
+                        f"也没有共享对象（相关性 {relevance:.2f}），按独立任务处理"
+                    ),
+                    signals=signals,
+                )
 
         return TaskRelationResult(
             relation=relation,
