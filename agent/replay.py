@@ -31,12 +31,17 @@ from storage.event_log import (
     CONFIRMED,
     CREATED,
     DONE,
+    EFFECT_UNKNOWN,
     FAILED,
+    GOAL_CONFIRMED,
+    GOAL_REJECTED,
+    GOAL_REQUESTED,
     PREEMPT_REQUESTED,
     QUEUED,
     RECONCILED,
     RECOVERED,
     RESUMED,
+    RISK_ASSESSED,
     STARTED,
     SUSPENDED,
     WAITING,
@@ -78,6 +83,11 @@ _PHASE_BY_KIND: dict[str, ReplayPhase] = {
     ACTION_VERIFIED: ReplayPhase.ACTION,
     CHECKPOINT_SAVED: ReplayPhase.RECOVERY,
     RECONCILED: ReplayPhase.RECOVERY,
+    EFFECT_UNKNOWN: ReplayPhase.RECOVERY,
+    RISK_ASSESSED: ReplayPhase.CONTROL,
+    GOAL_REQUESTED: ReplayPhase.CONTROL,
+    GOAL_CONFIRMED: ReplayPhase.CONTROL,
+    GOAL_REJECTED: ReplayPhase.CONTROL,
     WAITING: ReplayPhase.CONTROL,
     CONFIRMED: ReplayPhase.CONTROL,
 }
@@ -85,7 +95,18 @@ _PHASE_BY_KIND: dict[str, ReplayPhase] = {
 # 「不顺利」的事件。回放报告的第一节就是它们——
 # 一个跑成功的任务没什么好看的，出问题的那几帧才是。
 _NOTABLE_KINDS = frozenset(
-    {PREEMPT_REQUESTED, SUSPENDED, RECONCILED, FAILED, CANCELLED, WAITING, RECOVERED}
+    {
+        PREEMPT_REQUESTED,
+        SUSPENDED,
+        RECONCILED,
+        FAILED,
+        CANCELLED,
+        WAITING,
+        RECOVERED,
+        # V2.2：效果未知与完成被驳回，都是「系统差点做错但被拦下」的证据
+        EFFECT_UNKNOWN,
+        GOAL_REJECTED,
+    }
 )
 
 _PHASE_LABEL = {
@@ -264,6 +285,19 @@ def _summarize(kind: str, data: dict) -> str:
         return f"重启后恢复（{data.get('restored_as')}）"
     if kind == RECONCILED:
         return f"动作对账 → {data.get('verdict')}：{data.get('reason')}"
+    if kind == EFFECT_UNKNOWN:
+        return (
+            f"效果未知：{data.get('action')} 已发出但拿不到验证观察（{data.get('reason')}）"
+        )
+    if kind == RISK_ASSESSED:
+        note = "（模型试图降级被拒）" if data.get("downgrade_blocked") else ""
+        return f"风险判定 {data.get('effective')}{note}：{data.get('reason')}"
+    if kind == GOAL_REQUESTED:
+        return f"模型申请完成（第 {data.get('rejections', 0)} 次被驳回过）：{data.get('reason')}"
+    if kind == GOAL_CONFIRMED:
+        return f"目标验证通过（{data.get('layer')}）：{data.get('reason')}"
+    if kind == GOAL_REJECTED:
+        return f"完成申请被**驳回**：{data.get('reason')}"
     if kind == WAITING:
         return f"命中危险动作 {data.get('action')}（{data.get('risk')}），等待人工确认"
     if kind == CONFIRMED:

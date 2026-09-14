@@ -40,6 +40,23 @@ FAILED = "failed"
 CANCELLED = "cancelled"
 RECOVERED = "recovered"
 
+# ---- V2.2 新增：把「谁做的决定」也变成可追溯事实 ----
+
+GOAL_REQUESTED = "goal_requested"
+"""模型申请完成（DONE_REQUEST）。申请 ≠ 完成。"""
+
+GOAL_CONFIRMED = "goal_confirmed"
+"""目标验证器确认完成（附独立证据）。"""
+
+GOAL_REJECTED = "goal_rejected"
+"""目标验证器**驳回**完成申请——声称完成与可核验事实矛盾。"""
+
+EFFECT_UNKNOWN = "effect_unknown"
+"""动作已发出但效果无法确认（拿不到验证观察）。下一个安全点要对账。"""
+
+RISK_ASSESSED = "risk_assessed"
+"""风险门禁的判定结论，含「模型试图降级被拒」这种要留痕的情况。"""
+
 
 @dataclass
 class Event:

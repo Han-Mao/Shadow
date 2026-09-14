@@ -31,6 +31,13 @@ class Checkpoint(BaseModel):
     # 说明任务目标已变（SUPER_TASK / re-plan 等），旧恢复点必须作废，不能盲续。
     task_version: int = 1
 
+    # 关联的计划版本（V2.2 §十一）。与 task_version 分开放：
+    #   task_version 变了 → 旧恢复点**绝对不能**用
+    #   plan_version 变了 → 目标没变、只是计划被改过（插入子任务 / Re-plan），
+    #                       恢复点仍然可用，但要能看出「它对应的是第几版计划」
+    # 只做记录与展示，不做门控——门控会误伤「目标没变、页面也没变」的安全续跑。
+    plan_version: int = 0
+
     current_step: int = 0
     step_states: dict[str, StepStatus] = Field(default_factory=dict)
 
@@ -73,6 +80,7 @@ class Checkpoint(BaseModel):
         observation: Observation | None,
         history_tail: list[Observation] | None = None,
         task_version: int = 1,
+        plan_version: int = 0,
         action_effect: ActionEffectStatus = ActionEffectStatus.NOT_STARTED,
         last_action: Action | None = None,
         action_attempt_id: str | None = None,
@@ -90,6 +98,7 @@ class Checkpoint(BaseModel):
             id=new_checkpoint_id(task_id, step),
             task_id=task_id,
             task_version=task_version,
+            plan_version=plan_version,
             current_step=step,
             step_states=dict(step_states),
             screenshot_path=observation.screenshot_path if observation else None,
@@ -125,6 +134,8 @@ class Checkpoint(BaseModel):
             "id": self.id,
             "task_id": self.task_id,
             "current_step": self.current_step,
+            "task_version": self.task_version,
+            "plan_version": self.plan_version,
             "package": self.package,
             "activity": self.activity,
             "step_states": {k: v.value for k, v in self.step_states.items()},

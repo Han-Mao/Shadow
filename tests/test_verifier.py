@@ -99,3 +99,75 @@ def test_done_action_skips_dispatch(monkeypatch):
 
     assert result.dispatch.status is DispatchStatus.SKIPPED
     assert result.goal.done
+
+
+# ---------------------------------------------------------------- V2.2 §七：认不出的结论不当成功
+
+
+def patch_vlm_unusable(monkeypatch):
+    """模拟 VLM 结论不可解读（`VlmVerifyError`）或整个不可用。"""
+    def boom(*args, **kwargs):
+        raise verifier_mod.vlm.VlmVerifyError("VLM 返回未知验证结论：'banana'")
+
+    monkeypatch.setattr(verifier_mod.vlm, "verify_transition", boom)
+
+
+def test_unusable_vlm_verdict_does_not_default_to_success(monkeypatch):
+    """没有语义证据 + 页面无变化 → 效果未知，**不是** OK。
+
+    旧实现里 `{"result": "banana"}` 匹配不上 done/error，直接落到默认分支
+    `outcome=OK`，等于「模型胡说 = 这步过了」。
+    """
+    patch_vlm_unusable(monkeypatch)
+
+    result = verify_action("做事", obs(1, UI_A), tap(), obs(2, UI_A), {"ok": True})
+
+    assert result.effect.status is ActionEffectStatus.EFFECT_UNKNOWN
+    assert not result.goal.achieved
+    assert result.effect.ambiguous
+
+
+def test_dangerous_action_without_evidence_is_never_treated_as_success(monkeypatch):
+    """不可撤销动作 + 拿不到独立证据 → 效果存疑，绝不能静默放行。"""
+    patch_vlm_unusable(monkeypatch)
+    danger = Action(type=ActionType.TAP, value="确认付款", target=Point(x=10, y=20))
+
+    result = verify_action("付款", obs(1, UI_A), danger, obs(2, UI_A), {"ok": True})
+
+    assert result.effect.status is ActionEffectStatus.EFFECT_UNKNOWN
+    assert result.effect.ambiguous
+    assert not result.goal.achieved
+    assert not result.should_retry, "危险动作绝不自动重试"
+
+
+def test_local_evidence_rescues_an_unusable_vlm(monkeypatch):
+    """VLM 不可用，但页面结构确实变了 → 有据可依，成功。
+
+    注意这不是「默认成功」：依据（l3_structure）会被明确记录。
+    """
+    patch_vlm_unusable(monkeypatch)
+
+    result = verify_action("做事", obs(1, UI_A), tap(), obs(2, UI_B), {"ok": True})
+
+    assert result.outcome is StepOutcome.OK
+    assert result.effect.status is ActionEffectStatus.VERIFIED_SUCCESS
+    assert result.effect.evidence == "l3_structure"
+    assert result.goal.independent_evidence
+
+
+def test_navigation_change_outranks_structure_evidence(monkeypatch):
+    """同一次验证里，导航变化（L2）比结构变化（L3）更硬，证据层要如实反映。"""
+    patch_vlm(monkeypatch, "ok")
+    after = Observation(
+        step=2,
+        screenshot_path="/tmp/s2.png",
+        package="com.demo",
+        activity=".Detail",
+        ui_tree=UI_B,
+    )
+
+    result = verify_action("做事", obs(1, UI_A), tap(), after, {"ok": True})
+
+    assert result.layer == "vlm+l2_navigation"
+    assert result.effect.evidence == "l2_navigation"
+    assert result.effect.changed

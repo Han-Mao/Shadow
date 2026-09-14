@@ -6,7 +6,9 @@
 
 - V1（M1–M3）已完成：设备控制、视觉感知、Observe → Think → Act → Verify 闭环
 - V2 在此之上补齐 **任务管理层**：任务模型、关系识别、调度抢占、检查点恢复
-- 依据：《蓝色鲸鱼 Agent · 方案三》§09/§10 + 《V2 审核建议》
+- V2.1 分五轮落地《v2.1审核建议》的 21 项改造（预算/版本门控/重试策略/对账/指纹/回放/多设备）
+- V2.2 修复《2.1存在的问题》点出的 12 项缺陷，重点在**安全与正确性**：
+  危险动作不绕过确认、未知效果不当成功、完成需独立验证、多设备不互相干扰
 
 ## 架构
 
@@ -48,7 +50,9 @@ VLM 决定「下一步点哪里」，调度与检查点决定「多件事怎么�
 │   ├── planner.py          # 语义级规划 + 结构化 Re-plan
 │   ├── observer.py         # 采集 Observation（截图 + UI 树 + 上下文）
 │   ├── executor.py         # Action → DeviceController（承诺永不抛异常）
-│   ├── verifier.py         # 多级验证：Device → UI Tree → VLM
+│   ├── verifier.py         # 多级验证：Device → 导航 → 结构 → 目标元素 → VLM
+│   ├── evidence.py         # 多级证据：页面变没变、依据哪一层（V2.2 §六）
+│   ├── goal_verifier.py    # 目标验证：完成是「申请」，由独立证据裁定（V2.2 §四）
 │   ├── task_manager.py     # 任务生命周期与指令注入
 │   ├── classifier.py       # 任务关系识别（三层融合）
 │   ├── risk_gate.py        # 统一风险门禁（策略风险 = 下限，模型只能抬不能降）
@@ -66,19 +70,22 @@ VLM 决定「下一步点哪里」，调度与检查点决定「多件事怎么�
 │   ├── retry.py            # ErrorClass + RetryPolicy：错误分类与重试的唯一真相源
 │   ├── verification.py     # ActionDispatch / ActionEffect / GoalVerification 三概念
 │   └── state.py            # Observation / StepOutcome
-├── storage/                # TaskStore / CheckpointStore / TrajectoryStore（落盘）/ EventLog
+├── storage/                # TaskStore / CheckpointStore / TrajectoryStore / EventLog / AuditLog
 ├── device/
 │   ├── adb.py screenshot.py accessibility.py emulator.py
 │   ├── session.py          # DeviceSession：设备所有权与抢占交接
 │   ├── pool.py             # DevicePool：serial → 会话的注册表（多设备）
 │   └── input.py            # InputProvider：ASCII 与中文输入通道
 ├── vision/                 # vlm / grounding / parser
-│   └── fingerprint.py      # UI 结构指纹：恢复校验的 L2（比 package 细、比 VLM 便宜）
-├── api/server.py           # FastAPI
+│   ├── fingerprint.py      # UI 结构指纹：恢复校验的 L2（比 package 细、比 VLM 便宜）
+│   └── target.py           # 把动作目标还原成 UI 节点（风险判定与效果验证共用）
+├── api/
+│   ├── server.py           # FastAPI
+│   └── auth.py             # 令牌 / 只读 / 设备范围 / 人工确认令牌（V2.2 §九）
 ├── scripts/
 │   ├── demo_preemption.py  # 抢占恢复演示（离线可跑）
 │   └── replay_task.py      # 命令行回放一个任务的事件流
-└── tests/                  # 257 个离线用例
+└── tests/                  # 331 个离线用例
 ```
 
 ## 职责边界
@@ -166,9 +173,11 @@ python scripts/replay_task.py 20260914_093100_demo01
 
 ### 5. 执行安全
 
-- **风险分级**：`safe / caution / dangerous`。`resolved_risk()` 取 **策略风险（下限）与模型声明风险的较大值**：
-  命中「发送/支付/删除/下单」等关键词即升级为危险动作；模型可以显式把风险抬到更高，
-  **但绝不允许把策略判定的危险动作降级成安全**（防止模型乱标 SAFE 绕过 HITL）。
+- **风险分级**：`safe / caution / dangerous`。判定走 `ActionRiskGate`（唯一入口），
+  结果是 `max(策略风险, 模型声明风险)`，其中策略风险由**三路证据**合成：
+  动作类型 + 动作文本关键词 + **UI 树上目标元素的真实文本**（见 V2.2 §一），
+  再叠加敏感 App 页面下限。模型的风险表态进 `risk_hint`，只能抬不能降，
+  降级尝试会被记录并忽略。
 - **HITL 门禁**：危险动作挂起任务等人工确认，批准才放行；被否决的动作进黑名单，
   下次再出现直接换策略，不会陷入「请求确认 → 否决 → 再请求」的空转
 - **死循环检测**：连续 3 次做出语义相同的动作（坐标容差 24px）即强制换策略，
@@ -391,7 +400,8 @@ Scheduler
 等于把任务丢到一台陌生手机上接着做。未绑定的任务由调度器派给最闲的一台；
 绑定的设备不在池里（拔线/换机）时改派，否则这条任务永远没人取走、悄悄变成僵尸。
 
-单设备时只有一条车道，与旧实现逐字等价——这一点由 257 个既有测试守着。
+单设备时只有一条车道，与旧实现逐字等价——这一点由当时的 257 个既有测试守着
+（V2.2 修复轮之后合计 331 个）。
 
 ### 多设备暴露出的两个正确性问题
 
@@ -412,6 +422,81 @@ Scheduler
 
 **仍未做**：§24 目录重构（已确认不改）、真正的负载均衡（当前只是「挑最闲的一条」，没考虑设备异构性）、
 多设备的截图/产物分目录（`device.pool.storage_hint` 已备好，尚未接线）。
+
+## V2.2 修复轮（依据 `2.1存在的问题.md`）
+
+这一轮不堆功能，只修一个静态审查文档点出的 12 个问题。审查是针对**更早的提交**做的，
+所以第一步是逐条核对现状：**5 项已在 V2.1 各轮中修过**（风险门禁、动作效果状态、
+检查点版本门控、部分对账、分关系阈值），**7 项仍然真实存在**，包括审查标为 P0 的两项。
+
+| # | 审查项 | 现状核对 | 改动 | 落点 |
+|---|---|---|---|---|
+| 1 | P0 风险门禁只是 `resolved_risk()` 的包装 | 部分存在：`max(policy, model)` 已实现，但**门禁拿不到页面上下文** | 门禁拆出显式的 `policy_risk` / `model_risk` / `declared_risk`，并把 **UI 树上目标元素的真实文本**纳入策略风险 | `agent/risk_gate.py`、`models/action.py`、`vision/target.py` |
+| 2 | P1 `preempt_running()` 不带 task_id | **存在** | 传 `current.id`；不带参时打 warning；自身抢占也计入延迟观测 | `agent/task_manager.py`、`agent/scheduler.py` |
+| 3 | P1 重新观察失败被当成 OK | **存在** | 落 `EFFECT_UNKNOWN`，并在**下一个安全点就地在线对账**（继续/重做/找人） | `agent/runtime.py`、`agent/reconciliation.py` |
+| 4 | P1 `DONE` 是一句模型就能结束任务 | **存在** | 新增 `GoalVerifier`：计划、页面推进、可核验声明三条独立证据；有反证才驳回。新增动作别名 `DONE_REQUEST` | `agent/goal_verifier.py`、`agent/runtime.py`、`agent/verifier.py` |
+| 5 | P1 预算新旧语义混用 | **存在** | API 新增 `budget`（三个独立上限）；`max_steps` 保留为兼容层并写死映射规则 | `api/server.py`、`models/budget.py` |
+| 6 | P2 UI 树变化判断只比 clickable label 集合 | **存在** | 换成多级证据：L2 导航 / L3 结构指纹 / L4 目标元素状态，并记录「结论依据哪一层」 | `agent/evidence.py`、`agent/verifier.py` |
+| 7 | P2 VLM 未知结论被默认当成功 | **存在** | `VerifyResult` 严格枚举；解析不出抛 `VlmVerifyError`，走「证据不足」分支 | `vision/vlm.py` |
+| 8 | P2 风险关键词漏判 | **存在** | 关键词扩表 + 目标元素文本/resource-id + 敏感 App 页面下限 | `models/action.py`、`agent/risk_gate.py` |
+| 9 | P2 API 几乎没有认证授权 | **存在** | 令牌鉴权 + 只读令牌 + 设备级权限 + 人工确认令牌 + 请求审计；非回环绑定且无令牌时拒绝启动 | `api/auth.py`、`storage/audit_log.py`、`api/server.py` |
+| 10 | P2 单设备兼容代码残留 | 部分存在 | `running_tasks()` 取代「唯一 running」；`_running` 降级为兼容视图并标注 | `agent/scheduler.py`、`agent/task_manager.py` |
+| 11 | §11 SUBTASK 注入不更新版本号 | **存在** | `_merge_subtask` 递增 `plan_version`；`Checkpoint` 记录 `plan_version` 便于回溯 | `agent/task_manager.py`、`models/checkpoint.py` |
+| 12 | 缺端到端状态机测试 | 部分存在 | 新增双设备跨设备干扰、SUBTASK 注入 + 崩溃恢复、效果未知对账、完成申请驳回等 57 条用例 | `tests/test_multi_device_e2e.py`、`test_risk_gate.py`、`test_goal_verifier.py`、`test_evidence.py`、`test_api_auth.py` |
+
+### 四个必须修的，各自到底改了什么
+
+**1. 风险判定现在看得见页面。** 之前门禁只是 `resolved_risk()` 的一层包装，
+它只看得到动作自己。于是这种情形一路绿灯：
+
+```json
+{"action_type": "tap", "target": "点击红色按钮", "risk_hint": "safe"}
+```
+
+那个红色按钮实际叫「立即购买」——**这个信息在 UI 树里，不在动作里**。
+现在门禁把目标坐标还原成 UI 节点（取包含该点的**最小**节点），
+拿它的 text / content-desc / resource-id 一起参与关键词判定。
+模型的风险表态改名为 `risk_hint`（建议），与 `risk`（权威标注）分开存，
+降级尝试会被记录并忽略——审计能回答「这级风险到底是谁定的」。
+
+**2. 效果未知不再是成功。** 旧路径：
+
+```text
+点击发送 → ADB 成功 → 截图失败 → 「未验证的 OK」→ 下一轮模型看到页面没变 → 再点一次 → 重复发送
+```
+
+现在 `EFFECT_UNKNOWN` 会触发**在线对账**：下一个安全点拿到新观察后，
+比对该动作发出前的页面结构，四条路分别是继续 / 重做一次 / 重新规划 / 转人工。
+危险动作在缺乏强证据时一律转人工——宁可多问一次人，也不能重复扣款。
+
+**3. 完成变成「申请」。** `DONE` 不再直接结束任务。`GoalVerifier` 用三条**不依赖模型自述**
+的证据裁定：计划是否跑完、页面是否真的推进过、模型给的可核验声明是否与真实页面相符。
+
+```text
+VLM → DONE_REQUEST → GoalVerifier → 确认 / 打回继续做 / 转人工裁定
+```
+
+诚实地说清这条边界：**证据不足 ≠ 有反证**。没有证据的完成申请会被如实记为
+`uncertain` 并放行（否则 Agent 会变得不可用），只有拿到反证才驳回。
+驳回结果全部进事件流（`goal_requested` / `goal_rejected` / `goal_confirmed`），
+所以「它凭什么说完成了」事后查得出来。
+
+**4. API 有了四层防护。** 令牌、只读、设备范围、确认令牌，外加请求审计。
+刻意保住「本地开发零配置」：不配令牌就不鉴权；一旦配上，四层同时生效。
+另外有一条硬约束——**绑定非回环地址却没有令牌时直接拒绝启动**，
+防止「图省事改个 HOST 就裸奔上线」。
+
+### 行为变化提醒
+
+- **完成变得更保守**：模型声称完成时若既没走完计划、页面一次都没推进、又没给理由，
+  会被驳回并塞一个 Re-plan 理由继续做；连续驳回超过 `MAX_GOAL_REJECTIONS`(2) 次转人工。
+  想回到旧行为可设 `GOAL_VERIFY_MODE=off`，要更严可设 `strict`。
+- **拿不到验证观察时会重做一次动作**（普通动作）。这是有意的：页面结构完全没变
+  说明上次很可能没生效；危险动作不在其列。
+- **风险告警不再误报**：只有模型**明确声明**了更低的风险才算降级尝试，
+  「没表态」不等于「说了 safe」。
+- **`ActionType.DONE_REQUEST`** 是 `DONE` 的别名，模型可以直接用；
+  两者都只表示「申请完成」。
 
 ## 快速开始
 
@@ -444,6 +529,14 @@ python -m api.server    # 监听 127.0.0.1:8010
 | `OBSERVE_BUDGET_SECONDS` | 一次采集（截图 + UI 树 + 上下文）的**总**预算，决定抢占延迟上界 | `12` |
 | `ADB_READ_TIMEOUT_SECONDS` | 采集类 adb 命令的单条超时（写类固定 15s） | `6` |
 | `PORT` | API 端口 | `8010` |
+| `HOST` | 监听地址；**非回环且未配令牌时拒绝启动** | `127.0.0.1` |
+| `SHADOW_API_TOKEN` | API 访问令牌；不设置则关闭鉴权（仅建议本机） | 未设置 |
+| `SHADOW_API_READONLY_TOKEN` | 只读令牌（仅 GET） | 未设置 |
+| `SHADOW_API_DEVICE_ALLOW` | 令牌可操作的设备 serial，逗号分隔 | 不限 |
+| `SHADOW_REQUIRE_AUTH` | 置 1 时即使没配令牌也拒绝一切请求 | 未设置 |
+| `GOAL_VERIFY_MODE` | 完成验证严格度：`off` / `advisory`(默认) / `strict` | `advisory` |
+| `AUDIT_DIR` | 请求审计目录 | `$STORAGE_DIR/audit` |
+| `SHADOW_AUDIT` | 置 0 关闭请求审计 | 开启 |
 | `SHADOW_DEBUG` | 置 1 时 500 响应回传异常摘要（默认脱敏） | 未设置 |
 
 ## API
@@ -454,18 +547,33 @@ python -m api.server    # 监听 127.0.0.1:8010
 |---|---|---|
 | `POST` | `/tasks` | 创建任务。默认后台执行，`wait=true` 同步等待（超时 504） |
 | `GET` | `/tasks` | 列出全部任务 |
-| `GET` | `/tasks/{id}` | 查询详情（含计划进度与待确认动作） |
+| `GET` | `/tasks/{id}` | 查询详情（含计划进度、待确认动作 + 确认令牌、最近一次完成裁定） |
 | `POST` | `/tasks/{id}/pause` | 暂停 |
 | `POST` | `/tasks/{id}/resume` | 恢复 |
 | `POST` | `/tasks/{id}/cancel` | 取消 |
 | `POST` | `/tasks/{id}/inject` | **执行中注入新指令**，由任务关系决定并入/排队/抢占 |
-| `POST` | `/tasks/{id}/confirm` | 危险动作的人工确认 |
+| `POST` | `/tasks/{id}/confirm` | 危险动作的人工确认 / 完成裁定。启用鉴权时需带 `token` |
 | `GET` | `/tasks/{id}/history` | 执行轨迹（给下一步决策看，会被裁剪） |
-| `GET` | `/tasks/{id}/events` | **审计事件流**（只追加，含抢占/对账/失败原因） |
+| `GET` | `/tasks/{id}/events` | **审计事件流**（只追加，含抢占/对账/风险判定/完成驳回） |
 | `GET` | `/tasks/{id}/replay` | **回放**：`format=markdown` 给人看，默认 JSON 给程序用 |
 | `GET` | `/tasks/{id}/checkpoint` | 最新恢复点 |
 | `GET` | `/tasks/{id}/shots/{n}` | 某一步的截图 |
-| `GET` | `/scheduler` | 调度器状态（running / ready / paused / suspended + 设备归属） |
+| `GET` | `/scheduler` | 调度器状态（含 `devices` 逐设备详情与 `running_tasks`） |
+| `GET` | `/health` | 探活。**唯一不需要鉴权**的端点 |
+
+### 预算怎么传
+
+三种上限互相独立，`max_steps` 只是动作步数的兼容别名：
+
+```json
+{
+  "instruction": "帮我订一张高铁票",
+  "budget": { "max_action_steps": 25, "max_observations": 80, "max_model_calls": 60 }
+}
+```
+
+`max_steps=10` 等价于 `{"budget": {"max_action_steps": 10}}`，
+**观察与模型调用仍是默认的 60 / 40**——这一点以前是含糊的，现在写死在兼容层里。
 
 ### 设备直连（单步调试）
 
@@ -506,7 +614,7 @@ pip install -r requirements.txt
 python -m pytest -q
 ```
 
-**257 个用例，全部离线**：不需要 adb、模拟器或 API Key。
+**331 个用例，全部离线**：不需要 adb、模拟器或 API Key。
 
 | 文件 | 覆盖 |
 |---|---|
@@ -514,14 +622,19 @@ python -m pytest -q
 | `test_device.py` | ADB 封装、输入通道（含中文）、设备会话所有权与并发、**命令超时分级与总预算**、**多设备 serial 解析** |
 | `test_device_pool.py` | **DevicePool**：注册/查找、未知设备报错、空闲筛选、产物按设备分目录 |
 | `test_trajectory_store.py` | **轨迹落盘**：重启可读、ui_tree 不落盘、窗口裁剪、紧凑化、坏行容错 |
-| `test_vision.py` | UI 树容错、坐标落点、VLM 重试、prompt 构造 |
-| `test_verifier.py` | **验证三概念**：发出 / 效果 / 目标，含「VLM 说成功但页面没变 → 效果存疑」 |
+| `test_vision.py` | UI 树容错、坐标落点、VLM 重试、prompt 构造、**严格验证枚举**、**风险建议与完成声明解析** |
+| `test_evidence.py` | **多级证据**：结构指纹、导航变化、目标元素状态、树坏掉时判「不可比」 |
+| `test_risk_gate.py` | **风险门禁**：策略⊕模型、降级被拒并留痕、**UI 节点文本抬升风险**、敏感页下限 |
+| `test_goal_verifier.py` | **目标验证**：可核验声明命中/矛盾、计划完成、页面无推进时驳回、严格/关闭模式 |
+| `test_verifier.py` | **验证三概念** + **认不出的 VLM 结论不当成功**、危险动作无证据不放过 |
 | `test_event_log.py` | 事件日志：顺序、按任务隔离、limit、截断行容错、写失败不抛异常 |
 | `test_replay.py` | **回放**：时间轴顺序与偏移、异常帧挑选、Markdown 报告、动作计划、**重放的安全默认** |
 | `test_classifier.py` | 三层关系判定、相似度否决、**分关系阈值**、二次确认标记、**语义相似度** |
 | `test_scheduler.py` | 优先级、暂停/取消、**抢占与恢复**、组合式中断、**启动恢复**（含审批前重启）、**抢占延迟观测**、设备占用、**多设备并行/绑定/改派** |
-| `test_runtime.py` | 闭环执行、异常收敛、死循环、HITL、Checkpoint 恢复、**三预算门控**、**动作对账**（继续/重做）、批准一次性、**执行记录**、事件流、**事件自足性**、**按绑定设备取会话** |
-| `test_api.py` | HTTP 契约、状态码语义、错误脱敏、危险动作拦截、SUPER_TASK 改写与二次确认、**依赖链迁移**、版本门控、**/events 审计流**、**/replay 回放** |
+| `test_multi_device_e2e.py` | **双设备跨设备干扰**、逐设备 running 视图、**SUBTASK 注入 + 崩溃恢复**（含 `plan_version`）、恢复后跑完 |
+| `test_runtime.py` | 闭环执行、异常收敛、死循环、HITL、Checkpoint 恢复、**三预算门控**、**动作对账**、**效果未知在线对账**、**完成申请驳回/转人工**、**风险门禁接入闭环**、事件自足性、按绑定设备取会话 |
+| `test_api.py` | HTTP 契约、状态码语义、错误脱敏、危险动作拦截、SUPER_TASK 改写与二次确认、依赖链迁移、版本门控、`/events`、`/replay`、**预算入参** |
+| `test_api_auth.py` | **鉴权/只读/设备范围/确认令牌/请求审计**、`/health` 公开、**非回环裸绑定拒绝启动** |
 
 ## 注意事项
 
@@ -530,8 +643,10 @@ python -m pytest -q
 - 坐标解析：`target` 可为 `{"x":..,"y":..}`、`"x,y"`、`"x1,y1,x2,y2"`、`"[x1,y1][x2,y2]"` 或元素描述文本。
   0~1 之间按归一化比例换算，其余按像素；换算基准取 `wm size` 的 **Override size**（实际渲染尺寸）。
   解析失败会抛出明确错误，不会静默回退到屏幕中心。
-- **单设备串行**：全局只有一台目标设备，所有写操作经由 `DeviceSession` 串行化；
-  扩展多设备前需要把会话拆成 per-serial。
+- **单设备串行**：写操作经由 `DeviceSession` 串行化；多设备时每台一条车道、各自串行。
+- **部署提醒**：这个 API 的敏感端点（`/actions`、`/tasks`、`confirm`、`inject`）能直接操作真实手机。
+  只在本机用可以零配置；一旦要放到 0.0.0.0 / Docker / 反向代理后面，
+  必须配 `SHADOW_API_TOKEN`，否则服务会拒绝启动。`/confirm` 启用鉴权后还需带确认令牌。
 - 执行器与观察阶段都承诺「不抛异常」，失败统一收敛为 `ERROR` 步骤并计入重试熔断；
   任务一旦启动，任何异常都会先把状态落为失败态，不会留下卡在 `running` 的僵尸任务。
 - VLM 调用对 429 / 5xx / 网络错误做 3 次指数退避重试；4xx（除 429）不重试。

@@ -306,3 +306,96 @@ def test_classify_relation_rejects_unknown_relation(monkeypatch):
     result = vlm.classify_relation("x", "y")
     assert result.relation.value == "unrelated"
     assert "未知关系" in result.reason
+
+
+# ---------------------------------------------------------------- V2.2 §七：严格验证枚举
+
+
+def patch_chat(monkeypatch, content: str) -> None:
+    monkeypatch.setenv("VLM_API_KEY", "test-key")
+    monkeypatch.setattr(
+        vlm.httpx,
+        "post",
+        lambda *a, **k: FakeResponse(200, {"choices": [{"message": {"content": content}}]}),
+    )
+
+
+def two_shots(tmp_path) -> tuple[str, str]:
+    """验证要读两张真实截图文件（`_encode_image` 会 open），所以先落两个占位图。"""
+    pre = tmp_path / "pre.png"
+    post = tmp_path / "post.png"
+    pre.write_bytes(b"\x89PNG\r\n\x1a\n")
+    post.write_bytes(b"\x89PNG\r\n\x1a\n")
+    return str(pre), str(post)
+
+
+def test_verify_transition_returns_strict_enum(monkeypatch, tmp_path):
+    patch_chat(monkeypatch, '{"result": "DONE", "reason": "页面已到详情页"}')
+
+    verdict = vlm.verify_transition(*two_shots(tmp_path), "任务", {"type": "tap"})
+
+    assert verdict is vlm.VerifyResult.DONE
+
+
+def test_verify_transition_rejects_unknown_value(monkeypatch, tmp_path):
+    """`{"result": "banana"}` 必须报错，不能原样传下去。
+
+    旧实现是 `str(data.get("result", "ok")).lower()`：认不出的值会一路传到 verifier，
+    匹配不上 done/error 之后落到默认分支 `outcome=OK` —— 相当于「模型胡说 = 这步过了」。
+    """
+    patch_chat(monkeypatch, '{"result": "banana"}')
+
+    with pytest.raises(vlm.VlmVerifyError, match="未知验证结论"):
+        vlm.verify_transition(*two_shots(tmp_path), "任务", {"type": "tap"})
+
+
+def test_verify_transition_rejects_missing_result(monkeypatch, tmp_path):
+    """空对象以前会被解析成 "ok"（默认值），现在必须报错。"""
+    patch_chat(monkeypatch, "{}")
+
+    with pytest.raises(vlm.VlmVerifyError, match="未返回 result"):
+        vlm.verify_transition(*two_shots(tmp_path), "任务", {"type": "tap"})
+
+
+# ---------------------------------------------------------------- V2.2 §一/§四：解析模型表态
+
+
+def test_parse_action_writes_model_risk_as_hint():
+    """模型的风险表态进 risk_hint（建议），不是 risk（权威标注）。"""
+    action = vlm._parse_action({"action_type": "tap", "risk": "dangerous"})
+
+    assert action.risk is None, "模型不该直接写权威字段"
+    assert action.risk_hint is vlm.ActionRisk.DANGEROUS
+    assert action.resolved_risk() is vlm.ActionRisk.DANGEROUS
+
+
+def test_parse_action_reads_goal_evidence_whitelist():
+    """完成声明只认白名单键——多写的字段不参与核验，避免用没人看的键伪装「有证据」。"""
+    action = vlm._parse_action(
+        {
+            "action_type": "done",
+            "goal_evidence": {
+                "package": "com.taobao.taobao",
+                "text": "立即购买",
+                "whatever": "noise",
+                "activity": "",
+            },
+        }
+    )
+
+    assert action.goal_evidence == {"package": "com.taobao.taobao", "text": "立即购买"}
+
+
+def test_parse_decision_accepts_done_request_alias():
+    """模型可以直接申请完成（done_request），语义与 done 一致。"""
+    decision = vlm._parse_decision({"action_type": "done_request", "thought": "做完了"})
+
+    assert decision.action.type is ActionType.DONE_REQUEST
+    assert decision.action.is_completion_request
+
+
+def test_done_evidence_is_rendered_in_prompt():
+    text = vlm.build_decision_prompt("x", "", None, [], [], "第一步")
+
+    assert "goal_evidence" in text
+    assert "risk_hint" in text

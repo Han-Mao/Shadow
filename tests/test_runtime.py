@@ -11,7 +11,7 @@ from device.adb import AdbError
 from device.pool import DevicePool
 from device.session import DeviceSession
 from fakes import FakeDevice
-from models.action import Action, ActionEffectStatus, ActionType, Decision, Point
+from models.action import Action, ActionEffectStatus, ActionRisk, ActionType, Decision, Point
 from models.budget import TaskBudget
 from models.checkpoint import Checkpoint
 from models.retry import ErrorClass
@@ -985,3 +985,323 @@ def test_dangerous_approval_is_consumed_after_one_use(monkeypatch, tmp_path):
         assert len(executed) == 1, "一次批准只对一次动作生效"
     finally:
         session.release(task.id)
+
+
+# ---------------------------------------------------------------- V2.2 §三：效果未知与在线对账
+
+
+def patch_observe_sequence(monkeypatch, tmp_path, trees, *, fail_post_times=0):
+    """按调用序返回不同的 UI 树，并可以让「重新观察」失败若干次。
+
+    这是 V2.2 §三 的测试基础：必须先能造出「动作发出去了、但拿不到验证观察」
+    这个瞬间，才谈得上验证系统怎么处理它。
+    """
+    remaining = list(trees)
+    failures = {"left": fail_post_times}
+    last = {"tree": trees[-1] if trees else ""}
+
+    def fake_observe(adb, artifact_dir, step, suffix=""):
+        if suffix == "post" and failures["left"] > 0:
+            failures["left"] -= 1
+            raise AdbError("模拟：动作已发出，但重新观察失败")
+        tree = remaining.pop(0) if remaining else last["tree"]
+        last["tree"] = tree
+        return Observation(
+            step=step,
+            screenshot_path=str(tmp_path / f"step_{step:03d}{suffix}.png"),
+            package="com.android.settings",
+            activity=".MainActivity",
+            ui_tree=tree,
+        )
+
+    monkeypatch.setattr(runtime_mod.observer, "observe", fake_observe)
+
+
+def test_reobserve_failure_is_recorded_as_effect_unknown(monkeypatch, tmp_path):
+    """重新观察失败**不能**当成 OK 放行（V2.2 §三）。
+
+    旧实现把它降级为「未验证的 OK」：点击发送 → 拿不到截图 → 记为成功 →
+    下一轮模型看到页面没变又点一次 → 重复发送。现在它必须落成 EFFECT_UNKNOWN，
+    并由下一个安全点的对账决定继续 / 重做 / 找人。
+    """
+    patch_observe_sequence(monkeypatch, tmp_path, [PATCHED_UI_BEFORE, PATCHED_UI_AFTER], fail_post_times=1)
+    patch_planner(
+        monkeypatch,
+        goals=["发消息"],
+        decisions=[tap(10, 20), Decision(action=Action(type=ActionType.DONE, reason="完成"))],
+    )
+    patch_verifier(monkeypatch)
+
+    events = EventLog(tmp_path / "events")
+    checkpoints = CheckpointStore(tmp_path / "checkpoints")
+    session, runtime = build(tmp_path, checkpoints=checkpoints, event_log=events)
+    task = Task(instruction="给张三发消息", budget=TaskBudget(max_action_steps=5))
+    session.acquire(task.id)
+    try:
+        outcome = runtime.run(task)
+    finally:
+        session.release(task.id)
+
+    kinds = events.kinds(task.id)
+    assert "effect_unknown" in kinds, "拿不到验证观察必须落成「效果未知」"
+    assert "reconciled" in kinds, "下一个安全点必须就地把它对掉"
+    reconciled = [e for e in events.read(task.id) if e.kind == "reconciled"][-1]
+    assert reconciled.data["verdict"] == "continue", "页面已变，应判定上次动作已生效"
+    assert reconciled.data["online"] is True
+    assert outcome is RunOutcome.DONE
+
+
+def test_effect_unknown_reconcile_redoes_the_action_once(monkeypatch, tmp_path):
+    """页面毫无变化 → 判定上次动作没生效 → 原样重做一次，而不是让模型另做别的。"""
+    patch_observe_sequence(monkeypatch, tmp_path, [PATCHED_UI_BEFORE], fail_post_times=1)
+    patch_planner(
+        monkeypatch,
+        goals=["点确定"],
+        decisions=[tap(10, 20), Decision(action=Action(type=ActionType.DONE, reason="完成"))],
+    )
+    patch_verifier(monkeypatch)
+
+    executed: list[Action] = []
+
+    def fake_execute(device, action, ui_tree):
+        executed.append(action)
+        return {"ok": True}
+
+    monkeypatch.setattr(runtime_mod.executor, "execute", fake_execute)
+
+    events = EventLog(tmp_path / "events")
+    checkpoints = CheckpointStore(tmp_path / "checkpoints")
+    session, runtime = build(tmp_path, checkpoints=checkpoints, event_log=events)
+    task = Task(instruction="点确定", budget=TaskBudget(max_action_steps=5))
+    session.acquire(task.id)
+    try:
+        outcome = runtime.run(task)
+    finally:
+        session.release(task.id)
+
+    assert outcome is RunOutcome.DONE
+    assert len(executed) == 2, "对账判定未生效后应重做一次"
+    assert executed[0].is_same_as(executed[1])
+    reconciled = [e for e in events.read(task.id) if e.kind == "reconciled"][-1]
+    assert reconciled.data["verdict"] == "retry"
+
+
+def test_dangerous_effect_unknown_never_auto_retries(monkeypatch, tmp_path):
+    """危险动作效果未知时绝不自动重做——宁可多问一次人，也不能重复扣款。"""
+    patch_observe_sequence(monkeypatch, tmp_path, [PATCHED_UI_BEFORE], fail_post_times=1)
+    danger = Action(type=ActionType.TAP, value="确认付款", target=Point(x=10, y=20))
+    # 两次给同一个动作：第一次撞 HITL，批准后第二次才真正执行
+    patch_planner(
+        monkeypatch, goals=["付款"], decisions=[Decision(action=danger), Decision(action=danger)]
+    )
+    patch_verifier(monkeypatch)
+
+    executed: list[Action] = []
+
+    def fake_execute(device, action, ui_tree):
+        executed.append(action)
+        return {"ok": True}
+
+    monkeypatch.setattr(runtime_mod.executor, "execute", fake_execute)
+
+    checkpoints = CheckpointStore(tmp_path / "checkpoints")
+    session, runtime = build(tmp_path, checkpoints=checkpoints)
+    task = Task(instruction="去付款", budget=TaskBudget(max_action_steps=5))
+    session.acquire(task.id)
+
+    # 第一次 run：危险动作先要人工确认，批准后才执行
+    assert runtime.run(task) is RunOutcome.AWAITING_CONFIRMATION
+    assert runtime.confirm(task.id, approved=True)
+    outcome = runtime.run(task)
+    session.release(task.id)
+
+    assert outcome is RunOutcome.AWAITING_CONFIRMATION, "页面无变化 + 危险动作 → 必须转人工"
+    assert len(executed) == 1, "绝不能自动重做危险动作"
+
+
+# ---------------------------------------------------------------- V2.2 §四：完成申请
+
+
+def test_completion_claim_is_rejected_then_confirmed_with_evidence(monkeypatch, tmp_path):
+    """模型的完成申请被独立验证驳回后，换一种方式继续做，最终凭可核验证据完成。"""
+    patch_observe(monkeypatch, tmp_path)
+    patch_planner(
+        monkeypatch,
+        goals=["第一步", "第二步"],
+        # 第一次什么都不说就想收工；被驳回后 Re-plan 给出可核验的完成声明
+        decisions=[
+            tap(1, 1),
+            Decision(action=Action(type=ActionType.DONE_REQUEST, reason="", goal_evidence={})),
+        ],
+        replans=[
+            tap(9, 9),
+            Decision(
+                action=Action(
+                    type=ActionType.DONE_REQUEST,
+                    reason="已回到设置页",
+                    goal_evidence={"package": "com.android.settings"},
+                )
+            ),
+        ],
+    )
+    patch_verifier(monkeypatch)
+
+    events = EventLog(tmp_path / "events")
+    session, runtime = build(tmp_path, event_log=events)
+    task = Task(instruction="改设置", budget=TaskBudget(max_action_steps=10))
+    session.acquire(task.id)
+    try:
+        outcome = runtime.run(task)
+    finally:
+        session.release(task.id)
+
+    kinds = events.kinds(task.id)
+    assert "goal_requested" in kinds
+    assert "goal_rejected" in kinds, "既没走完计划、页面也没推进、还没给理由 → 必须驳回"
+    assert "goal_confirmed" in kinds, "给出可核验且命中的声明后应当被确认"
+    assert outcome is RunOutcome.DONE
+    assert task.status is TaskStatus.DONE
+
+    done_event = [e for e in events.read(task.id) if e.kind == "done"][-1]
+    assert done_event.data["goal_independent_evidence"] is True
+    assert done_event.data["goal_rejections"] == 1
+
+
+def test_repeated_completion_rejection_goes_to_human(monkeypatch, tmp_path):
+    """连续被驳回且无法自行推翻时交给人裁定，而不是无限重试。"""
+    monkeypatch.setattr(runtime_mod.goal_verifier, "MAX_GOAL_REJECTIONS", 0)
+    patch_observe(monkeypatch, tmp_path)
+    patch_planner(
+        monkeypatch,
+        goals=["第一步"],
+        decisions=[
+            tap(1, 1),
+            Decision(action=Action(type=ActionType.DONE_REQUEST, reason="")),
+            Decision(action=Action(type=ActionType.DONE_REQUEST, reason="人工已认定完成")),
+        ],
+    )
+    patch_verifier(monkeypatch)
+
+    session, runtime = build(tmp_path)
+    task = Task(instruction="改设置", budget=TaskBudget(max_action_steps=10))
+    session.acquire(task.id)
+
+    assert runtime.run(task) is RunOutcome.AWAITING_CONFIRMATION
+    assert runtime.is_goal_decision(task.id), "待处理的应当是「任务算不算完成」，不是某个动作"
+    assert task.status is TaskStatus.WAITING
+
+    # 人工认定完成 → 下一次完成申请直接放行
+    assert runtime.confirm(task.id, approved=True)
+    outcome = runtime.run(task)
+    session.release(task.id)
+
+    assert outcome is RunOutcome.DONE
+    assert task.status is TaskStatus.DONE
+
+
+def test_human_denial_of_completion_keeps_the_task_alive(monkeypatch, tmp_path):
+    """人工说「还没做完」= 继续做，不能把任务判死。"""
+    monkeypatch.setattr(runtime_mod.goal_verifier, "MAX_GOAL_REJECTIONS", 0)
+    patch_observe(monkeypatch, tmp_path)
+    patch_planner(
+        monkeypatch,
+        goals=["第一步"],
+        decisions=[
+            tap(1, 1),
+            Decision(action=Action(type=ActionType.DONE_REQUEST, reason="")),
+            Decision(action=Action(type=ActionType.DONE_REQUEST, reason="这次真的做完了")),
+        ],
+        replans=[tap(7, 7)],
+    )
+    patch_verifier(monkeypatch)
+
+    session, runtime = build(tmp_path)
+    task = Task(instruction="改设置", budget=TaskBudget(max_action_steps=10))
+    session.acquire(task.id)
+
+    assert runtime.run(task) is RunOutcome.AWAITING_CONFIRMATION
+    assert runtime.confirm(task.id, approved=False)
+    assert not runtime.is_goal_decision(task.id)
+    assert task.status is not TaskStatus.FAILED, "否决完成 ≠ 放弃任务"
+
+    outcome = runtime.run(task)
+    session.release(task.id)
+
+    # 被塞了 Re-plan 理由，下一轮会先换一种做法——而不是原地重复同一个完成申请
+    assert outcome is not RunOutcome.CANCELLED
+    assert task.status is not TaskStatus.FAILED
+
+
+# ---------------------------------------------------------------- V2.2 §一：风险门禁接入闭环
+
+
+def test_runtime_blocks_action_whose_target_node_is_dangerous(monkeypatch, tmp_path):
+    """动作描述人畜无害，但点到的控件是「立即购买」——门禁必须拦下来等人工确认。"""
+    ui = (
+        '<hierarchy><node class="android.widget.Button" text="立即购买" '
+        'bounds="[100,200][300,300]" clickable="true"/></hierarchy>'
+    )
+    patch_observe_ui(monkeypatch, tmp_path, ui)
+    patch_planner(
+        monkeypatch,
+        goals=["买东西"],
+        decisions=[Decision(action=Action(type=ActionType.TAP, target=Point(x=200, y=250)))],
+    )
+    patch_verifier(monkeypatch)
+
+    executed: list[Action] = []
+    monkeypatch.setattr(
+        runtime_mod.executor,
+        "execute",
+        lambda device, action, ui_tree: (executed.append(action), {"ok": True})[1],
+    )
+
+    events = EventLog(tmp_path / "events")
+    session, runtime = build(tmp_path, event_log=events)
+    task = Task(instruction="买东西", budget=TaskBudget(max_action_steps=5))
+    session.acquire(task.id)
+    try:
+        outcome = runtime.run(task)
+    finally:
+        session.release(task.id)
+
+    assert outcome is RunOutcome.AWAITING_CONFIRMATION
+    assert executed == [], "确认之前不得执行"
+    assessed = [e for e in events.read(task.id) if e.kind == "risk_assessed"][-1]
+    assert assessed.data["effective"] == "dangerous"
+    assert "立即购买" in assessed.data["reason"]
+
+
+def test_runtime_records_model_risk_downgrade_attempt(monkeypatch, tmp_path):
+    """模型试图把危险动作说成 safe：既不生效，也要在事件流里留痕。"""
+    patch_observe(monkeypatch, tmp_path)
+    patch_planner(
+        monkeypatch,
+        goals=["付款"],
+        decisions=[
+            Decision(
+                action=Action(
+                    type=ActionType.TAP,
+                    value="确认付款",
+                    target=Point(x=5, y=5),
+                    risk_hint=ActionRisk.SAFE,
+                )
+            )
+        ],
+    )
+    patch_verifier(monkeypatch)
+
+    events = EventLog(tmp_path / "events")
+    session, runtime = build(tmp_path, event_log=events)
+    task = Task(instruction="付款", budget=TaskBudget(max_action_steps=5))
+    session.acquire(task.id)
+    try:
+        outcome = runtime.run(task)
+    finally:
+        session.release(task.id)
+
+    assert outcome is RunOutcome.AWAITING_CONFIRMATION, "降级声明不能让它静默执行"
+    assessed = [e for e in events.read(task.id) if e.kind == "risk_assessed"][-1]
+    assert assessed.data["downgrade_blocked"] is True
+    assert assessed.data["policy"] == "dangerous"
+    assert assessed.data["model"] == "safe"

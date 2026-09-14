@@ -109,8 +109,19 @@ class TaskManager:
         return self._store.list_all()
 
     def active_task(self) -> Task | None:
-        running = self._scheduler.snapshot().get("running")
-        return self.get(running) if running else None
+        """当前正在执行的任务（多设备时返回优先级最高的那个）。
+
+        旧的 `snapshot()["running"]` 在多设备下只返回**第一台**在跑的任务，
+        上层据此以为「系统里只跑了这一个」——这正是审核点名的单设备残留（V2.2 §十）。
+        """
+        running = self.active_tasks()
+        if not running:
+            return None
+        return max(running, key=lambda task: priority_rank(task.priority))
+
+    def active_tasks(self) -> list[Task]:
+        """所有设备上正在执行的任务。业务逻辑请用这个，不要用「唯一 running」。"""
+        return [task for task in self._scheduler.running_tasks() if not task.is_terminal]
 
     # ---- 状态迁移 ----
 
@@ -148,6 +159,7 @@ class TaskManager:
         *,
         current_task_id: str | None = None,
         priority: TaskPriority | None = None,
+        budget: TaskBudget | None = None,
         max_steps: int = 10,
         allow_disruptive: bool = False,
     ) -> InjectResult:
@@ -209,12 +221,15 @@ class TaskManager:
             current.instruction = instruction
             current.version += 1            # 版本+1，旧 Checkpoint / 旧计划随之失效
             current.plan = []               # 旧计划作废，恢复时重新规划新目标
+            current.plan_version += 1       # 计划也换了版本，便于回溯「这条恢复点属于哪一版计划」
             current.checkpoint_id = None    # 旧 Checkpoint 因版本不匹配自动失效
             current.priority = TaskPriority.HIGH
             self._store.save(current)
             if current.status is TaskStatus.RUNNING:
-                # 正在跑：请求它在下一个安全点让位，让出后会从新目标重跑（plan 已清空）
-                self._scheduler.preempt_running()
+                # 正在跑：请求**这一个任务**在下一个安全点让位（V2.2 §二）。
+                # 必须带 task_id —— 不带的话 scheduler 会退化成「所有车道都让出」，
+                # 多设备场景下 A 任务被改写会把 B 设备上毫不相干的任务也一起打断。
+                self._scheduler.preempt_running(current.id)
             else:
                 self._scheduler.submit(current, allow_preempt=False)
             return InjectResult(
@@ -231,7 +246,7 @@ class TaskManager:
         )
         new_task = self.create(
             instruction,
-            budget=TaskBudget(max_action_steps=max_steps),
+            budget=budget or TaskBudget.from_max_steps(max_steps),
             priority=new_priority,
             parent_task_id=current.id if relation.relation is TaskRelation.SUBTASK else None,
             # 记下「它是被判成什么关系才产生的」，事后能回溯为什么它抢占了别人
@@ -269,6 +284,10 @@ class TaskManager:
 
         插到正在执行的步骤之前会打断已发出的动作；插到待执行首位既满足「先……」的语义，
         又不动已经跑了一半的那一步。
+
+        **计划一改就必须 `plan_version += 1`**（V2.2 §十一）：恢复点、Re-plan 上下文、
+        审计里都带着这个版本号，不递增的话「这份计划是哪一版」就永远说不清，
+        「运行中插入子任务 → 落检查点 → 进程崩溃 → 恢复」这条链尤其容易踩。
         """
         index = next(
             (i for i, s in enumerate(task.plan) if s.status is StepStatus.PENDING),
@@ -287,6 +306,10 @@ class TaskManager:
             following.depends_on = [step.id]
 
         task.plan.insert(index, step)
+        # 目标没变（version 不动），但计划确实变了 → plan_version +1。
+        # 旧恢复点仍然可用（页面还是那一屏），但能看出它属于上一版计划。
+        task.plan_version += 1
+        task.sync_current_step()
         task.updated_at = datetime.now()
         return step
 

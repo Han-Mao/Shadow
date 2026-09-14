@@ -147,10 +147,12 @@ class TaskScheduler:
 
     @property
     def _running(self) -> Task | None:
-        """单设备的便捷视图（多设备时返回第一台在跑的任务）。
+        """**仅为兼容旧调用方与测试保留**的单设备视图。
 
-        V2.1 起真正的运行槽在 `_DeviceLane.running` 上；这个 property 是为
-        兼容既有调用方和测试保留的写法，新代码请直接用 `snapshot()`。
+        V2.1 起真正的运行槽在 `_DeviceLane.running` 上，每台设备一个。
+        这个 property 在多设备下只能返回第一台在跑的任务，用它做业务判断会得出
+        「系统里只跑了一个任务」的错误结论——正是审核点名的单设备残留（V2.2 §十）。
+        新代码请用 `running_tasks()` 或 `snapshot()["devices"]`。
         """
         for serial in sorted(self._lanes):
             running = self._lanes[serial].running
@@ -160,7 +162,17 @@ class TaskScheduler:
 
     @_running.setter
     def _running(self, task: Task | None) -> None:
+        """兼容旧测试的直接赋值（只作用于第一台设备）。业务代码不要用。"""
         self._lanes[sorted(self._lanes)[0]].running = task
+
+    def running_tasks(self) -> list[Task]:
+        """所有设备上正在执行的任务（多设备下的正确读法）。"""
+        with self._cond:
+            return [
+                self._lanes[serial].running
+                for serial in sorted(self._lanes)
+                if self._lanes[serial].running is not None
+            ]
 
     # ---- 生命周期 ----
 
@@ -357,9 +369,15 @@ class TaskScheduler:
         用于 SUPER_TASK：任务目标已被改写，需要让出设备、从新目标重新规划（V2.1 §七）。
         与 `preempt(by_task_id)` 不同——这里没有「优先级比较」，被抢占的就是 running 自身。
 
-        多设备下必须指明是**哪条任务**（`task_id`）：不指定就退化为「所有车道都让出」，
-        那会把无关任务也一起打断。旧调用方没传参也不会出错，但建议带上。
+        多设备下**必须**指明是哪条任务（`task_id`）：不指定就退化为「所有车道都让出」，
+        那会把无关设备上毫不相干的任务也一起打断（V2.2 §二）。
+        不传参仍然可用（兼容旧调用方），但会打 warning——它几乎总是调用方写错了。
         """
+        if task_id is None:
+            logger.warning(
+                "preempt_running() 未指定 task_id，将让所有设备上的在跑任务一起让出；"
+                "多设备场景下请传入具体任务 id"
+            )
         with self._cond:
             targets: list[tuple[_DeviceLane, Task]] = []
             if task_id is not None:
@@ -379,6 +397,18 @@ class TaskScheduler:
                 continue
             if lane.session.request_preempt(running.id):
                 granted = True
+                # 自己抢占自己（SUPER_TASK 改写目标）也要计入延迟观测，
+                # 否则「目标被改写 → 多久真正让出」这段耗时是盲区（V2.1 §十四）
+                self._preempt_request_at[running.id] = time.monotonic()
+                self._emit(
+                    running.id,
+                    PREEMPT_REQUESTED,
+                    by_task_id=running.id,
+                    by_priority=running.priority.value,
+                    running_priority=running.priority.value,
+                    device=lane.serial,
+                    reason="self_preempt",
+                )
         return granted
 
     # ---- 查询 ----
@@ -388,8 +418,13 @@ class TaskScheduler:
             lanes = [self._lanes[serial] for serial in sorted(self._lanes)]
             running = next((lane.running for lane in lanes if lane.running is not None), None)
             return {
+                # 顶层 running / device 是历史契约，多设备下只反映第一台——
+                # 真正可信的是下面的 devices（V2.2 §十）
                 "running": running.id if running else None,
                 "running_instruction": running.instruction if running else None,
+                "running_tasks": {
+                    lane.serial: lane.running.id for lane in lanes if lane.running is not None
+                },
                 "ready": sorted(entry[3].id for lane in lanes for entry in lane.ready),
                 "paused": sorted(self._paused),
                 "suspended": [task.id for lane in lanes for task in lane.suspended],

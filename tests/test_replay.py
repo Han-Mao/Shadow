@@ -257,3 +257,71 @@ def test_load_timeline_reads_from_the_persisted_log(tmp_path):
 
     assert [f.kind for f in timeline.frames] == ["started", "done"]
     assert load_timeline(store, "不存在的任务").empty
+
+
+# ---------------------------------------------------------------- V2.2：新事件类型
+
+
+def test_new_v22_events_are_rendered_and_flagged():
+    """V2.2 新增的三类事件要能在回放里读成人话，并且被标成「值得注意」。
+
+    `goal_rejected` 与 `effect_unknown` 都是「系统差点做错但被拦下」的证据，
+    排查时最该先看到它们。
+    """
+    timeline = build_timeline(
+        "t1",
+        [
+            ev("effect_unknown", "2026-09-14T09:00:00.000", action="tap", reason="拿不到截图"),
+            ev("reconciled", "2026-09-14T09:00:01.000", verdict="retry", reason="页面无变化"),
+            ev("goal_requested", "2026-09-14T09:00:02.000", reason="我觉得做完了", rejections=0),
+            ev("goal_rejected", "2026-09-14T09:00:03.000", reason="计划仍有 2 步未完成"),
+            ev("risk_assessed", "2026-09-14T09:00:04.000", effective="dangerous", downgrade_blocked=True),
+        ],
+    )
+
+    summaries = {frame.kind: frame.summary for frame in timeline.frames}
+    assert "效果未知" in summaries["effect_unknown"]
+    assert "对账" in summaries["reconciled"]
+    assert "申请完成" in summaries["goal_requested"]
+    assert "驳回" in summaries["goal_rejected"]
+    assert "降级被拒" in summaries["risk_assessed"]
+
+    notable = {frame.kind for frame in timeline.anomalies()}
+    assert {"effect_unknown", "goal_rejected"} <= notable
+
+    markdown = timeline.render_markdown()
+    assert "effect_unknown" in markdown and "goal_rejected" in markdown
+
+
+# ---------------------------------------------------------------- V2.2：新事件类型
+
+
+def test_new_v22_events_are_rendered_and_flagged():
+    """V2.2 新增的三类事件要能在回放里读成人话，并且被标成「值得注意」。
+
+    `goal_rejected` 与 `effect_unknown` 都是「系统差点做错但被拦下」的证据，
+    排查时最该先看到它们。
+    """
+    timeline = build_timeline(
+        "t1",
+        [
+            ev("effect_unknown", "2026-09-14T09:00:00.000", action="tap", reason="拿不到截图"),
+            ev("reconciled", "2026-09-14T09:00:01.000", verdict="retry", reason="页面无变化"),
+            ev("goal_requested", "2026-09-14T09:00:02.000", reason="我觉得做完了", rejections=0),
+            ev("goal_rejected", "2026-09-14T09:00:03.000", reason="计划仍有 2 步未完成"),
+            ev("risk_assessed", "2026-09-14T09:00:04.000", effective="dangerous", downgrade_blocked=True),
+        ],
+    )
+
+    summaries = {frame.kind: frame.summary for frame in timeline.frames}
+    assert "效果未知" in summaries["effect_unknown"]
+    assert "对账" in summaries["reconciled"]
+    assert "申请完成" in summaries["goal_requested"]
+    assert "驳回" in summaries["goal_rejected"]
+    assert "降级被拒" in summaries["risk_assessed"]
+
+    notable = {frame.kind for frame in timeline.anomalies()}
+    assert {"effect_unknown", "goal_rejected"} <= notable
+
+    markdown = timeline.render_markdown()
+    assert "effect_unknown" in markdown and "goal_rejected" in markdown

@@ -7,12 +7,13 @@ import logging
 import os
 import re
 import time
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
 import httpx
 
-from models.action import Action, ActionType, Decision, Point
+from models.action import COMPLETION_ACTION_TYPES, Action, ActionRisk, ActionType, Decision, Point
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,24 @@ class VlmError(RuntimeError):
 
 class VlmParseError(VlmError):
     pass
+
+
+class VlmVerifyError(VlmError):
+    """VLM 给了一个**无法解读**的验证结论。
+
+    单独一个异常类型是有意的（V2.2 §七）：以前 `str(data.get("result", "ok")).lower()`
+    会把 `{}` 解析成 `"ok"`、把 `{"result": "banana"}` 解析成 `"banana"`，
+    而 verifier 对认不出的值一律按成功处理——等于「模型胡说 = 这步过了」。
+    现在它必须是一个明确的错误，由调用方按「证据不足」处理。
+    """
+
+
+class VerifyResult(str, Enum):
+    """验证结论的**严格**取值集合（V2.2 §七）。"""
+
+    OK = "ok"
+    ERROR = "error"
+    DONE = "done"
 
 
 def _encode_image(path: str | Path) -> str:
@@ -161,9 +180,14 @@ def build_decision_prompt(
         '  "target": "点击目标的描述或坐标，如 {\"x\":360,\"y\":600} 或 \"搜索按钮\"",\n'
         '  "value": "当 action_type=type 时填写要输入的文本；swipe 时填写 x1,y1,x2,y2；wait 时填写毫秒",\n'
         '  "step_done": false,\n'
-        '  "done": false\n'
+        '  "done": false,\n'
+        '  "risk_hint": "safe|caution|dangerous（仅建议，最终风险由服务端策略裁定）",\n'
+        '  "goal_evidence": {"package": "当前应在的包名", "activity": "当前应在的 Activity", "text": "页面上应出现的文字"}\n'
         "}\n"
         "step_done 表示「做完这个动作后，当前聚焦步骤是否已经达成」；done 表示整个任务是否已经完成。\n"
+        "注意：done 只是**申请**完成——服务端会用截图、UI 树与包名独立核验，"
+        "核验不通过会把任务打回来继续做。所以声称完成时请把 goal_evidence 填上，"
+        "否则这次完成申请会因为没有独立证据而被记为「未验证」。\n"
         "坐标优先返回屏幕绝对像素；若不确定，返回可点击元素的文本或 content-desc 描述。"
     )
 
@@ -398,15 +422,39 @@ def _parse_action(data: dict[str, Any]) -> Action:
     value = data.get("value")
     reason = data.get("thought", "")
 
-    if data.get("done") and action_type != ActionType.DONE:
+    if data.get("done") and action_type not in COMPLETION_ACTION_TYPES:
         action_type = ActionType.DONE
 
-    # 模型可以自行标注风险等级；给了非法值就当没给，交给 Action.resolved_risk 推断
-    risk = data.get("risk")
-    if risk not in (None, "safe", "caution", "dangerous"):
-        risk = None
+    # 模型的风险表态写进 `risk_hint`（**建议**），而不是 `risk`（权威标注）。
+    # 两者在 effective_risk 里等价（都只能抬不能降），但分开存之后，
+    # 审计能一眼看出「这级风险是模型说的还是策略判的」（V2.2 §一）。
+    hint = data.get("risk_hint", data.get("risk"))
+    risk_hint = hint if hint in ("safe", "caution", "dangerous") else None
 
-    return Action(type=action_type, target=target, value=value, reason=reason, risk=risk)
+    return Action(
+        type=action_type,
+        target=target,
+        value=value,
+        reason=reason,
+        risk_hint=ActionRisk(risk_hint) if risk_hint else None,
+        goal_evidence=_parse_goal_evidence(data.get("goal_evidence")),
+    )
+
+
+def _parse_goal_evidence(raw: Any) -> dict[str, str]:
+    """解析模型对「目标已达成」的可核验声明（V2.2 §四）。
+
+    只接受白名单键——模型多写的字段不参与核验，避免它用一堆没人看的键
+    把「有证据」这件事伪装出来。
+    """
+    if not isinstance(raw, dict):
+        return {}
+    allowed = {"package", "activity", "text", "resource_id"}
+    return {
+        str(key): str(value)
+        for key, value in raw.items()
+        if key in allowed and value not in (None, "")
+    }
 
 
 def _parse_decision(data: dict[str, Any]) -> Decision:
@@ -424,8 +472,12 @@ def verify_transition(
     post_screenshot_path: str | Path,
     instruction: str,
     action: dict[str, Any],
-) -> str:
-    """比较执行前后截图，返回 'ok' | 'error' | 'done'。"""
+) -> VerifyResult:
+    """比较执行前后截图，返回严格的 `VerifyResult`。
+
+    解析不出合法取值时抛 `VlmVerifyError`——**绝不**默认当成功。
+    空对象、乱码、未知枚举都会走这条路，由 verifier 按「证据不足」处置。
+    """
     pre_b64 = _encode_image(pre_screenshot_path)
     post_b64 = _encode_image(post_screenshot_path)
     prompt = (
@@ -456,9 +508,15 @@ def verify_transition(
         content = _call_vlm(messages)["content"]
         data = _extract_json(content)
     except (VlmError, json.JSONDecodeError, KeyError) as exc:
-        raise VlmError(f"无法解析 VLM 验证结果: {exc}") from exc
+        raise VlmVerifyError(f"无法解析 VLM 验证结果: {exc}") from exc
 
-    return str(data.get("result", "ok")).lower()
+    raw = data.get("result")
+    if raw is None:
+        raise VlmVerifyError(f"VLM 未返回 result 字段（原文：{data!r}）")
+    try:
+        return VerifyResult(str(raw).strip().lower())
+    except ValueError as exc:
+        raise VlmVerifyError(f"VLM 返回未知验证结论：{raw!r}") from exc
 
 
 RELATION_PROMPT = """你在判断用户新说的话与\"正在执行的任务\"是什么关系。

@@ -21,6 +21,7 @@ from enum import Enum
 from pydantic import BaseModel
 
 from .action import Action, ActionEffectStatus
+from vision.target import TargetState
 
 
 class DispatchStatus(str, Enum):
@@ -50,14 +51,29 @@ class ActionDispatch(BaseModel):
 
 
 class ActionEffect(BaseModel):
-    """第 2 层：动作让页面发生了什么变化（L2 UI 树 + L3 VLM）。"""
+    """第 2 层：动作让页面发生了什么变化（L3 UI 结构 + L4 目标元素 + L5 VLM）。"""
 
     status: ActionEffectStatus = ActionEffectStatus.NOT_STARTED
     evidence: str = ""
-    """效果判定的证据来源：`ui_tree` / `vlm` / `none`（没有可比对信号）。"""
+    """效果判定的证据来源：`l2_navigation` / `l3_structure` / `l4_target` / `vlm` / `none`。"""
 
     changed: bool = False
-    """UI 结构是否发生了变化。没变而动作又是「会改页面」的类型，就是可疑信号。"""
+    """页面结构（含导航与目标元素）是否发生了变化。"""
+
+    target: TargetState = TargetState.UNKNOWN
+    """被操作元素自身在动作前后的状态（V2.2 §六 L4）。
+
+    比「UI 树变没变」贴近意图得多：点「登录」之后，该看的不是「树变了没」，
+    而是「登录按钮是不是没了 / 是不是进了首页」。
+    """
+
+    ambiguous: bool = False
+    """效果是否**存疑**（页面无变化、或不可撤销动作缺少独立证据）。
+
+    与 `status is EFFECT_UNKNOWN` 的区别：status 说的是「判成了什么」，
+    ambiguous 说的是「这个判定本身站不站得住」。危险动作置位时，
+    Runtime 会走人工确认而不是自动重试。
+    """
 
     message: str = ""
 
@@ -73,3 +89,10 @@ class GoalVerification(BaseModel):
 
     layer: str = ""
     message: str = ""
+
+    independent_evidence: bool = False
+    """「达成」这个结论有没有**不依赖模型**的独立证据支撑（V2.2 §四）。
+
+    模型的完成申请若无独立证据，仍可放行（证据不足 ≠ 有反证），
+    但必须留下痕迹——这样「它凭什么说完成了」事后查得出来。
+    """

@@ -99,7 +99,9 @@ def execute(adb: AdbController, action: Action, ui_tree: str | None = None) -> d
                 adb.wait(duration)
                 return {"ok": True, "duration": duration}
 
-            case ActionType.DONE:
+            case ActionType.DONE | ActionType.DONE_REQUEST:
+                # 「申请完成」不是设备动作，没有命令要发。真正的完成判定在
+                # `agent.goal_verifier`——模型说 done 只是一次申请（V2.2 §四）。
                 return {"ok": True, "done": True}
 
             case _:

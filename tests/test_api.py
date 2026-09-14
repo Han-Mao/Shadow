@@ -736,3 +736,147 @@ def test_checkpoint_validate_rejects_stale_version(tmp_path):
     assert store.validate(cp, obs, task_version=1) is RestoreVerdict.RESUME
     # 任务已发生 SUPER_TASK（version 升到 2）→ 旧 checkpoint 即使页面相同也必须失效
     assert store.validate(cp, obs, task_version=2) is RestoreVerdict.STALE
+
+
+# ---------------------------------------------------------------- V2.2 §五：预算语义统一
+
+
+def test_task_budget_can_be_specified_precisely(api):
+    """三种预算要能分别指定。
+
+    旧的 `max_steps` 只映射到「动作步数」，调用方却以为它管的是整个循环次数——
+    实际拿到的是 10 个动作 + 60 次观察 + 40 次模型调用（V2.2 §五）。
+    """
+    client, server, *_rest = api
+    manager = _rest[-1]
+
+    body = client.post(
+        "/tasks",
+        json={
+            "instruction": "长任务",
+            "budget": {
+                "max_action_steps": 7,
+                "max_observations": 21,
+                "max_model_calls": 14,
+            },
+        },
+    ).json()
+
+    task = manager.get(body["id"])
+    assert task.budget.max_action_steps == 7
+    assert task.budget.max_observations == 21
+    assert task.budget.max_model_calls == 14
+
+
+def test_legacy_max_steps_maps_to_action_budget_only(api):
+    """兼容层：`max_steps` 只约束动作步数，其余取默认值——这一点必须写死。"""
+    client, server, *_rest = api
+    manager = _rest[-1]
+
+    body = client.post("/tasks", json={"instruction": "老调用方", "max_steps": 5}).json()
+
+    task = manager.get(body["id"])
+    assert task.budget.max_action_steps == 5
+    assert task.budget.max_observations == 60, "max_steps 管不到观察预算"
+    assert task.budget.max_model_calls == 40
+
+
+def test_partial_budget_keeps_defaults_for_the_rest(api):
+    client, server, *_rest = api
+    manager = _rest[-1]
+
+    body = client.post(
+        "/tasks", json={"instruction": "只压模型调用", "budget": {"max_model_calls": 3}}
+    ).json()
+
+    task = manager.get(body["id"])
+    assert task.budget.max_model_calls == 3
+    assert task.budget.max_action_steps == 10, "没写的字段沿用旧默认"
+    assert task.budget.max_observations == 60
+
+
+def test_health_endpoint(api):
+    client, *_ = api
+
+    assert client.get("/health").json()["ok"] is True
+
+
+def test_scheduler_snapshot_exposes_per_device_running_tasks(api):
+    client, *_ = api
+
+    snapshot = client.get("/scheduler").json()
+
+    assert "running_tasks" in snapshot
+    assert "devices" in snapshot
+
+
+# ---------------------------------------------------------------- V2.2 §五：预算语义统一
+
+
+def test_task_budget_can_be_specified_precisely(api):
+    """三种预算要能分别指定。
+
+    旧的 `max_steps` 只映射到「动作步数」，调用方却以为它管的是整个循环次数——
+    实际拿到的是 10 个动作 + 60 次观察 + 40 次模型调用（V2.2 §五）。
+    """
+    client, server, *_rest = api
+    manager = _rest[-1]
+
+    body = client.post(
+        "/tasks",
+        json={
+            "instruction": "长任务",
+            "budget": {
+                "max_action_steps": 7,
+                "max_observations": 21,
+                "max_model_calls": 14,
+            },
+        },
+    ).json()
+
+    task = manager.get(body["id"])
+    assert task.budget.max_action_steps == 7
+    assert task.budget.max_observations == 21
+    assert task.budget.max_model_calls == 14
+
+
+def test_legacy_max_steps_maps_to_action_budget_only(api):
+    """兼容层：`max_steps` 只约束动作步数，其余取默认值——这一点必须写死。"""
+    client, server, *_rest = api
+    manager = _rest[-1]
+
+    body = client.post("/tasks", json={"instruction": "老调用方", "max_steps": 5}).json()
+
+    task = manager.get(body["id"])
+    assert task.budget.max_action_steps == 5
+    assert task.budget.max_observations == 60, "max_steps 管不到观察预算"
+    assert task.budget.max_model_calls == 40
+
+
+def test_partial_budget_keeps_defaults_for_the_rest(api):
+    client, server, *_rest = api
+    manager = _rest[-1]
+
+    body = client.post(
+        "/tasks", json={"instruction": "只压模型调用", "budget": {"max_model_calls": 3}}
+    ).json()
+
+    task = manager.get(body["id"])
+    assert task.budget.max_model_calls == 3
+    assert task.budget.max_action_steps == 10, "没写的字段沿用旧默认"
+    assert task.budget.max_observations == 60
+
+
+def test_health_endpoint(api):
+    client, *_ = api
+
+    assert client.get("/health").json()["ok"] is True
+
+
+def test_scheduler_snapshot_exposes_per_device_running_tasks(api):
+    client, *_ = api
+
+    snapshot = client.get("/scheduler").json()
+
+    assert "running_tasks" in snapshot
+    assert "devices" in snapshot
