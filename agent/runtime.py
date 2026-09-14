@@ -29,6 +29,7 @@ from storage.event_log import (
     ACTION_DISPATCHED,
     ACTION_VERIFIED,
     CHECKPOINT_SAVED,
+    CONFIRMED,
     DONE,
     FAILED,
     RECONCILED,
@@ -243,6 +244,12 @@ class AgentRuntime:
                 action=action.type.value,
                 risk=action.resolved_risk().value,
                 step=state.execution_step,
+                # 带上动作细节，事件流才「自足」到可以回放（V2.1 §二十三）：
+                # 只记动作类型的话，回放时看不出它当时点在哪、输入了什么
+                fingerprint=action.fingerprint,
+                target=self._action_target(action),
+                value=action.value,
+                reason=action.reason,
             )
             result = self._execute(task, action, observation)
             if state.approved_dangerous:
@@ -260,6 +267,10 @@ class AgentRuntime:
                 dispatch=verification.dispatch.status.value,
                 effect=verification.effect.status.value,
                 goal_achieved=verification.goal.achieved,
+                layer=verification.layer,
+                message=verification.message,
+                # 截图路径进事件流，回放时能直接点开看当时那一屏
+                screenshot=post.screenshot_path,
             )
 
             # 效果由验证层判定（V2.1 §十九），Runtime 不再自己拍脑袋。
@@ -331,8 +342,23 @@ class AgentRuntime:
             # 否则任务会在「请求确认 → 被否决 → 再次请求确认」之间空转
             state.denied_fingerprints.add(denied.fingerprint)
             state.failed_strategies.append(f"危险动作被人工否决：{self._describe_action(denied)}")
+            self._emit(
+                task_id,
+                CONFIRMED,
+                approved=False,
+                action=denied.type.value,
+                risk=denied.resolved_risk().value,
+            )
             return True
+        pending = state.pending_confirmation
         state.approved_dangerous = True
+        self._emit(
+            task_id,
+            CONFIRMED,
+            approved=True,
+            action=pending.type.value if pending else "",
+            risk=pending.resolved_risk().value if pending else "",
+        )
         return True
 
     def forget(self, task_id: str) -> None:
@@ -625,8 +651,23 @@ class AgentRuntime:
         return sum(1 for item in recent if item.is_same_as(latest)) >= LOOP_REPEAT_THRESHOLD
 
     @staticmethod
+    def _action_target(action: Action) -> object:
+        """把动作目标序列化成 JSON 友好的形式（Point → {"x":..,"y":..}）。
+
+        事件里要存得下、读得回来，回放时才能还原「它当时点在哪」。
+        """
+        target = action.target
+        if hasattr(target, "model_dump"):
+            return target.model_dump(mode="json")
+        return target
+
+    @staticmethod
     def _describe_action(action: Action) -> str:
-        target = action.target.model_dump(mode="json") if hasattr(action.target, "model_dump") else action.target
+        target = (
+            action.target.model_dump(mode="json")
+            if hasattr(action.target, "model_dump")
+            else action.target
+        )
         return f"{action.type.value} target={target} value={action.value!r}"
 
     def _load_checkpoint(self, task: Task) -> Checkpoint | None:
@@ -664,6 +705,7 @@ class AgentRuntime:
             checkpoint_id=checkpoint.id,
             effect=checkpoint.action_effect.value,
             budget_used=checkpoint.budget_used,
+            screenshot=checkpoint.screenshot_path,
         )
 
     @staticmethod

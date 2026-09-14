@@ -325,6 +325,43 @@ def test_events_endpoint_404_for_unknown_task(api):
     assert client.get("/tasks/does-not-exist/events").status_code == 404
 
 
+def test_replay_endpoint_returns_timeline_and_plan(api):
+    """/replay 把事件流按时间轴读回来，并附带动作计划（V2.1 §二十三）。"""
+    client, _, session, *_ = api
+    session.acquire("__manual__")  # 占住设备，任务停在队列，保证事件稳定
+    try:
+        created = client.post("/tasks", json={"instruction": "打开设置"}).json()
+
+        resp = client.get(f"/tasks/{created['id']}/replay")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["task_id"] == created["id"]
+        assert any(f["kind"] == "queued" for f in body["frames"])
+        assert all("offset_seconds" in f for f in body["frames"])
+        assert body["plan"]["count"] == 0, "还没跑动作，计划应为空"
+    finally:
+        session.release("__manual__")
+
+
+def test_replay_endpoint_supports_markdown_report(api):
+    client, _, session, *_ = api
+    session.acquire("__manual__")
+    try:
+        created = client.post("/tasks", json={"instruction": "打开设置"}).json()
+
+        resp = client.get(f"/tasks/{created['id']}/replay?format=markdown")
+        assert resp.status_code == 200
+        assert "## 时间轴" in resp.text
+        assert "## 值得注意的地方" in resp.text
+    finally:
+        session.release("__manual__")
+
+
+def test_replay_endpoint_404_for_unknown_task(api):
+    client, *_ = api
+    assert client.get("/tasks/does-not-exist/replay").status_code == 404
+
+
 def test_inject_unrelated_spawns_new_task(api):
     client, *_ = api
     created = client.post("/tasks", json={"instruction": "在淘宝搜索黑色运动鞋"}).json()

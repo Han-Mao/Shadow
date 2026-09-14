@@ -53,6 +53,7 @@ VLM 决定「下一步点哪里」，调度与检查点决定「多件事怎么�
 │   ├── classifier.py       # 任务关系识别（三层融合）
 │   ├── risk_gate.py        # 统一风险门禁（策略风险 = 下限，模型只能抬不能降）
 │   ├── reconciliation.py   # 动作对账：EFFECT_UNKNOWN → 继续/重做/重规划/找人
+│   ├── replay.py           # 任务回放：事件流 → 时间轴 + 「值得注意的地方」
 │   └── scheduler.py        # 优先级队列 / 抢占 / 恢复
 ├── models/
 │   ├── task.py             # Task + 8 态状态机 + 优先级 + 预算 + 版本号
@@ -73,8 +74,10 @@ VLM 决定「下一步点哪里」，调度与检查点决定「多件事怎么�
 ├── vision/                 # vlm / grounding / parser
 │   └── fingerprint.py      # UI 结构指纹：恢复校验的 L2（比 package 细、比 VLM 便宜）
 ├── api/server.py           # FastAPI
-├── scripts/demo_preemption.py   # 抢占恢复演示（离线可跑）
-└── tests/                  # 154 个离线用例
+├── scripts/
+│   ├── demo_preemption.py  # 抢占恢复演示（离线可跑）
+│   └── replay_task.py      # 命令行回放一个任务的事件流
+└── tests/                  # 222 个离线用例
 ```
 
 ## 职责边界
@@ -125,6 +128,10 @@ A 恢复：先重新 Observe，比对恢复点
 
 ```powershell
 python scripts/demo_preemption.py
+
+# 回放某个任务（先 --list 看有哪些）
+python scripts/replay_task.py --list
+python scripts/replay_task.py 20260914_093100_demo01
 ```
 
 ### 3. 每一步都有据可查
@@ -133,6 +140,8 @@ python scripts/demo_preemption.py
 - `Checkpoint` 保存「恢复所需的最小状态」（当前页、package/activity、结构指纹、已用预算、最近轨迹）
 - 每个执行完的步骤都进 `TrajectoryStore`，供下一步决策取上下文
 - 关键事件进 `EventLog`（`GET /tasks/{id}/events`）：抢占、对账、危险动作等待、失败原因
+- 事件流可以**回放**（`GET /tasks/{id}/replay` 或 `scripts/replay_task.py`）：
+  按时间轴还原「它当时干了什么」，并把抢占/对账/失败这些异常帧单独挑出来
 
 **轨迹与事件日志是两回事，不要合并**：轨迹给「下一步怎么决策」看，所以只留最近几条、会被裁剪；
 事件日志给「事后到底发生了什么」看，所以只追加不裁剪。合成一个必然两头不讨好。
@@ -248,8 +257,8 @@ python scripts/demo_preemption.py
 所以这里做的是「记录真实延迟 + 超过 `MAX_PREEMPTION_LATENCY_SECONDS`(2s) 打 warning」，
 让「高优任务被长命令堵住」这件事能被看见。真正的有界延迟需要给 ADB 调用加命令级超时。
 
-**仍未做（下一批）**：§24 目录重构（此前已确认不改）、多设备 Lease、
-Replay（事件日志已就位，它是 Replay 的前置）。
+**仍未做（下一批）**：§24 目录重构（此前已确认不改）、多设备 Lease。
+（Replay 已在第五轮完成。）
 
 ## V2.1 第四轮改造
 
@@ -293,6 +302,58 @@ with adb.deadline_budget(12):      # 整段采集共用 12 秒
 顺带把超时分成两档：**采集类 6s、写类 15s**。采集卡住时继续干等没有收益——
 任务不会因为多等几秒就拿到页面，只会把安全点一直往后拖；而 `am start` 拉冷启动 App
 确实可能慢，等一等是有意义的。
+
+## V2.1 第五轮：回放
+
+`EventLog` 落盘之后，回放是它的第一个真正用途。
+
+| # | 审核项 | 改动 | 落点 |
+|---|---|---|---|
+| 18 | §23 Replay | 新增 `agent/replay.py`：事件流 → 时间轴 + 异常帧 + Markdown 报告 + 动作计划 | `agent/replay.py`、`api/server.py`、`scripts/replay_task.py` |
+| 19 | 事件自足性 | 事件补上动作细节（坐标 / 输入值 / 指纹 / 截图路径 / 证据层），使事件流**脱离内存态也能回放** | `agent/runtime.py`、`storage/event_log.py` |
+
+### 为什么数据源必须是 EventLog
+
+`TrajectoryStore` 是内存态、只留最近 200 条、进程一重启就没了。
+而最需要回放的时刻，恰恰是**任务失败或进程崩溃之后**——那时轨迹已经没了。
+所以回放只认落盘的事件流，并且事件必须**自足**：
+
+```python
+# 只记动作类型的话，回放看不出它当时点在哪
+self._emit(task.id, ACTION_DISPATCHED, action=action.type.value, ...)
+# 补上细节后才回放得出来
+self._emit(task.id, ACTION_DISPATCHED, ..., target={"x": 540.0, "y": 1613.0})
+```
+
+### 报告长什么样
+
+```
+$ python scripts/replay_task.py 20260914_093100_demo01
+# 任务回放 `20260914_093100_demo01`
+
+- 事件数：14  时长：17.9s  动作：2（其中危险动作 1）
+
+## 值得注意的地方
+1. `t+3.900s` **preempt_requested** —— 被 ...ff00 抢占（high > normal）
+2. `t+4.170s` **suspended** —— 让出设备（原因 preemption，已执行 1 步）
+3. `t+9.700s` **recovered** —— 重启后恢复（queued(from paused)）
+4. `t+10.500s` **waiting** —— 命中危险动作 tap（dangerous），等待人工确认
+5. `t+15.300s` **reconciled** —— 动作对账 → ask_human：页面无变化，危险动作可能未生效…
+6. `t+17.900s` **failed** —— 失败：无法判断上次动作是否生效，等待人工确认超时
+```
+
+「值得注意的地方」放在最前面是刻意的：跑成功的任务没什么好看的，
+**出问题的那几帧才是**。完整时间轴在下面，按「生命周期 / 动作 / 恢复 / 人工」分了阶段。
+
+### 动作重放默认不执行
+
+`agent/replay.py` 也提供动作序列重放，但**默认 `dry_run=True`，一个动作都不执行**。
+要真执行必须同时满足三件事：显式 `dry_run=False`、传入 `execute` 回调、
+（若含危险动作）`allow_dangerous=True`，缺一就抛 `ReplayRefused`。
+
+理由很直接：手机上的动作有真实副作用，盲目重放一个「提交订单」比不重放危险得多。
+而且重放前必须自己确保设备处在对应恢复点的状态，否则页面上下文对不上、结果没有参考价值——
+**生产环境要复现问题，用观测回放 + 恢复点，不要重放动作。**
 
 ## 快速开始
 
@@ -343,6 +404,7 @@ python -m api.server    # 监听 127.0.0.1:8010
 | `POST` | `/tasks/{id}/confirm` | 危险动作的人工确认 |
 | `GET` | `/tasks/{id}/history` | 执行轨迹（给下一步决策看，会被裁剪） |
 | `GET` | `/tasks/{id}/events` | **审计事件流**（只追加，含抢占/对账/失败原因） |
+| `GET` | `/tasks/{id}/replay` | **回放**：`format=markdown` 给人看，默认 JSON 给程序用 |
 | `GET` | `/tasks/{id}/checkpoint` | 最新恢复点 |
 | `GET` | `/tasks/{id}/shots/{n}` | 某一步的截图 |
 | `GET` | `/scheduler` | 调度器状态（running / ready / paused / suspended + 设备归属） |
@@ -386,7 +448,7 @@ pip install -r requirements.txt
 python -m pytest -q
 ```
 
-**204 个用例，全部离线**：不需要 adb、模拟器或 API Key。
+**222 个用例，全部离线**：不需要 adb、模拟器或 API Key。
 
 | 文件 | 覆盖 |
 |---|---|
@@ -395,10 +457,11 @@ python -m pytest -q
 | `test_vision.py` | UI 树容错、坐标落点、VLM 重试、prompt 构造 |
 | `test_verifier.py` | **验证三概念**：发出 / 效果 / 目标，含「VLM 说成功但页面没变 → 效果存疑」 |
 | `test_event_log.py` | 事件日志：顺序、按任务隔离、limit、截断行容错、写失败不抛异常 |
+| `test_replay.py` | **回放**：时间轴顺序与偏移、异常帧挑选、Markdown 报告、动作计划、**重放的安全默认** |
 | `test_classifier.py` | 三层关系判定、相似度否决、**分关系阈值**、二次确认标记、**语义相似度** |
 | `test_scheduler.py` | 优先级、暂停/取消、**抢占与恢复**、组合式中断、**启动恢复**（含审批前重启）、**抢占延迟观测**、设备占用 |
-| `test_runtime.py` | 闭环执行、异常收敛、死循环、HITL、Checkpoint 恢复、**三预算门控**、**动作对账**（继续/重做）、批准一次性、**执行记录**、事件流 |
-| `test_api.py` | HTTP 契约、状态码语义、错误脱敏、危险动作拦截、SUPER_TASK 改写与二次确认、**依赖链迁移**、版本门控、**/events 审计流** |
+| `test_runtime.py` | 闭环执行、异常收敛、死循环、HITL、Checkpoint 恢复、**三预算门控**、**动作对账**（继续/重做）、批准一次性、**执行记录**、事件流、**事件自足性** |
+| `test_api.py` | HTTP 契约、状态码语义、错误脱敏、危险动作拦截、SUPER_TASK 改写与二次确认、**依赖链迁移**、版本门控、**/events 审计流**、**/replay 回放** |
 
 ## 注意事项
 

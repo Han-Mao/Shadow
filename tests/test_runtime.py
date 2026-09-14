@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import pytest
 
+import agent.replay as replay_mod
 import agent.runtime as runtime_mod
 from agent.runtime import AgentRuntime, RunOutcome
 from agent.verifier import Verification
@@ -810,6 +811,43 @@ def test_runtime_emits_lifecycle_events(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------- V2.1：HITL（§25 scenario 10）
+
+
+def test_runtime_events_are_self_sufficient_for_replay(monkeypatch, tmp_path):
+    """事件流要「自足」到可以回放：动作细节都在事件里，不依赖内存态（§二十三）。
+
+    TrajectoryStore 是内存态、会被裁剪；而最需要回放的时刻恰恰是任务崩溃之后。
+    所以事件里必须带上「点在哪、输入了什么」——只记动作类型的话，回放看不出名堂。
+    """
+    patch_observe(monkeypatch, tmp_path)
+    patch_planner(
+        monkeypatch,
+        goals=["做事"],
+        decisions=[tap(120, 340), Decision(action=Action(type=ActionType.DONE, reason="完成"))],
+    )
+    patch_verifier(monkeypatch)
+
+    event_log = EventLog(tmp_path / "events")
+    session, runtime = build(tmp_path, event_log=event_log)
+    task = Task(instruction="点一下", budget=TaskBudget(max_action_steps=5))
+    session.acquire(task.id)
+    try:
+        assert runtime.run(task) is RunOutcome.DONE
+    finally:
+        session.release(task.id)
+
+    timeline = replay_mod.load_timeline(event_log, task.id)
+    plan = replay_mod.build_plan(timeline)
+
+    assert len(plan.steps) == 1
+    step = plan.steps[0]
+    assert step.action == "tap"
+    assert step.target == {"x": 120.0, "y": 340.0}, "坐标必须落在事件里"
+    assert step.attempt_id, "要能对应回是哪一次尝试"
+
+    report = timeline.render_markdown()
+    assert "(120,340)" in report
+    assert "## 时间轴" in report
 
 
 def test_dangerous_approval_is_consumed_after_one_use(monkeypatch, tmp_path):

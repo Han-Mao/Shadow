@@ -46,7 +46,9 @@ class Event:
     task_id: str
     kind: str
     data: dict = field(default_factory=dict)
-    at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
+    # 毫秒精度：回放要看「两个事件之间隔了多久」（比如抢占请求到真正让出），
+    # 秒级粒度会把这类分析糊掉
+    at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="milliseconds"))
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
 
     def to_dict(self) -> dict:

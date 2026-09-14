@@ -13,10 +13,10 @@ from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field, ValidationError
 
-from agent import executor, observer, verifier
+from agent import executor, observer, replay as replay_mod, verifier
 from agent.classifier import TaskClassifier
 from agent.runtime import AgentRuntime
 from agent.scheduler import TaskScheduler
@@ -382,6 +382,26 @@ def task_events(task_id: str, limit: int = 200):
         "count": len(events),
         "events": [event.to_dict() for event in events],
     }
+
+
+@app.get("/tasks/{task_id}/replay")
+def task_replay(task_id: str, format: str = "json", limit: int = 1000):
+    """任务回放（V2.1 §二十三）。
+
+    `format=json` 返回时间轴 + 动作计划（给程序用）；
+    `format=markdown` 返回人读报告，开头就是「值得注意的地方」——
+    排查时最先要看的是出问题那几帧，不是完整流水。
+
+    只读，不重放动作。要真重放请用 `agent.replay.replay()`，
+    它默认 dry-run，且危险动作必须显式放行。
+    """
+    if manager.get(task_id) is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+
+    timeline = replay_mod.load_timeline(event_log, task_id, limit=limit)
+    if format == "markdown":
+        return PlainTextResponse(timeline.render_markdown())
+    return {**timeline.to_dict(), "plan": replay_mod.build_plan(timeline).to_dict()}
 
 
 @app.get("/tasks/{task_id}/checkpoint")
