@@ -293,11 +293,17 @@ def _summarize(kind: str, data: dict) -> str:
         note = "（模型试图降级被拒）" if data.get("downgrade_blocked") else ""
         return f"风险判定 {data.get('effective')}{note}：{data.get('reason')}"
     if kind == GOAL_REQUESTED:
-        return f"模型申请完成（第 {data.get('rejections', 0)} 次被驳回过）：{data.get('reason')}"
+        policy = f"［{data.get('mode')}·{data.get('profile')}］" if data.get("mode") else ""
+        return (
+            f"模型申请完成{policy}（第 {data.get('rejections', 0)} 次被驳回过）："
+            f"{data.get('reason')}"
+        )
     if kind == GOAL_CONFIRMED:
-        return f"目标验证通过（{data.get('layer')}）：{data.get('reason')}"
+        policy = f"［{data.get('mode')}·{data.get('profile')}］" if data.get("mode") else ""
+        return f"目标验证通过{policy}：{data.get('reason')}"
     if kind == GOAL_REJECTED:
-        return f"完成申请被**驳回**：{data.get('reason')}"
+        policy = f"［{data.get('mode')}·{data.get('profile')}］" if data.get("mode") else ""
+        return f"完成申请被**驳回**{policy}：{data.get('reason')}"
     if kind == WAITING:
         return f"命中危险动作 {data.get('action')}（{data.get('risk')}），等待人工确认"
     if kind == CONFIRMED:

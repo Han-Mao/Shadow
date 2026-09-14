@@ -63,10 +63,22 @@ class InjectResult:
 
 
 class TaskManager:
-    def __init__(self, *, store, scheduler, classifier: TaskClassifier | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        store,
+        scheduler,
+        classifier: TaskClassifier | None = None,
+        runtime=None,
+    ) -> None:
         self._store = store
         self._scheduler = scheduler
         self._classifier = classifier or TaskClassifier()
+        # 只有「人工处理待确认事项」需要 runtime（危险动作 / 完成裁定都在它那里）。
+        # 拿它进来是有意的（V2.2 §九/§十）：以前 API 自己调 runtime.confirm 再自己改
+        # task 状态，于是 Runtime 的语义（拒绝后换策略）和 API 的语义（直接 FAILED）
+        # 各写各的，冲突不可避免。现在这条路径只有 TaskManager 一个出口。
+        self._runtime = runtime
 
     # ---- 创建与查询 ----
 
@@ -81,6 +93,7 @@ class TaskManager:
         submit: bool = True,
         relation_meta: dict | None = None,
         device_serial: str | None = None,
+        allowed_devices: frozenset[str] | None = None,
     ) -> Task:
         task = Task(
             instruction=instruction,
@@ -95,7 +108,7 @@ class TaskManager:
         task.mark(TaskStatus.CREATED)
         self._store.save(task)
         if submit:
-            self._scheduler.submit(task)
+            self._scheduler.submit(task, allowed_devices=allowed_devices)
         return task
 
     def get(self, task_id: str) -> Task | None:
@@ -145,11 +158,62 @@ class TaskManager:
     def pause(self, task_id: str) -> bool:
         return self._scheduler.pause(task_id)
 
-    def resume(self, task_id: str) -> bool:
-        return self._scheduler.resume(task_id)
+    def resume(self, task_id: str, *, allowed_devices: frozenset[str] | None = None) -> bool:
+        return self._scheduler.resume(task_id, allowed_devices=allowed_devices)
 
     def cancel(self, task_id: str) -> bool:
         return self._scheduler.cancel(task_id)
+
+    # ---- 人工处理待确认事项（V2.2 §三 / §十一）----
+
+    def confirmation_kind(self, task_id: str) -> str:
+        """这条任务在等什么：「dangerous_action」/「goal」/「none」。"""
+        if self._runtime is None or not self.confirmation_pending(task_id):
+            return "none"
+        return "goal" if self._runtime.is_goal_decision(task_id) else "dangerous_action"
+
+    def confirmation_pending(self, task_id: str) -> bool:
+        """有没有待人工处理的事项（危险动作或完成裁定）。"""
+        if self._runtime is None:
+            return False
+        return (
+            self._runtime.pending_confirmation(task_id) is not None
+            or self._runtime.is_goal_decision(task_id)
+        )
+
+    def resolve_confirmation(self, task_id: str, *, approved: bool) -> Task | None:
+        """处理一次人工确认，返回更新后的任务；没有待确认事项时返回 None。
+
+        **两种确认的落点是一样的：都重新入队继续做。**
+
+        这正是审核指出的那个跨模块冲突（V2.2 §三）：
+
+            Runtime：危险动作被否决 → 拉黑该动作 → 换策略继续
+            API    ：否决 → task.mark(FAILED)
+
+        两套语义打架，实际行为是「任务被直接判死」，与设计文档相反。
+        归拢之后只有一条规则——
+
+            否决危险动作 = 这个动作不要了，换一种做法接着完成
+            否决完成申请 = 还没做完，接着做
+            只有 USER_CANCEL 才该让任务结束
+
+        真正「放弃任务」的入口是 `/cancel`，不是「否决某个动作」。
+        """
+        if self._runtime is None:
+            return None
+        task = self.get(task_id)
+        if task is None or not self.confirmation_pending(task_id):
+            return None
+        if not self._runtime.confirm(task_id, approved):
+            return None
+
+        # 无论批准还是否决，都要重新入队：
+        #  批准 → 放行那一次危险动作 / 认定完成
+        #  否决 → 按 runtime 记下的黑名单或 Re-plan 理由，换一种做法继续
+        self._scheduler.submit(task, allow_preempt=False)
+        logger.info("任务 %s 的待确认事项已处理（approved=%s）", task_id, approved)
+        return task
 
     # ---- 注入 ----
 
@@ -162,6 +226,7 @@ class TaskManager:
         budget: TaskBudget | None = None,
         max_steps: int = 10,
         allow_disruptive: bool = False,
+        allowed_devices: frozenset[str] | None = None,
     ) -> InjectResult:
         """执行过程中插入新指令，由任务关系决定落点。
 
@@ -231,7 +296,7 @@ class TaskManager:
                 # 多设备场景下 A 任务被改写会把 B 设备上毫不相干的任务也一起打断。
                 self._scheduler.preempt_running(current.id)
             else:
-                self._scheduler.submit(current, allow_preempt=False)
+                self._scheduler.submit(current, allow_preempt=False, allowed_devices=allowed_devices)
             return InjectResult(
                 relation=relation,
                 action=InjectAction.SUPERSEDED,
@@ -249,6 +314,9 @@ class TaskManager:
             budget=budget or TaskBudget.from_max_steps(max_steps),
             priority=new_priority,
             parent_task_id=current.id if relation.relation is TaskRelation.SUBTASK else None,
+            # 设备授权范围一路传下去（V2.2 §二）：未绑定的新任务只能落在被允许的设备上，
+            # 绝不能因为「没指定 serial」就漂到别人的设备上
+            allowed_devices=allowed_devices,
             # 记下「它是被判成什么关系才产生的」，事后能回溯为什么它抢占了别人
             relation_meta={
                 "relation": relation.relation.value,

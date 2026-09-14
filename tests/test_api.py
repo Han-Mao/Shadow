@@ -18,14 +18,29 @@ from models.task_step import StepStatus
 from storage import CheckpointStore, EventLog, TaskStore, TrajectoryStore
 
 
+@pytest.fixture(autouse=True)
+def _pin_goal_policy_advisory(monkeypatch):
+    """把这些用例钉在宽松的完成策略上。
+
+    V2.2 §六 起完成判定按任务画像自动选严格度（导航/副作用 → strict），
+    而本文件关心的是 HTTP 契约、状态码与调度时序，不是完成策略本身。
+    完成策略由 `tests/test_goal_policy.py` 专门覆盖。
+    """
+    monkeypatch.setenv("GOAL_VERIFY_MODE", "advisory")
+
+
 @pytest.fixture
 def api(tmp_path, monkeypatch):
     """重建 API 的依赖装配，全部指向临时目录与假设备。"""
     from fastapi.testclient import TestClient
 
     from api import server
+    from device.pool import DevicePool
 
     session = DeviceSession(FakeDevice(), serial="fake-serial")
+    # 设备直连端点现在按 DevicePool 选设备（V2.2 §八），所以池也要指向替身，
+    # 否则会去问真的 adb
+    pool = DevicePool([session])
     task_store = TaskStore(tmp_path / "tasks")
     checkpoint_store = CheckpointStore(tmp_path / "checkpoints")
     trajectory = TrajectoryStore(root=tmp_path / "trajectories")
@@ -46,6 +61,7 @@ def api(tmp_path, monkeypatch):
     manager = TaskManager(store=task_store, scheduler=scheduler, classifier=TaskClassifier())
 
     monkeypatch.setattr(server, "session", session)
+    monkeypatch.setattr(server, "device_pool", pool)
     monkeypatch.setattr(server, "task_store", task_store)
     monkeypatch.setattr(server, "checkpoint_store", checkpoint_store)
     monkeypatch.setattr(server, "trajectory", trajectory)
@@ -467,13 +483,13 @@ def test_manual_endpoints_report_device_busy(api):
 
 
 def test_unhandled_error_is_redacted_by_default(api, monkeypatch):
-    client, server, *_ = api
+    client, server, session, *_ = api
 
     def boom(*args, **kwargs):
         raise RuntimeError("设备层炸了")
 
     monkeypatch.setattr(server, "_DEBUG_ERRORS", False)
-    monkeypatch.setattr(server.adb, "state", boom)
+    monkeypatch.setattr(session.controller, "state", boom)
 
     resp = client.get("/devices")
     assert resp.status_code == 500
@@ -483,13 +499,13 @@ def test_unhandled_error_is_redacted_by_default(api, monkeypatch):
 
 
 def test_unhandled_error_can_expose_detail_in_debug(api, monkeypatch):
-    client, server, *_ = api
+    client, server, session, *_ = api
 
     def boom(*args, **kwargs):
         raise RuntimeError("设备层炸了")
 
     monkeypatch.setattr(server, "_DEBUG_ERRORS", True)
-    monkeypatch.setattr(server.adb, "state", boom)
+    monkeypatch.setattr(session.controller, "state", boom)
 
     resp = client.get("/devices")
     assert "设备层炸了" in resp.json()["error"]

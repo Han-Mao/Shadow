@@ -1,6 +1,7 @@
 """Task 模型（V2 §二）：任务不再只是「一次请求」，而是可排队、可暂停、可恢复、可抢占的执行单元。"""
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import datetime
 from enum import Enum
@@ -9,6 +10,8 @@ from pydantic import BaseModel, Field
 
 from .budget import TaskBudget
 from .task_step import StepStatus, TaskStep, build_steps
+
+logger = logging.getLogger(__name__)
 
 
 class TaskStatus(str, Enum):
@@ -44,6 +47,50 @@ ACTIVE_STATUSES = frozenset({TaskStatus.QUEUED, TaskStatus.RUNNING, TaskStatus.P
 # 「被抢占挂起」是调度器临时让位，重启后必须自动恢复，否则任务就被永久搁置了。
 PAUSED_BY_USER = "user"
 PAUSED_BY_PREEMPTION = "preemption"
+
+# ---- 状态机（V2.2 §十/§十一）----
+#
+# 背景：TaskManager / Scheduler / Runtime / API 四层都能写 `task.status`，
+# 于是「Runtime 想拒绝后继续、API 却直接 FAILED」这类**跨模块语义冲突**几乎必然发生
+# （审核原话：不是功能不够，而是设计文档和实际状态迁移开始分叉）。
+#
+# 所以把合法迁移写成一张表，所有写入统一走 `Task.transition_to()`。
+# 终态不可逆（DONE/FAILED/CANCELLED 之后不能再动）。
+#
+# 注意：非法迁移**仍然执行**，只记 warning 并返回 False。
+# 这是刻意的——运行时最怕的是「状态卡住」，严格拒绝会让任务永远停在 running；
+# 但要能被看见，而不是悄悄发生。
+ALLOWED_TRANSITIONS: dict["TaskStatus", frozenset["TaskStatus"]] = {
+    TaskStatus.CREATED: frozenset(
+        {TaskStatus.QUEUED, TaskStatus.RUNNING, TaskStatus.PAUSED,
+         TaskStatus.WAITING, TaskStatus.FAILED, TaskStatus.CANCELLED,
+         TaskStatus.DONE, TaskStatus.CREATED}
+    ),
+    TaskStatus.QUEUED: frozenset(
+        {TaskStatus.RUNNING, TaskStatus.PAUSED, TaskStatus.WAITING,
+         TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.DONE, TaskStatus.QUEUED}
+    ),
+    TaskStatus.RUNNING: frozenset(
+        {TaskStatus.QUEUED, TaskStatus.PAUSED, TaskStatus.WAITING,
+         TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.RUNNING}
+    ),
+    TaskStatus.PAUSED: frozenset(
+        {TaskStatus.QUEUED, TaskStatus.RUNNING, TaskStatus.WAITING,
+         TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.PAUSED}
+    ),
+    TaskStatus.WAITING: frozenset(
+        {TaskStatus.QUEUED, TaskStatus.RUNNING, TaskStatus.PAUSED,
+         TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.WAITING}
+    ),
+    # 终态：不可逆
+    TaskStatus.DONE: frozenset({TaskStatus.DONE}),
+    TaskStatus.FAILED: frozenset({TaskStatus.FAILED}),
+    TaskStatus.CANCELLED: frozenset({TaskStatus.CANCELLED}),
+}
+
+# 条件合法：从 PAUSED 恢复成 QUEUED 时，只有「被抢占挂起」才该自动恢复。
+# 用户主动暂停的任务被调度器重新入队是错的——不替用户做决定。
+RESUMMABLE_PAUSED_REASONS = frozenset({PAUSED_BY_PREEMPTION})
 
 
 
@@ -114,17 +161,51 @@ class Task(BaseModel):
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)
 
+    # 非法状态迁移的累计次数（V2.2 §十）。> 0 就说明有调用方绕过了正确的状态机，
+    # 放在 Task 上而不是只写日志，是因为它会被 /tasks/{id} 直接读出来。
+    illegal_transition_count: int = 0
+
     # ---- 状态 ----
 
     def mark(self, status: TaskStatus, *, paused_reason: str | None = None) -> None:
-        """切换状态。
+        """切换状态（所有状态写入的统一入口）。
 
         `paused_reason` 只在 PAUSED 时有意义，切到其它状态会被自动清空，
         避免把「上次为什么暂停」的信息带到下一次运行里。
+
+        真正干活的是 `transition_to`——它按 `ALLOWED_TRANSITIONS` 校验，
+        非法迁移记 warning 但**仍然执行**（运行时最怕状态卡住）。
         """
+        self.transition_to(status, paused_reason=paused_reason)
+
+    def transition_to(
+        self,
+        status: TaskStatus,
+        *,
+        paused_reason: str | None = None,
+        source: str = "",
+    ) -> bool:
+        """状态迁移的唯一实现，返回「这次迁移是否合法」。
+
+        V2.2 §十/§十一：以前 TaskManager / Scheduler / Runtime / API 各自写
+        `task.status = x`，于是「Runtime 想拒绝后继续、API 却直接 FAILED」这类
+        跨模块语义冲突几乎无法避免——因为没有一处能回答「这个迁移该不该发生」。
+        `source` 让 warning 能指出是谁做的，排查时不用猜。
+        """
+        legal = status in ALLOWED_TRANSITIONS.get(self.status, frozenset())
+        if not legal:
+            self.illegal_transition_count += 1
+            logger.warning(
+                "任务 %s 非法状态迁移 %s → %s（来源 %s），已执行但请检查调用方",
+                self.id,
+                self.status.value,
+                status.value,
+                source or "未标注",
+            )
         self.status = status
         self.paused_reason = paused_reason if status is TaskStatus.PAUSED else None
         self.updated_at = datetime.now()
+        return legal
 
     @property
     def is_terminal(self) -> bool:

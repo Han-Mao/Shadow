@@ -59,6 +59,23 @@ class RuntimeLike(Protocol):
     def run(self, task: Task) -> Any: ...
 
 
+class DeviceNotAllowedError(RuntimeError):
+    """调用方被允许使用的设备里，没有一台可用（或全部不在池中）。
+
+    这是**对象级设备权限的最后一道防线**（V2.2 §二）：API 层已经检查过
+    「指定的 serial 在不在允许列表里」，但如果调用方根本不指定 serial，
+    光在 API 层检查 `None` 是没用的——调度器会自动挑一台最闲的设备，
+    于是「未指定」就成了绕过设备限制的后门。所以强制点必须落在选设备这一处。
+    """
+
+    def __init__(self, allowed: Any, known: list[str]) -> None:
+        allowed_text = ", ".join(sorted(allowed)) if allowed else "（无）"
+        known_text = ", ".join(known) if known else "（空）"
+        super().__init__(
+            f"没有可用的授权设备：允许 {allowed_text}；池中设备 {known_text}"
+        )
+
+
 @dataclass
 class _DeviceLane:
     """一台设备一条车道：自己的就绪队列、挂起区、运行槽。
@@ -270,11 +287,18 @@ class TaskScheduler:
         if self._event_log is not None:
             self._event_log.emit(task_id, kind, **data)
 
-    def submit(self, task: Task, *, allow_preempt: bool = True) -> Task:
-        """把任务放进就绪队列；若正在跑的任务优先级更低且可打断，则请求抢占。"""
-        task.mark(TaskStatus.QUEUED)
+    def submit(self, task: Task, *, allow_preempt: bool = True, allowed_devices: Any = None) -> Task:
+        """把任务放进就绪队列；若正在跑的任务优先级更低且可打断，则请求抢占。
+
+        `allowed_devices` 是调用方的设备授权范围（V2.2 §二）：未绑定设备的任务
+        只能从这里面挑。授权不足时抛 `DeviceNotAllowedError`，**不会**留下
+        半提交的任务——这个异常发生在 push_ready/落盘之前。
+        """
+        # 先解析车道（授权不足会在这里抛），**再**改状态与入队。
+        # 反过来的话，被拒绝的任务会被改成 queued 却从没进过队列——变成僵尸。
         with self._cond:
-            lane = self._lane_for(task)
+            lane = self._lane_for(task, allowed_devices)
+            task.mark(TaskStatus.QUEUED)
             lane.push_ready(task, self._counter)
 
         # **先落盘、再唤醒 worker**。反过来的话，worker 可能在任务还没持久化时
@@ -318,7 +342,7 @@ class TaskScheduler:
         self._emit(task_id, SUSPENDED, reason=PAUSED_BY_USER)
         return True
 
-    def resume(self, task_id: str) -> bool:
+    def resume(self, task_id: str, *, allowed_devices: Any = None) -> bool:
         with self._cond:
             task = self._paused.pop(task_id, None)
             if task is None or task.is_terminal:
@@ -326,8 +350,8 @@ class TaskScheduler:
             if not task.resumable:
                 self._paused[task_id] = task
                 return False
+            lane = self._lane_for(task, allowed_devices)
             task.mark(TaskStatus.QUEUED)
-            lane = self._lane_for(task)
             lane.push_ready(task, self._counter)
             self._cond.notify_all()
         self._persist(task)
@@ -465,19 +489,38 @@ class TaskScheduler:
             return None, paused
         return None, None
 
-    def _pick_lane(self) -> _DeviceLane:
-        """挑一条最闲的车道：优先没在跑、队列最短的。
+    def _pick_lane(self, allowed_devices: Any = None) -> _DeviceLane:
+        """挑一条**被授权**的车道：优先没在跑、队列最短的。
 
-        这是「未绑定任务」的落点。简单策略就够——真正的负载均衡要看设备异构性，
-        那是以后的事，现在先把「多设备能并行跑」这件事做对。
+        这是「未绑定任务」的落点，也是对象级设备权限真正生效的地方（V2.2 §二）：
+        调用方不指定设备时，只能从它被允许的那些设备里挑，绝不能挑到池里最闲的那台。
+
+        `allowed_devices` 为 None 表示不限（单用户本地场景）。
         """
+        candidates = [
+            self._lanes[serial]
+            for serial in sorted(self._lanes)
+            if allowed_devices is None or serial in allowed_devices
+        ]
+        if not candidates:
+            raise DeviceNotAllowedError(allowed_devices, sorted(self._lanes))
         return min(
-            (self._lanes[serial] for serial in sorted(self._lanes)),
+            candidates,
             key=lambda lane: (lane.running is not None, len(lane.ready), lane.serial),
         )
 
-    def _lane_for(self, task: Task) -> _DeviceLane:
-        """任务该投到哪条车道；未绑定就挑一条**并绑定**（V2.1 §十三）。
+    def pick_device(self, allowed_devices: Any = None) -> str | None:
+        """按授权范围挑一台设备，只回答 serial（不绑定、不排队）。
+
+        给上层「先决定这台任务该跑在哪，再去做权限判断」用的。
+        """
+        with self._cond:
+            if len(self._lanes) == 0:
+                return None
+            return self._pick_lane(allowed_devices).serial
+
+    def _lane_for(self, task: Task, allowed_devices: Any = None) -> _DeviceLane:
+        """任务该投到哪条车道；未绑定就挑一条**被授权的**并绑定（V2.1 §十三）。
 
         绑定发生在提交/恢复时，之后任务就固定在设备上——中途换设备会让
         页面上下文对不上，比排队等待更糟。
@@ -485,13 +528,15 @@ class TaskScheduler:
         if task.device_serial:
             lane = self._lanes.get(task.device_serial)
             if lane is not None:
+                if allowed_devices is not None and lane.serial not in allowed_devices:
+                    raise DeviceNotAllowedError(allowed_devices, sorted(self._lanes))
                 return lane
             logger.warning(
                 "任务 %s 绑定的设备 %s 不在池中，改派给可用设备", task.id, task.device_serial
             )
             task.device_serial = None
 
-        lane = self._pick_lane()
+        lane = self._pick_lane(allowed_devices)
         task.device_serial = lane.serial
         return lane
 

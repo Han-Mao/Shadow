@@ -22,10 +22,17 @@
 证据不足不等于有反证，把没有证据的完成一律拦下来会让 Agent 变成不能用。
 但反过来的错误（有反证还放行）是不可接受的，所以驳回必须是真的。
 
-`GOAL_VERIFY_MODE` 控制严格度：
-    off        不检查
-    advisory   默认。只在拿到反证时驳回
-    strict     计划里还有未完成步骤就一律驳回（除非模型给了可核验证据）
+`GOAL_VERIFY_MODE` 控制严格度（**V2.2 §六 起默认按任务画像自动判定**）：
+
+    auto / 未设置  **默认**。按任务画像决定（见 `agent/goal_policy.py`）：
+                    纯查询 → advisory；导航/副作用/改设置 → strict
+    advisory       全局宽松：只在拿到反证时驳回
+    strict         全局严格：计划里还有未完成步骤就驳回
+    off            不检查
+
+显式配置仍然是**全局覆盖**——需要单点压过画像时用它（例如压测、回归）。
+裁定结果里会记下「这次用了哪个画像、哪个策略」，所以「为什么这次被判严格」
+事后查得出来，不用猜配置。
 """
 from __future__ import annotations
 
@@ -37,6 +44,8 @@ from enum import Enum
 from models.action import Action
 from models.state import Observation
 from vision import parser
+
+from . import goal_policy
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +81,16 @@ class GoalCheck:
     independent_evidence: bool = False
     """是否拿到了不依赖模型的证据。"""
 
+    mode: str = ""
+    """本次实际生效的策略（off / advisory / strict）。"""
+
+    profile: str = ""
+    """本次判定的任务画像（read_only / navigation / side_effect / unknown）。
+
+    记下来是为了能回答「为什么这条任务判得比别人严」——
+    否则「画像 → 策略」这条链路只在代码里，出了事只能猜。
+    """
+
     @property
     def blocks_completion(self) -> bool:
         return self.verdict is GoalVerdict.REJECTED
@@ -82,11 +101,17 @@ class GoalCheck:
             "reason": self.reason,
             "checks": dict(self.checks),
             "independent_evidence": self.independent_evidence,
+            "mode": self.mode,
+            "profile": self.profile,
         }
 
 
 def mode() -> str:
-    return os.getenv("GOAL_VERIFY_MODE", "advisory").strip().lower()
+    """当前生效的**全局**策略名（`auto` 表示按任务画像走）。
+
+    保留这个函数给运维/自检看配置，内部判定请用 `goal_policy.resolve_mode`。
+    """
+    return os.getenv("GOAL_VERIFY_MODE", "").strip().lower() or goal_policy.AUTO
 
 
 def verify_goal(
@@ -96,32 +121,46 @@ def verify_goal(
     pending_steps: int,
     executed_steps: int,
     page_seen_changed: bool,
+    instruction: str = "",
+    context: str = "",
 ) -> GoalCheck:
-    """裁定一次完成申请。纯本地、无网络、无副作用。"""
-    current_mode = mode()
-    if current_mode == "off":
+    """裁定一次完成申请。纯本地、无网络、无副作用。
+
+    严格度按**任务画像**自动选择（V2.2 §六）：纯查询宽松、导航与副作用严格。
+    """
+    current_mode, profile = goal_policy.resolve_mode(instruction, context)
+    policy_note = goal_policy.describe_policy(profile, current_mode)
+
+    def decided(verdict: GoalVerdict, reason: str, **kwargs) -> GoalCheck:
         return GoalCheck(
-            GoalVerdict.UNCERTAIN, "目标验证已关闭（GOAL_VERIFY_MODE=off）"
+            verdict=verdict,
+            reason=f"{reason}［{policy_note}］",
+            mode=current_mode,
+            profile=profile.value,
+            **kwargs,
         )
+
+    if current_mode == goal_policy.OFF:
+        return decided(GoalVerdict.UNCERTAIN, "目标验证已关闭（GOAL_VERIFY_MODE=off）")
 
     # ---- L6-c：模型给了可核验声明 → 逐条比对（这是唯一的强判定）----
     declared = action.goal_evidence or {}
     if declared:
         checks, mismatched, unverifiable = _check_declarations(declared, observation)
         if mismatched:
-            return GoalCheck(
+            return decided(
                 GoalVerdict.REJECTED,
                 "完成申请与可核验事实矛盾：" + "；".join(mismatched),
                 checks=checks,
                 independent_evidence=True,
             )
         if unverifiable:
-            return GoalCheck(
+            return decided(
                 GoalVerdict.UNCERTAIN,
                 "完成申请提供了声明，但其中部分无法核验：" + "；".join(unverifiable),
                 checks=checks,
             )
-        return GoalCheck(
+        return decided(
             GoalVerdict.CONFIRMED,
             f"完成申请的可核验声明全部命中（{len(checks)} 项）",
             checks=checks,
@@ -130,24 +169,25 @@ def verify_goal(
 
     # ---- L6-a：计划跑完了（计划状态是本地事实，不是模型自述）----
     if pending_steps == 0:
-        return GoalCheck(
+        return decided(
             GoalVerdict.CONFIRMED,
             "计划中没有未完成步骤，独立证据支持完成",
             independent_evidence=True,
         )
 
-    # ---- strict 模式：计划没做完就不认 ----
-    if current_mode == "strict":
-        return GoalCheck(
+    # ---- strict：计划没做完就不认 ----
+    if current_mode == goal_policy.STRICT:
+        return decided(
             GoalVerdict.REJECTED,
-            f"strict 模式：计划仍有 {pending_steps} 步未完成，且模型未提供可核验证据",
+            f"strict 策略（{profile.value} 任务）：计划仍有 {pending_steps} 步未完成，"
+            "且模型未提供可核验证据",
             independent_evidence=True,
         )
 
     # ---- advisory：只在拿到反证时驳回 ----
     # 反证 = 既没走完计划、页面一次都没推进过、模型还连理由都懒得说
     if executed_steps > 0 and not page_seen_changed and not action.reason.strip():
-        return GoalCheck(
+        return decided(
             GoalVerdict.REJECTED,
             (
                 f"声称完成但缺少任何支撑：计划仍有 {pending_steps} 步未完成，"
@@ -162,7 +202,7 @@ def verify_goal(
         reasons.append("本次任务尚未观察到页面推进")
     if not action.reason.strip():
         reasons.append("模型未说明完成理由")
-    return GoalCheck(
+    return decided(
         GoalVerdict.UNCERTAIN,
         "完成申请缺少独立证据，但不构成反证：" + "；".join(reasons),
     )

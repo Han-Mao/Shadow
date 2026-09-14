@@ -30,6 +30,11 @@ class DeviceSession:
         self._meta_lock = threading.RLock()
         self._owner: str | None = None
         self._preempt_for: str | None = None
+        # 设备状态的「代次」（V2.2 §九）：每次有人拿到设备、或每发出一个动作就 +1。
+        # 观察这类只读接口不加锁（否则任务跑起来连设备都查不到），但消费者必须能
+        # 分辨「这是一次稳定观察」还是「中途读到动画/半更新的一屏」——
+        # 拿观察前后的代次一比就知道。
+        self._generation = 0
 
     # ---- 只读状态 ----
 
@@ -40,6 +45,18 @@ class DeviceSession:
     @property
     def serial(self) -> str:
         return self._serial
+
+    @property
+    def generation(self) -> int:
+        """设备状态的代次。同一代次内的观察是稳定的。"""
+        with self._meta_lock:
+            return self._generation
+
+    def bump_generation(self) -> int:
+        """标记「设备状态可能变了」。"""
+        with self._meta_lock:
+            self._generation += 1
+            return self._generation
 
     @property
     def owner(self) -> str | None:
@@ -60,6 +77,7 @@ class DeviceSession:
                 "owner": self._owner,
                 "busy": self._owner is not None,
                 "preempt_requested_for": self._preempt_for,
+                "generation": self._generation,
             }
 
     # ---- 所有权 ----
@@ -75,6 +93,8 @@ class DeviceSession:
             with self._meta_lock:
                 self._owner = task_id
                 self._preempt_for = None
+                # 换了持有者 = 设备状态可能变 → 代次 +1
+                self._generation += 1
             logger.debug("任务 %s 取得设备 %s", task_id, self._serial)
         return acquired
 
@@ -105,6 +125,9 @@ class DeviceSession:
         """
         if not self.owned_by(task_id):
             raise DeviceBusyError(f"任务 {task_id} 当前不持有设备（持有者：{self.owner}）")
+        # 一个动作就要发出去了 → 设备状态即将改变，代次 +1。
+        # 这样并发的只读观察能看出「我这次观察跨越了一个动作」
+        self.bump_generation()
         yield self._controller
 
     # ---- 抢占 ----

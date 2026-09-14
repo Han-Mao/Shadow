@@ -45,8 +45,16 @@ class EvidenceLevel(str, Enum):
     L4_TARGET = "l4_target"
     """目标层：被操作元素的自身状态变化。"""
 
+    L5_SUCCESS_MARKER = "l5_success_marker"
+    """明确成功标志：页面文本里出现了「支付成功 / 已发送」这类**终态**文案。
+
+    比 VLM 便宜（纯本地匹配）、比「页面变了」具体得多。专门用来回答
+    「不可撤销动作到底成了没有」——页面跳转到支付页**不等于**支付成功，
+    但页面上写着「支付成功」就是（V2.2 §六）。
+    """
+
     L5_VLM = "l5_vlm"
-    """语义层：VLM 对前后截图的判定。"""
+    """语义层：VLM 对前后截图的判定（与上一条同属 L5，但一个靠本地模板、一个靠模型）。"""
 
     L6_GOAL = "l6_goal"
     """目标层（任务级）：GoalVerifier 对「任务是否完成」的独立裁定。"""
@@ -62,6 +70,7 @@ class EvidenceLevel(str, Enum):
             EvidenceLevel.L2_NAVIGATION,
             EvidenceLevel.L3_STRUCTURE,
             EvidenceLevel.L4_TARGET,
+            EvidenceLevel.L5_SUCCESS_MARKER,
             EvidenceLevel.L6_GOAL,
         )
 
@@ -188,3 +197,47 @@ def _clickable_labels(ui_tree: str | None) -> set[str] | None:
         if label:
             labels.add(label)
     return labels
+
+
+# 页面上的「终态成功」文案（V2.2 §六）。命中即认为不可撤销动作确实成功了。
+#
+# 为什么需要它：审核指出「Activity 改变 ≠ 目标动作成功」——
+#   点击付款 → 打开支付 Activity，只说明**进入了支付流程**，不等于付款成功。
+# 危险动作必须等到这类明确的成功标志才敢继续；只看到页面变了就转人工。
+#
+# 这份表刻意写得保守：宁可不匹配（转人工多问一次），也不要误匹配
+# （把「支付失败」也当成成功——所以「失败」类词一律不在表内）。
+SUCCESS_MARKERS = (
+    "支付成功", "付款成功", "已支付", "支付完成", "充值成功", "转账成功",
+    "下单成功", "提交成功", "已提交", "发送成功", "已发送", "发送完毕",
+    "操作成功", "已完成", "购买成功", "退款成功", "设置成功", "保存成功",
+    "success", "succeeded", "completed", "payment successful", "sent",
+)
+
+
+def success_evidence(ui_tree: str | None) -> str:
+    """页面文本里命中的成功标志（没有则空串）。纯本地匹配，不发网络请求。"""
+    text = _ui_text_index(ui_tree)
+    if not text:
+        return ""
+    lowered = text.lower()
+    for marker in SUCCESS_MARKERS:
+        if marker.lower() in lowered:
+            return marker
+    return ""
+
+
+def _ui_text_index(ui_tree: str | None) -> str:
+    """把 UI 树里所有可读文本拼成一个可搜索的字符串；树不可解析时返回空串。"""
+    if not ui_tree:
+        return ""
+    try:
+        root = parser.parse(ui_tree)
+    except Exception:  # noqa: BLE001
+        return ""
+    parts: list[str] = []
+    for node in parser.iter_nodes(root):
+        for candidate in (node.text, node.content_desc, node.resource_id):
+            if candidate:
+                parts.append(candidate)
+    return " ".join(parts)

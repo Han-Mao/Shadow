@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
-from device.pool import DevicePool
+from device.pool import DevicePool, storage_hint
 from device.session import DeviceBusyError, DeviceSession
 from models.action import Action, ActionType, ActionRisk, ActionEffectStatus, Decision
 from models.checkpoint import Checkpoint
@@ -715,6 +715,10 @@ class AgentRuntime:
                 pending_steps=pending_steps,
                 executed_steps=state.execution_step,
                 page_seen_changed=state.page_seen_changed,
+                # 严格度按任务画像自动选（V2.2 §六）：纯查询宽松、导航与副作用严格。
+                # 所以必须把任务原文传进去，否则无法判断这是哪一类任务。
+                instruction=task.instruction,
+                context=task.context,
             )
 
         state.last_goal_check = check
@@ -726,6 +730,8 @@ class AgentRuntime:
             executed_steps=state.execution_step,
             page_seen_changed=state.page_seen_changed,
             rejections=state.goal_rejections,
+            mode=check.mode,
+            profile=check.profile,
         )
 
         if not check.blocks_completion:
@@ -734,6 +740,8 @@ class AgentRuntime:
                 GOAL_CONFIRMED,
                 verdict=check.verdict.value,
                 reason=check.reason,
+                mode=check.mode,
+                profile=check.profile,
                 layer=check.independent_evidence and "l6_goal" or "planner",
             )
             self._close_step(task, step)
@@ -747,6 +755,8 @@ class AgentRuntime:
             GOAL_REJECTED,
             reason=check.reason,
             checks=check.checks,
+            mode=check.mode,
+            profile=check.profile,
             rejections=state.goal_rejections,
         )
         logger.warning(
@@ -806,8 +816,14 @@ class AgentRuntime:
     ) -> Observation | None:
         state.observation_count += 1
         try:
+            # 产物按设备分目录（V2.2 §七）：多设备共用一个目录时，
+            # 两台设备的截图会互相覆盖、证据无法归属，Checkpoint / Replay / 审计
+            # 都会指到错的那一张图上。
             return observer.observe(
-                session.controller, self._artifact_dir, state.observation_count, suffix=suffix
+                session.controller,
+                storage_hint(self._artifact_dir, session.serial),
+                state.observation_count,
+                suffix=suffix,
             )
         except Exception as exc:  # noqa: BLE001 - 设备抖动不能穿透到 API
             logger.warning("任务 %s 第 %d 次观察失败: %s", task.id, state.observation_count, exc)

@@ -10,9 +10,10 @@
 """
 from __future__ import annotations
 
+from agent import evidence
 from agent.evidence import EvidenceLevel, screen_delta
 from agent.verifier import ui_tree_signal
-from models.action import Action, ActionType, Point
+from models.action import Action, ActionEffectStatus, ActionType, Point
 from models.state import Observation
 from vision.target import TargetState, resolve_target, target_state
 
@@ -127,3 +128,94 @@ def test_positive_target_evidence_is_recognized():
     delta = screen_delta(obs(SUBMIT), obs(SUBMITTED), tap())
 
     assert delta.target.is_positive_evidence
+
+
+# ---------------------------------------------------------------- V2.2 §六：危险动作的强证据
+
+
+def test_success_marker_matches_final_state_text_only():
+    """成功标志必须写得保守：只认终态文案，绝不把「支付失败」当成功。"""
+    assert evidence.success_evidence(SUBMITTED) == "已提交"
+    assert evidence.success_evidence(SUBMIT) == "", "「提交」还不是终态"
+    assert evidence.success_evidence(None) == ""
+    assert evidence.success_evidence("<hierarchy><node") == "", "树坏了不算证据"
+    assert evidence.success_evidence(
+        '<hierarchy><node text="支付失败" bounds="[0,0][10,10]"/></hierarchy>'
+    ) == ""
+
+
+def test_dangerous_reconcile_requires_an_explicit_success_marker():
+    """「跳到了支付 Activity」不等于「付款成功」（V2.2 §六）。
+
+    旧逻辑：activity 变了 → CONTINUE。但那只说明**进入了支付流程**。
+    危险动作现在只看页面上有没有明确的成功标志，没有就转人工。
+    """
+    from agent.reconciliation import ReconcileAction, reconcile
+    from models.action import Action, ActionRisk, ActionType, Point
+    from models.checkpoint import Checkpoint
+
+    pay = Action(
+        type=ActionType.TAP,
+        target=Point(x=10, y=20),
+        value="确认付款",
+        risk=ActionRisk.DANGEROUS,
+    )
+    assert pay.resolved_risk() is ActionRisk.DANGEROUS, "前置条件：它确实被判成危险动作"
+
+    cart = obs(
+        '<hierarchy><node class="android.widget.Button" text="确认付款" bounds="[0,0][100,50]"/>'
+        "</hierarchy>",
+        activity=".CartActivity",
+    )
+    checkpoint = Checkpoint.capture(
+        task_id="t1",
+        step=1,
+        step_states={},
+        observation=cart,
+        action_effect=ActionEffectStatus.EFFECT_UNKNOWN,
+        last_action=pay,
+    )
+
+    # 情况 A：跳到了支付页，但页面上没有任何成功标志 → 不能判定成功
+    pay_page = obs(
+        '<hierarchy><node class="android.widget.TextView" text="请输入支付密码" '
+        'bounds="[0,0][100,50]"/></hierarchy>',
+        activity=".PayActivity",
+    )
+    verdict = reconcile(checkpoint, pay_page, online=True)
+
+    assert verdict.action is ReconcileAction.ASK_HUMAN
+    assert "进入" in verdict.reason or "跳转" in verdict.reason
+
+    # 情况 B：页面出现明确成功标志 → 才算生效
+    paid = obs(
+        '<hierarchy><node class="android.widget.TextView" text="支付成功" '
+        'bounds="[0,0][100,50]"/></hierarchy>',
+        activity=".PayActivity",
+    )
+    verdict = reconcile(checkpoint, paid, online=True)
+
+    assert verdict.action is ReconcileAction.CONTINUE
+    assert verdict.layer == "l5_success_marker"
+
+
+def test_normal_action_still_accepts_page_change():
+    """普通动作不受这条收紧影响：页面跳转仍然是「已生效」的合理证据。"""
+    from agent.reconciliation import ReconcileAction, reconcile
+    from models.action import Action, ActionType, Point
+    from models.checkpoint import Checkpoint
+
+    tap_action = Action(type=ActionType.TAP, target=Point(x=10, y=20))
+    before = obs(SUBMIT, activity=".ListActivity")
+    checkpoint = Checkpoint.capture(
+        task_id="t1",
+        step=1,
+        step_states={},
+        observation=before,
+        action_effect=ActionEffectStatus.EFFECT_UNKNOWN,
+        last_action=tap_action,
+    )
+
+    verdict = reconcile(checkpoint, obs(SUBMITTED, activity=".DetailActivity"), online=True)
+
+    assert verdict.action is ReconcileAction.CONTINUE

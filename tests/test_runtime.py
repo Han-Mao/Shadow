@@ -21,6 +21,18 @@ from models.task_step import StepStatus
 from storage import CheckpointStore, EventLog, TaskStore, TrajectoryStore
 
 
+@pytest.fixture(autouse=True)
+def _pin_goal_policy_advisory(monkeypatch):
+    """把这些用例钉在宽松的完成策略上。
+
+    V2.2 §六 起，完成判定的严格度**按任务画像**自动选（导航/副作用 → strict）。
+    本文件用的是「计划永远停在 pending」的脚本化 planner（决策里不带 step_done），
+    在新默认下会被 strict 判定为「计划没走完」而驳回——那测的就不是执行闭环，
+    而是完成策略了。完成策略本身由 `tests/test_goal_policy.py` 专门覆盖。
+    """
+    monkeypatch.setenv("GOAL_VERIFY_MODE", "advisory")
+
+
 def observation(step: int, tmp_path, package: str = "com.android.settings") -> Observation:
     return Observation(
         step=step,

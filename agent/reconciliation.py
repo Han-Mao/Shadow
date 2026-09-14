@@ -89,7 +89,29 @@ def reconcile(
         )
 
     dangerous = action.resolved_risk() is ActionRisk.DANGEROUS
-    delta = evidence.screen_delta(_baseline_observation(checkpoint), observation, action)
+    delta = _delta_against(checkpoint, observation, action)
+
+    # ---- 危险动作走单独一条通道：只认「明确的成功标志」（V2.2 §六）----
+    #
+    # 审核指出的假设问题：
+    #   点击付款 → 打开支付 Activity → 旧逻辑判「page changed → CONTINUE」
+    #   但那只能说明**进入了支付流程**，不等于付款成功。
+    # 所以危险动作不看「页面变没变」（对这类动作它是弱证据），
+    # 只看页面上有没有出现「支付成功 / 已发送」这种终态文案；没有就转人工。
+    if dangerous:
+        marker = evidence.success_evidence(observation.ui_tree)
+        if marker:
+            return ReconcileVerdict(
+                ReconcileAction.CONTINUE,
+                f"页面出现明确成功标志「{marker}」，判定不可撤销动作已生效",
+                layer="l5_success_marker",
+            )
+        return ReconcileVerdict(
+            ReconcileAction.ASK_HUMAN,
+            "不可撤销动作：页面变化（含跳转）只能说明进入了下一屏，"
+            "不能证明副作用已经成功，且页面上没有出现明确的成功标志，转人工确认",
+            layer=delta.strongest_layer.value,
+        )
 
     package_changed = bool(
         checkpoint.package and observation.package and observation.package != checkpoint.package
@@ -109,7 +131,7 @@ def reconcile(
             layer="l2_navigation",
         )
 
-    # 同 package 内 activity 变了 → 动作确实让页面跳转了，这是最硬的证据
+    # 同 package 内 activity 变了 → 动作确实让页面跳转了
     if checkpoint.activity and observation.activity and observation.activity != checkpoint.activity:
         return ReconcileVerdict(
             ReconcileAction.CONTINUE,
@@ -119,11 +141,6 @@ def reconcile(
 
     # 拿不到可比对的基线
     if not delta.known:
-        if dangerous:
-            return ReconcileVerdict(
-                ReconcileAction.ASK_HUMAN,
-                "缺少 UI 基线，无法判断危险动作是否生效，需人工确认",
-            )
         return ReconcileVerdict(
             ReconcileAction.REPLAN, "缺少 UI 基线，无法判断上次动作是否生效"
         )
@@ -137,27 +154,12 @@ def reconcile(
         )
 
     if delta.changed:
-        if dangerous:
-            # 危险动作只认「跳转 / 目标元素变化」这类强证据：
-            # 页面结构变化可能只是弹了个 toast 或 dialog，不足以断定「付款成功了」
-            return ReconcileVerdict(
-                ReconcileAction.ASK_HUMAN,
-                "页面结构有变化但不足以确认危险动作已生效，为避免重复执行，转人工确认",
-                layer="l3_structure",
-            )
         return ReconcileVerdict(
             ReconcileAction.CONTINUE,
             f"页面结构已变化（{delta.strongest_layer.value}），判定上次动作已生效，继续原计划",
             layer=delta.strongest_layer.value,
         )
 
-    # 页面结构完全没变 → 动作没生效
-    if dangerous:
-        return ReconcileVerdict(
-            ReconcileAction.ASK_HUMAN,
-            "页面无变化，危险动作可能未生效；为避免重复执行，转人工确认",
-            layer="l3_structure",
-        )
     return ReconcileVerdict(
         ReconcileAction.RETRY,
         "页面无变化，判定上次动作未生效，重做该动作",
@@ -193,17 +195,6 @@ def _delta_against(checkpoint: Checkpoint, observation: Observation, action: Act
         fingerprint_before=before_fp,
         fingerprint_after=after_fp,
         known=known,
-    )
-
-
-def _baseline_observation(checkpoint: Checkpoint) -> Observation:
-    """把恢复点还原成一次「动作发出前」的观察（保留给需要 Observation 的调用方）。"""
-    return Observation(
-        step=checkpoint.current_step,
-        screenshot_path=checkpoint.screenshot_path or "",
-        package=checkpoint.package,
-        activity=checkpoint.activity,
-        ui_tree=checkpoint.ui_snapshot if checkpoint.ui_snapshot else None,
     )
 
 

@@ -18,6 +18,21 @@ class FakeDevice:
         self.size_calls += 1
         return self.size
 
+    def state(self) -> str:
+        """与 AdbController.state() 同签名：/devices 会逐台查状态。"""
+        self.events.append(("state",))
+        return "device"
+
+    def screenshot(self, path) -> "Path":
+        """与 AdbController.screenshot(path) 同签名：落一个占位文件并返回路径。"""
+        from pathlib import Path
+
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"\x89PNG\r\n\x1a\n")
+        self.events.append(("screenshot", str(target)))
+        return target
+
     def tap(self, x: int, y: int) -> None:
         self.events.append(("tap", x, y))
 

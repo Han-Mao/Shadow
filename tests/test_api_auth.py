@@ -70,24 +70,68 @@ def test_authentication(monkeypatch):
 
 def test_device_scope(monkeypatch):
     monkeypatch.setenv("SHADOW_API_DEVICE_ALLOW", "emu-1,emu-2")
-    principal = auth.authenticate(f"Bearer {TOKEN}", None) if False else auth.Principal(
-        name="op", devices=frozenset({"emu-1", "emu-2"})
-    )
+    principal = auth.Principal(name="op", devices=frozenset({"emu-1", "emu-2"}))
 
     assert principal.may_use_device("emu-1")
     assert not principal.may_use_device("emu-9")
-    assert principal.may_use_device(None), "不指定设备时不做限制"
+    # V2.2 §二：None 不等于「哪台都行」，而是「还不知道会是哪台」——
+    # 受限令牌下必须为 False，否则「不指定设备」就是绕过设备限制的后门
+    assert not principal.may_use_device(None)
+    # 真正的「哪台都行」只能由调度器在授权范围内挑
+    assert principal.allowed_serials() == frozenset({"emu-1", "emu-2"})
+    assert auth.Principal(name="local").allowed_serials() is None, "不限设备时交给调度器"
 
 
-def test_confirmation_token_is_bound_to_the_action():
-    """令牌绑定「任务 + 具体动作 + 任务版本」——换个动作或目标被改写后旧令牌即失效。"""
-    token = auth.issue_confirmation_token("t1", "fp-aaa", 1)
+def test_confirmation_token_is_bound_to_action_principal_and_expiry():
+    """令牌绑定「调用方身份 + 任务 + 具体动作 + 任务版本 + 有效期」（V2.2 §五）。"""
+    token = auth.issue_confirmation_token("operator-A", "t1", "fp-aaa", 1)
 
-    assert auth.verify_confirmation_token(token, "t1", "fp-aaa", 1)
-    assert not auth.verify_confirmation_token(token, "t1", "fp-bbb", 1), "换了动作必须失效"
-    assert not auth.verify_confirmation_token(token, "t2", "fp-aaa", 1)
-    assert not auth.verify_confirmation_token(token, "t1", "fp-aaa", 2), "任务改写后必须失效"
-    assert not auth.verify_confirmation_token(None, "t1", "fp-aaa", 1)
+    ok, _ = auth.verify_confirmation_token(token, "operator-A", "t1", "fp-aaa", 1)
+    assert ok
+
+    # 换个人来提交：不通过。不绑人的话，令牌就是「谁拿到谁能用」
+    assert not auth.verify_confirmation_token(token, "operator-B", "t1", "fp-aaa", 1)[0]
+    # 换动作 / 换任务 / 任务被改写：都不通过
+    assert not auth.verify_confirmation_token(token, "operator-A", "t1", "fp-bbb", 1)[0]
+    assert not auth.verify_confirmation_token(token, "operator-A", "t2", "fp-aaa", 1)[0]
+    assert not auth.verify_confirmation_token(token, "operator-A", "t1", "fp-aaa", 2)[0]
+    assert not auth.verify_confirmation_token(None, "operator-A", "t1", "fp-aaa", 1)[0]
+    assert not auth.verify_confirmation_token("garbage", "operator-A", "t1", "fp-aaa", 1)[0]
+
+
+def test_confirmation_token_expires():
+    """短时效：过期的令牌不再是「长期有效的能力票据」。"""
+    issued_at = 1_000_000.0
+    token = auth.issue_confirmation_token(
+        "operator-A", "t1", "fp-aaa", 1, ttl=60, now=issued_at
+    )
+
+    assert auth.verify_confirmation_token(
+        token, "operator-A", "t1", "fp-aaa", 1, now=issued_at + 30
+    )[0]
+    ok, reason = auth.verify_confirmation_token(
+        token, "operator-A", "t1", "fp-aaa", 1, now=issued_at + 61
+    )
+    assert not ok
+    assert "过期" in reason
+
+
+def test_read_permission_denies_other_device_tasks():
+    """对象级读权限：受限令牌读不到别人设备上的任务（V2.2 §四）。
+
+    读到 `/tasks/{id}` 就等于拿到了待确认动作的**放行令牌**，所以读取侧
+    也必须过设备检查，不能只查「谁能发起操作」。
+    """
+    principal = auth.Principal(name="op", devices=frozenset({"emu-1"}))
+
+    class _Task:
+        def __init__(self, serial):
+            self.device_serial = serial
+
+    assert principal.may_access_task(_Task("emu-1"))
+    assert not principal.may_access_task(_Task("emu-2"))
+    assert not principal.may_access_task(_Task(None)), "未绑定设备的任务在受限令牌下一律拒绝"
+    assert auth.Principal(name="local").may_access_task(_Task("emu-9")), "不限设备的令牌看得到全部"
 
 
 # ---------------------------------------------------------------- 端到端部分
@@ -104,6 +148,7 @@ def secured_api(tmp_path, monkeypatch):
     from agent.scheduler import TaskScheduler
     from agent.task_manager import TaskManager
     from api import server
+    from device.pool import DevicePool
     from device.session import DeviceSession
     from fakes import FakeDevice
     from models.action import Action, ActionType, Decision
@@ -116,6 +161,7 @@ def secured_api(tmp_path, monkeypatch):
     monkeypatch.setenv("SHADOW_API_DEVICE_ALLOW", "emu-1")
 
     session = DeviceSession(FakeDevice(), serial="emu-1")
+    pool = DevicePool([session])
     task_store = TaskStore(tmp_path / "tasks")
     checkpoint_store = CheckpointStore(tmp_path / "checkpoints")
     trajectory = TrajectoryStore(root=tmp_path / "trajectories")
@@ -133,10 +179,13 @@ def secured_api(tmp_path, monkeypatch):
     scheduler = TaskScheduler(
         runtime, session, task_store=task_store, idle_poll_seconds=0.01, event_log=event_log
     )
-    manager = TaskManager(store=task_store, scheduler=scheduler, classifier=TaskClassifier())
+    manager = TaskManager(
+        store=task_store, scheduler=scheduler, classifier=TaskClassifier(), runtime=runtime
+    )
 
     for name, value in (
         ("session", session),
+        ("device_pool", pool),
         ("task_store", task_store),
         ("checkpoint_store", checkpoint_store),
         ("trajectory", trajectory),

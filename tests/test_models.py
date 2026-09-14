@@ -350,3 +350,63 @@ def test_step_outcome_values_are_distinct_from_step_status():
 def test_build_steps_trims_goals():
     steps = build_steps(["  打开设置  ", "开启飞行模式"])
     assert [s.goal for s in steps] == ["打开设置", "开启飞行模式"]
+
+
+# ---------------------------------------------------------------- 任务状态机（V2.2 §十）
+
+
+def test_legal_transitions_are_not_flagged():
+    """正常生命周期不该产生任何「非法迁移」噪音。"""
+    task = Task(instruction="打开设置")
+
+    for status in (
+        TaskStatus.QUEUED,
+        TaskStatus.RUNNING,
+        TaskStatus.WAITING,
+        TaskStatus.QUEUED,
+        TaskStatus.RUNNING,
+        TaskStatus.DONE,
+    ):
+        assert task.transition_to(status) is True, f"{status} 应当是合法迁移"
+
+    assert task.illegal_transition_count == 0
+
+
+def test_illegal_transition_is_recorded_but_still_applied():
+    """非法迁移**仍然执行**，但会被记账、被日志看见。
+
+    刻意不拒绝：运行时最怕的是「状态卡住」——严格拒绝会让任务永远停在 running，
+    比一次不该发生的迁移更难排查。要的是「能被发现」，不是「静默失败」。
+    """
+    task = Task(instruction="x")
+    task.mark(TaskStatus.DONE)
+
+    ok = task.transition_to(TaskStatus.RUNNING, source="test_suite")
+
+    assert ok is False, "终态不可逆"
+    assert task.illegal_transition_count == 1
+    assert task.status is TaskStatus.RUNNING, "但仍然生效"
+
+
+def test_paused_reason_cleared_when_leaving_paused():
+    from models.task import PAUSED_BY_USER
+
+    task = Task(instruction="x")
+    task.mark(TaskStatus.PAUSED, paused_reason=PAUSED_BY_USER)
+    assert task.paused_reason == PAUSED_BY_USER
+
+    task.mark(TaskStatus.QUEUED)
+    assert task.paused_reason is None, "「上次为什么暂停」不该带到下一次运行"
+
+
+def test_every_status_has_a_transition_entry():
+    """表要覆盖全部状态，漏一个就会让那个状态变成「随便怎么转都非法」。"""
+    from models.task import ALLOWED_TRANSITIONS
+
+    assert set(ALLOWED_TRANSITIONS) == set(TaskStatus)
+    for status in (
+        TaskStatus.DONE,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+    ):
+        assert ALLOWED_TRANSITIONS[status] == frozenset({status}), "终态不可逆"

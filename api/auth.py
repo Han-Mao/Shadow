@@ -26,6 +26,7 @@ import hmac
 import logging
 import os
 import secrets
+import time
 from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
@@ -46,11 +47,39 @@ class Principal:
     devices: frozenset[str] = field(default_factory=frozenset)
     """允许操作的设备 serial；空集合表示不限。"""
 
+    def allowed_serials(self) -> frozenset[str] | None:
+        """该令牌可用的设备集合；None 表示不限。
+
+        传给调度器用（V2.2 §二）：**未指定设备时只能从这里挑**。
+        以前 API 只检查「指定的 serial 在不在列表里」，于是不指定就等于绕过——
+        调度器会自动挑一台最闲的，很可能就是别人的设备。
+        """
+        return None if not self.devices else frozenset(self.devices)
+
     def may_use_device(self, serial: str | None) -> bool:
-        """设备级权限检查。未指定 serial 时不做限制（由调度器去挑设备）。"""
-        if not self.devices or not serial:
+        """能不能操作这台设备。
+
+        注意 `serial=None` 在**受限令牌**下返回 False：`None` 不等于「哪台都行」，
+        而是「还不知道会是哪台」。真正的「哪台都行」判断要交给调度器在
+        允许列表内挑（见 `allowed_serials`）。
+        """
+        if not self.devices:
             return True
-        return serial in self.devices
+        return bool(serial) and serial in self.devices
+
+    def may_access_task(self, task) -> bool:
+        """能不能读/控制这条任务的**具体对象**（V2.2 §四）。
+
+        审核原话：现在的授权是「谁能发起操作」，而不是「谁能读取/控制哪个 Task」。
+        读取侧同样要过对象级检查——`GET /tasks/{id}` 还会带出待确认动作的令牌，
+        读到了就等于拿到了放行危险动作的凭据。
+
+        未绑定设备的任务在受限令牌下一律拒绝：它迟早会被派到某台设备上，
+        而「派到哪台」此刻并不确定，不能默认它落在自己名下。
+        """
+        if not self.devices:
+            return True
+        return self.may_use_device(getattr(task, "device_serial", None))
 
     def to_dict(self) -> dict:
         return {
@@ -155,6 +184,10 @@ def bare_bind_refused(host: str) -> str | None:
 
 # ---------------------------------------------------------------- 人工确认令牌
 
+# 确认令牌的有效期（秒）。审核指出：没有过期时间的话它不是「一次性审批票据」，
+# 而是「能力票据」——拿到就一直有效。给一个短时限，够人看清内容再点就行。
+CONFIRM_TTL_SECONDS = float(os.getenv("SHADOW_CONFIRM_TTL_SECONDS", "300"))
+
 
 def confirmation_secret() -> bytes:
     """签名密钥：优先用配置的令牌派生，否则用进程级随机串。"""
@@ -165,25 +198,76 @@ def confirmation_secret() -> bytes:
     return hashlib.sha256(f"shadow-confirm:{material}".encode()).digest()
 
 
-def confirmation_payload(task_id: str, action_fingerprint: str, task_version: int) -> str:
+def confirmation_payload(
+    principal: str,
+    task_id: str,
+    action_fingerprint: str,
+    task_version: int,
+    expires_at: int,
+) -> str:
     """确认令牌绑定的内容。
 
-    绑定 task_id **和那个具体动作**：同一个任务换了另一个危险动作，
-    旧令牌就失效——否则「确认过一次」等于把这个任务的所有危险动作都放行了。
+    绑的四样东西各有理由（V2.2 §五）：
+    - `task_id` + 动作指纹：同一个任务换了另一个危险动作，旧令牌就失效——
+      否则「确认过一次」等于把这个任务的所有危险动作都放行了
+    - `task_version`：任务目标被改写（SUPER_TASK）后旧令牌即失效
+    - `principal`：**审核新指出的缺口**。不绑人的话，令牌是「谁拿到谁能用」——
+      A 读一次任务拿到令牌，B 只要有普通写权限就能放行危险动作
+    - `expires_at`：短时效，避免变成长期有效的能力票据
     """
-    return f"{task_id}|{action_fingerprint}|{task_version}"
+    return f"{principal}|{task_id}|{action_fingerprint}|{task_version}|{expires_at}"
 
 
-def issue_confirmation_token(task_id: str, action_fingerprint: str, task_version: int) -> str:
-    """为一次待确认的危险动作签发令牌。"""
-    payload = confirmation_payload(task_id, action_fingerprint, task_version)
-    return hmac.new(confirmation_secret(), payload.encode(), hashlib.sha256).hexdigest()[:32]
+def issue_confirmation_token(
+    principal: str,
+    task_id: str,
+    action_fingerprint: str,
+    task_version: int,
+    *,
+    ttl: float | None = None,
+    now: float | None = None,
+) -> str:
+    """为一次待确认的危险动作签发令牌，格式 `<过期时间戳>.<签名>`。"""
+    issued = time.time() if now is None else now
+    expires_at = int(issued + (CONFIRM_TTL_SECONDS if ttl is None else ttl))
+    payload = confirmation_payload(principal, task_id, action_fingerprint, task_version, expires_at)
+    signature = hmac.new(confirmation_secret(), payload.encode(), hashlib.sha256).hexdigest()[:32]
+    return f"{expires_at}.{signature}"
 
 
 def verify_confirmation_token(
-    token: str | None, task_id: str, action_fingerprint: str, task_version: int
-) -> bool:
+    token: str | None,
+    principal: str,
+    task_id: str,
+    action_fingerprint: str,
+    task_version: int,
+    *,
+    now: float | None = None,
+) -> tuple[bool, str]:
+    """校验确认令牌，返回 (是否通过, 不通过的原因)。
+
+    返回原因是为了进审计日志——「令牌为什么被拒」是排查权限问题的第一手信息。
+    """
     if not token:
-        return False
-    expected = issue_confirmation_token(task_id, action_fingerprint, task_version)
-    return hmac.compare_digest(expected, str(token).strip())
+        return False, "缺少确认令牌"
+
+    raw = str(token).strip()
+    expires_text, _, signature = raw.partition(".")
+    if not expires_text or not signature:
+        return False, "确认令牌格式非法"
+    try:
+        expires_at = int(expires_text)
+    except ValueError:
+        return False, "确认令牌格式非法"
+
+    current = time.time() if now is None else now
+    if current > expires_at:
+        return False, f"确认令牌已过期（{expires_at}）"
+
+    expected = issue_confirmation_token(
+        principal, task_id, action_fingerprint, task_version, now=expires_at - CONFIRM_TTL_SECONDS
+    )
+    if not hmac.compare_digest(expected, raw):
+        # 指纹/版本/身份对不上都会走到这里，只回一句笼统原因，不泄露是哪一项不匹配
+        return False, "确认令牌与当前待确认事项或调用方身份不匹配"
+    return True, ""

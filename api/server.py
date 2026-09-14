@@ -20,13 +20,13 @@ from agent import executor, observer, replay as replay_mod, verifier
 from agent.classifier import TaskClassifier
 from agent.risk_gate import ActionRiskGate, RiskContext
 from agent.runtime import AgentRuntime
-from agent.scheduler import TaskScheduler
+from agent.scheduler import DeviceNotAllowedError, TaskScheduler
 from agent.task_manager import TaskManager
 from device import screenshot as shots
 from device.adb import AdbController, AdbError
 from device.emulator import resolve_serial, resolve_serials
 from device.input import build_default_input
-from device.pool import DevicePool
+from device.pool import DevicePool, UnknownDeviceError, storage_hint
 from device.session import DeviceSession
 from models.action import Action, ActionRisk, ActionType, Point
 from models.budget import TaskBudget
@@ -82,13 +82,16 @@ runtime = AgentRuntime(
 scheduler = TaskScheduler(
     runtime, device_pool, task_store=task_store, event_log=event_log
 )
-input_provider = build_default_input(adb)
 
 # 没有 API Key 时不接 LLM 判定，Classifier 自动退化为「规则 + 相似度」两层
 classifier = TaskClassifier(
     llm_judge=classify_relation if os.getenv("VLM_API_KEY") else None
 )
-manager = TaskManager(store=task_store, scheduler=scheduler, classifier=classifier)
+# runtime 要交给 TaskManager（V2.2 §三/§九）：人工确认这条路径的状态写入
+# 收口在 TaskManager 内部，API 不再自己调 runtime.confirm + task.mark(FAILED)。
+manager = TaskManager(
+    store=task_store, scheduler=scheduler, classifier=classifier, runtime=runtime
+)
 
 
 @asynccontextmanager
@@ -159,6 +162,89 @@ def current_principal(request: Request) -> auth.Principal:
     return getattr(request.state, "principal", auth.ANONYMOUS)
 
 
+# ---- 对象级授权（V2.2 §一 / §三 / §四）----
+#
+# 审核的核心判断：现在的授权是「谁能发起操作」，而不是「谁能读取/控制哪个 Task」。
+# 三个后果，都真实存在过：
+#   1. `/inject` 先调 manager.inject() 改完任务、再检查设备 → Authorization after side effect
+#   2. 不指定 device_serial 就能绕过设备限制（调度器自动挑，可能挑到别人的设备）
+#   3. GET /tasks/{id} 不查设备 → 受限令牌能读到别人任务的**放行令牌**
+#
+# 所以这里只有一个入口：先解析对象、再判权限、最后才动它。
+
+
+def _audit_denied(request: Request, principal: auth.Principal, note: str, detail: str) -> HTTPException:
+    if _AUDIT:
+        audit_log.record(
+            method=request.method,
+            path=request.url.path,
+            principal=principal.name,
+            status=403,
+            note=note or detail,
+        )
+    return HTTPException(status_code=403, detail=detail)
+
+
+def require_task_access(task_id: str, request: Request):
+    """解析任务并做对象级授权；不通过时抛 404/403，通过则返回任务对象。"""
+    principal = current_principal(request)
+    task = manager.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    if not principal.may_access_task(task):
+        raise _audit_denied(
+            request,
+            principal,
+            "object-level task access denied",
+            f"该令牌无权访问任务 {task_id}（任务在设备 {task.device_serial or '未绑定'}；"
+            f"允许的设备：{sorted(principal.devices)}）",
+        )
+    return task
+
+
+def allowed_devices_for(request: Request) -> frozenset[str] | None:
+    """当前调用方的设备授权范围（None = 不限）。要传给调度器，而不是只用来判断。"""
+    return current_principal(request).allowed_serials()
+
+
+def require_device_access(serial: str | None, request: Request) -> None:
+    """设备级授权：指定了设备就必须在允许列表里。"""
+    principal = current_principal(request)
+    if not principal.may_use_device(serial):
+        raise _audit_denied(
+            request,
+            principal,
+            "device access denied",
+            f"该令牌无权使用设备 {serial}（允许的设备：{sorted(principal.devices)}）",
+        )
+
+
+def resolve_manual_device(serial: str | None, request: Request):
+    """单步调试端点选设备：指定就按指定，不指定就取**被允许的**第一台。
+
+    V2.2 §八：底层早就是多设备（DevicePool / 多车道），但 `/tap` `/observe` 这些
+    仍然写死全局 `adb`，形成「Runtime 多设备 ✅ / Manual API 单设备 ❌」的割裂。
+    """
+    principal = current_principal(request)
+    allowed = principal.allowed_serials()
+    if serial:
+        require_device_access(serial, request)
+        try:
+            return device_pool.require(serial)
+        except UnknownDeviceError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    candidates = [s for s in device_pool.serials if allowed is None or s in allowed]
+    if not candidates:
+        raise _audit_denied(
+            request,
+            principal,
+            "no allowed device",
+            f"没有可用的授权设备（池中：{device_pool.serials}；允许：{sorted(principal.devices)}）",
+        )
+    return device_pool.require(candidates[0])
+
+
 @contextmanager
 def device_access(timeout: float = 0.0):
     """单步调试端点临时占用设备。
@@ -180,10 +266,13 @@ def device_access(timeout: float = 0.0):
 class TapRequest(BaseModel):
     x: int
     y: int
+    device_serial: str | None = None
+    """目标设备（V2.2 §八）。不填则取当前令牌可用设备中的第一台。"""
 
 
 class TextRequest(BaseModel):
     value: str
+    device_serial: str | None = None
 
 
 class BudgetRequest(BaseModel):
@@ -269,6 +358,7 @@ class ActionRequest(BaseModel):
     type: str
     target: Point | str | None = None
     value: str | None = None
+    device_serial: str | None = None
 
 
 # ---- 异常处理 ----
@@ -299,46 +389,120 @@ async def unhandled_error_handler(request: Request, exc: Exception) -> JSONRespo
 
 
 @app.get("/devices")
-def devices():
-    return {"serial": adb.serial, "state": adb.state()}
+def devices(request: Request):
+    """列出**当前令牌可用**的设备（V2.2 §八）。
+
+    以前只回一台全局 `adb`，多设备下等于看不见另一半设备；
+    而且没有任何授权过滤，受限令牌也能看到全部。
+    """
+    principal = current_principal(request)
+    allowed = principal.allowed_serials()
+    items = []
+    for serial in device_pool.serials:
+        if allowed is not None and serial not in allowed:
+            continue
+        session_item = device_pool.require(serial)
+        items.append({"serial": serial, **session_item.snapshot(), "state": session_item.controller.state()})
+    return {"count": len(items), "devices": items, "primary": adb.serial}
+
+
+def _artifact_dir_for(session_item) -> Path:
+    """产物按设备分目录（V2.2 §七）：多设备共用一个目录会互相覆盖、串证据。"""
+    return storage_hint(ARTIFACT_DIR, session_item.serial)
+
+
+@contextmanager
+def device_access(session_item, *, timeout: float = 0.0):
+    """单步调试端点临时占用设备。
+
+    只给会**改变设备状态**的操作加锁：只读端点（/devices、/screenshot、/observe）
+    不加锁，否则任务一跑起来连设备信息都查不到。
+    """
+    if not session_item.acquire(_MANUAL_OWNER, timeout=timeout):
+        raise HTTPException(
+            status_code=409, detail=f"设备忙：{session_item.owner or '未知任务'} 正在执行"
+        )
+    try:
+        yield session_item.controller
+    finally:
+        session_item.release(_MANUAL_OWNER)
 
 
 @app.post("/tap")
-def tap(req: TapRequest):
-    with device_access() as device:
+def tap(req: TapRequest, request: Request, device_serial: str | None = None):
+    session_item = resolve_manual_device(req.device_serial or device_serial, request)
+    with device_access(session_item) as device:
         device.tap(req.x, req.y)
-    return {"ok": True}
+    return {"ok": True, "device": session_item.serial, "generation": session_item.generation}
 
 
 @app.post("/text")
-def text(req: TextRequest):
+def text(req: TextRequest, request: Request, device_serial: str | None = None):
+    session_item = resolve_manual_device(req.device_serial or device_serial, request)
     # 中文走 ADB Keyboard 广播，ASCII 走 input text —— 调用方不需要知道区别
-    with device_access():
-        input_provider.input(req.value)
-    return {"ok": True, "provider": input_provider.name}
+    provider = build_default_input(session_item.controller)
+    with device_access(session_item):
+        provider.input(req.value)
+    return {
+        "ok": True,
+        "provider": provider.name,
+        "device": session_item.serial,
+        "generation": session_item.generation,
+    }
 
 
 @app.post("/back")
-def back():
-    with device_access() as device:
+def back(request: Request, device_serial: str | None = None):
+    session_item = resolve_manual_device(device_serial, request)
+    with device_access(session_item) as device:
         device.back()
-    return {"ok": True}
+    return {"ok": True, "device": session_item.serial, "generation": session_item.generation}
 
 
 @app.post("/screenshot")
-def screenshot():
-    path = shots.capture(adb, ARTIFACT_DIR, name="latest.png")
-    return {"path": str(path)}
+def screenshot(request: Request, device_serial: str | None = None):
+    """只读端点：不加设备锁，但会明确告诉你这次截图是不是稳定态（V2.2 §九）。"""
+    session_item = resolve_manual_device(device_serial, request)
+    before = session_item.generation
+    path = shots.capture(
+        session_item.controller,
+        _artifact_dir_for(session_item),
+        name=f"latest_{session_item.serial}.png",
+    )
+    after = session_item.generation
+    return {
+        "path": str(path),
+        "device": session_item.serial,
+        "generation": after,
+        # 截图前后代次不同 = 中途有动作发生，这一张可能落在动画/过渡帧上
+        "stable": before == after,
+    }
 
 
 @app.post("/observe")
-def observe():
-    obs = observer.observe(adb, ARTIFACT_DIR, step=0)
-    return obs.model_dump(exclude={"ui_tree"})
+def observe(request: Request, device_serial: str | None = None):
+    """只读端点，返回带代次的整屏观察。
+
+    `stable=false` 表示这次观察跨越了一次设备写入——消费者**不能**把它
+    当成「当前稳定页面」，否则很容易把过渡动画页当成真实状态（V2.2 §九）。
+    """
+    session_item = resolve_manual_device(device_serial, request)
+    before = session_item.generation
+    obs = observer.observe(session_item.controller, _artifact_dir_for(session_item), step=0)
+    after = session_item.generation
+    payload = obs.model_dump(exclude={"ui_tree"})
+    payload.update(
+        {
+            "device": session_item.serial,
+            "generation": after,
+            "stable": before == after,
+        }
+    )
+    return payload
 
 
 @app.post("/actions")
-def execute_action(req: ActionRequest, request: Request):
+def execute_action(req: ActionRequest, request: Request, device_serial: str | None = None):
     try:
         action_type = ActionType(req.type)
     except ValueError:
@@ -348,7 +512,11 @@ def execute_action(req: ActionRequest, request: Request):
     except ValidationError as exc:
         raise HTTPException(status_code=400, detail=f"Action 参数非法: {exc}") from exc
 
-    with device_access() as device:
+    session_item = resolve_manual_device(req.device_serial or device_serial, request)
+    controller = session_item.controller
+    artifact_dir = _artifact_dir_for(session_item)
+
+    with device_access(session_item) as device:
         # 统一风险门禁：危险动作不能绕过 HITL 直接执行（V2.1 §十）。
         # 之前这里在 execute 之后才回传 risk，等于外部调用能静默执行危险动作。
         #
@@ -366,7 +534,7 @@ def execute_action(req: ActionRequest, request: Request):
                 ),
             )
 
-        pre = observer.observe(adb, ARTIFACT_DIR, step=0)
+        pre = observer.observe(controller, artifact_dir, step=0)
         assessment = ActionRiskGate.assess(
             action, context=RiskContext.from_observation(pre, instruction="__action__")
         )
@@ -376,7 +544,11 @@ def execute_action(req: ActionRequest, request: Request):
                 detail=f"危险动作需经人工确认（目标元素风险复核）：{assessment.describe()}",
             )
         result = executor.execute(device, action, pre.ui_tree)
-        post = observer.observe(adb, ARTIFACT_DIR, step=0, suffix="post") if result.get("ok") else pre
+        post = (
+            observer.observe(controller, artifact_dir, step=0, suffix="post")
+            if result.get("ok")
+            else pre
+        )
         post.action = action
         post.result = result
         verdict = verifier.verify_action("__action__", pre, action, post, result)
@@ -387,6 +559,8 @@ def execute_action(req: ActionRequest, request: Request):
     payload["verification"] = verdict.model_dump()
     payload["risk"] = assessment.effective.value
     payload["risk_detail"] = assessment.describe()
+    payload["device"] = session_item.serial
+    payload["generation"] = session_item.generation
     return payload
 
 
@@ -412,18 +586,23 @@ def _wait_for(task_id: str, timeout: float) -> dict:
 @app.post("/tasks")
 def create_task(req: TaskRequest, request: Request):
     principal = current_principal(request)
-    if not principal.may_use_device(req.device_serial):
-        raise HTTPException(
-            status_code=403,
-            detail=f"该令牌无权使用设备 {req.device_serial}（允许：{sorted(principal.devices)}）",
+    allowed = allowed_devices_for(request)
+    if req.device_serial is not None:
+        require_device_access(req.device_serial, request)
+
+    try:
+        task = manager.create(
+            req.instruction,
+            context=req.context,
+            budget=_resolve_budget(req.budget, req.max_steps),
+            priority=req.priority,
+            device_serial=req.device_serial,
+            # 未指定设备时，调度器只能从被允许的设备里挑（V2.2 §二）。
+            # 以前只检查 req.device_serial，不填就等于绕过限制。
+            allowed_devices=allowed,
         )
-    task = manager.create(
-        req.instruction,
-        context=req.context,
-        budget=_resolve_budget(req.budget, req.max_steps),
-        priority=req.priority,
-        device_serial=req.device_serial,
-    )
+    except DeviceNotAllowedError as exc:
+        raise _audit_denied(request, principal, "no allowed device", str(exc)) from exc
     if req.wait:
         payload = _wait_for(task.id, req.wait_timeout)
         payload["mode"] = "sync"
@@ -435,26 +614,34 @@ def create_task(req: TaskRequest, request: Request):
 
 
 @app.get("/tasks")
-def list_tasks():
-    return {"tasks": [t.model_dump(mode="json") for t in manager.list_all()]}
+def list_tasks(request: Request):
+    """列出**当前令牌有权访问**的任务（V2.2 §四）。
+
+    受限令牌不该看到别人设备上的任务——列表本身就是一种信息泄露
+    （任务指令里有用户要干什么）。
+    """
+    principal = current_principal(request)
+    visible = [t for t in manager.list_all() if principal.may_access_task(t)]
+    return {"tasks": [t.model_dump(mode="json") for t in visible], "count": len(visible)}
 
 
 @app.get("/tasks/{task_id}")
-def get_task(task_id: str):
-    task = manager.get(task_id)
-    if task is None:
-        raise HTTPException(status_code=404, detail="任务不存在")
+def get_task(task_id: str, request: Request):
+    task = require_task_access(task_id, request)
+    principal = current_principal(request)
     payload = task.model_dump(mode="json")
     payload["plan_progress"] = task.plan_progress()
     pending = runtime.pending_confirmation(task_id)
     if pending is not None:
         item = pending.model_dump(mode="json")
-        # 确认令牌绑定「任务 + 哪个动作 + 任务版本」（V2.2 §九）：
-        # 换个危险动作或任务被改写后，旧令牌立刻失效
+        # 确认令牌绑定「调用方身份 + 任务 + 哪个动作 + 任务版本 + 有效期」（V2.2 §五）：
+        # 换个动作、任务被改写、换个人来提交、或者过期了，令牌都失效
         item["token"] = auth.issue_confirmation_token(
-            task_id, pending.fingerprint, task.version
+            principal.name, task_id, pending.fingerprint, task.version
         )
+        item["token_expires_in_seconds"] = auth.CONFIRM_TTL_SECONDS
         payload["pending_confirmation"] = item
+    payload["confirmation_kind"] = manager.confirmation_kind(task_id)
     check = runtime.last_goal_check(task_id)
     if check is not None and hasattr(check, "to_dict"):
         payload["goal_verification"] = check.to_dict()
@@ -462,122 +649,158 @@ def get_task(task_id: str):
 
 
 @app.post("/tasks/{task_id}/pause")
-def pause_task(task_id: str):
-    if manager.get(task_id) is None:
-        raise HTTPException(status_code=404, detail="任务不存在")
+def pause_task(task_id: str, request: Request):
+    require_task_access(task_id, request)
     if not manager.pause(task_id):
         raise HTTPException(status_code=409, detail="任务当前无法暂停（可能已结束）")
     return {"ok": True, "task": manager.get(task_id).model_dump(mode="json")}
 
 
 @app.post("/tasks/{task_id}/resume")
-def resume_task(task_id: str):
-    if manager.get(task_id) is None:
-        raise HTTPException(status_code=404, detail="任务不存在")
-    if not manager.resume(task_id):
+def resume_task(task_id: str, request: Request):
+    require_task_access(task_id, request)
+    if not manager.resume(task_id, allowed_devices=allowed_devices_for(request)):
         raise HTTPException(status_code=409, detail="任务当前无法恢复（未处于暂停状态）")
     return {"ok": True, "task": manager.get(task_id).model_dump(mode="json")}
 
 
 @app.post("/tasks/{task_id}/cancel")
-def cancel_task(task_id: str):
-    if manager.get(task_id) is None:
-        raise HTTPException(status_code=404, detail="任务不存在")
+def cancel_task(task_id: str, request: Request):
+    """取消任务。**这才是「结束这条任务」的唯一入口**（V2.2 §三）。
+
+    否决一次危险动作、或者否决一次完成申请，都不该让任务结束——
+    那只是「这个做法不行」或「还没做完」。
+    """
+    require_task_access(task_id, request)
     if not manager.cancel(task_id):
         raise HTTPException(status_code=409, detail="任务当前无法取消（可能已结束）")
     return {"ok": True, "task": manager.get(task_id).model_dump(mode="json")}
 
 
 @app.post("/tasks/{task_id}/confirm")
-def confirm_task(task_id: str, req: ConfirmRequest):
-    """危险动作的人工确认（HITL）。批准后该动作放行一次。
+def confirm_task(task_id: str, req: ConfirmRequest, request: Request):
+    """人工处理一次待确认事项（危险动作 / 完成裁定）。
 
-    两种语义要分开（V2.2 §四）：
-    - **危险动作**：批准 = 放行该动作；否决 = 放弃该动作（进黑名单，换策略）
-    - **完成裁定**：批准 = 认定任务完成；否决 = 任务还没完，继续做
+    两种语义不同，但**落点一致：都重新入队继续做**（V2.2 §三）
+    - **危险动作**：批准 = 放行该动作；否决 = 这个动作不要了，换策略继续
+    - **完成裁定**：批准 = 认定任务完成；否决 = 还没做完，继续做
 
-    启用鉴权时还必须带上 `token`（见 `GET /tasks/{id}`）。
+    只有 `POST /tasks/{id}/cancel` 才会结束任务。以前这里否决就直接
+    `task.mark(FAILED)`，与 Runtime「拒绝后换策略」的设计相反——
+    那不是权限问题，是两个模块的状态机在打架。
+
+    启用鉴权时还必须带上 `token`，它绑定调用方身份与有效期（V2.2 §五）。
     """
-    task = manager.get(task_id)
-    if task is None:
-        raise HTTPException(status_code=404, detail="任务不存在")
+    task = require_task_access(task_id, request)
+    principal = current_principal(request)
+    kind = manager.confirmation_kind(task_id)
 
-    goal_decision = runtime.is_goal_decision(task_id)
-    pending = runtime.pending_confirmation(task_id)
-    if pending is None and not goal_decision:
+    if kind == "none":
         raise HTTPException(status_code=409, detail="该任务当前没有待确认的动作或完成裁定")
 
     if auth.enabled():
+        pending = runtime.pending_confirmation(task_id)
         fingerprint = pending.fingerprint if pending is not None else "goal"
-        if not auth.verify_confirmation_token(req.token, task_id, fingerprint, task.version):
-            audit_log.record(
-                method="POST",
-                path=f"/tasks/{task_id}/confirm",
-                principal="anonymous",
-                status=403,
-                note="confirmation token missing or invalid",
-            )
+        ok, reason = auth.verify_confirmation_token(
+            req.token, principal.name, task_id, fingerprint, task.version
+        )
+        if not ok:
+            if _AUDIT:
+                audit_log.record(
+                    method="POST",
+                    path=request.url.path,
+                    principal=principal.name,
+                    status=403,
+                    note=f"confirmation denied: {reason}",
+                )
             raise HTTPException(
                 status_code=403,
-                detail="缺少或错误的确认令牌：请从 GET /tasks/{id} 的 "
-                "pending_confirmation.token 取值后再提交",
+                detail=(
+                    f"确认未通过（{reason}）：请从 GET /tasks/{{id}} 的 "
+                    "pending_confirmation.token 取值后再提交"
+                ),
             )
 
-    runtime.confirm(task_id, req.approved)
-    task = manager.get(task_id)
-    if req.approved or goal_decision:
-        # 批准：重新入队（危险动作放行一次 / 完成认定生效）
-        # 否决「完成裁定」：`runtime.confirm` 已经塞好 Re-plan 理由，重新入队继续做——
-        # 把任务判死是错的，人说的是「还没做完」，不是「别做了」
-        scheduler.submit(task, allow_preempt=False)
-    else:
-        task.mark(TaskStatus.FAILED)
-        task_store.save(task)
+    # 状态写入全部收口到 TaskManager（V2.2 §九 / §十）：API 不再自己 task.mark(...)
+    resolved = manager.resolve_confirmation(task_id, approved=req.approved)
+    if resolved is None:
+        raise HTTPException(status_code=409, detail="该任务当前没有可处理的待确认事项")
+    return {
+        "ok": True,
+        "approved": req.approved,
+        "kind": kind,
+        "task": manager.get(task_id).model_dump(mode="json"),
+    }
     return {"ok": True, "approved": req.approved, "task": manager.get(task_id).model_dump(mode="json")}
 
 
 @app.post("/tasks/{task_id}/inject")
 def inject_task(task_id: str, req: InjectRequest, request: Request):
-    """执行过程中注入新指令：由任务关系决定并入、排队还是抢占（V2 §二十一）。"""
-    if manager.get(task_id) is None:
-        raise HTTPException(status_code=404, detail="任务不存在")
+    """执行过程中注入新指令：由任务关系决定并入、排队还是抢占（V2 §二十一）。
+
+    **授权必须在 `manager.inject()` 之前完成**（V2.2 §一）。
+
+    这不是「位置不优雅」，而是一个真实的授权后置漏洞：
+    `manager.inject()` 会在一次调用里改 instruction / version / plan /
+    checkpoint_id / priority，SUPER_TASK 还会请求抢占。如果先执行它、
+    再检查设备权限并返回 403，**任务已经被改掉了**——
+    Authorization after side effect：调用方拿到了失败响应，副作用却已经发生。
+    """
+    task = require_task_access(task_id, request)
     principal = current_principal(request)
-    result = manager.inject(
-        req.instruction,
-        current_task_id=task_id,
-        priority=req.priority,
-        budget=_resolve_budget(req.budget, req.max_steps),
-        allow_disruptive=req.allow_disruptive,
-    )
+    allowed = allowed_devices_for(request)
+
+    try:
+        result = manager.inject(
+            req.instruction,
+            current_task_id=task.id,
+            priority=req.priority,
+            budget=_resolve_budget(req.budget, req.max_steps),
+            allow_disruptive=req.allow_disruptive,
+            allowed_devices=allowed,
+        )
+    except DeviceNotAllowedError as exc:
+        raise _audit_denied(request, principal, "no allowed device", str(exc)) from exc
     payload = result.model_dump()
-    # 设备级权限：新任务会落到某台设备上，令牌没权限的设备不该被派到
-    task = result.task
-    if task is not None and not principal.may_use_device(task.device_serial):
-        raise HTTPException(
-            status_code=403,
-            detail=f"该令牌无权使用设备 {task.device_serial}（允许：{sorted(principal.devices)}）",
+
+    # 防御性复核：新任务也必须在授权范围内。
+    # 正常情况下提交时就被调度器挡下了（`allowed_devices` 已经生效），
+    # 这里是第二道闸——**但它不是唯一的一道**，判权限的主战场在前面。
+    launched = result.task
+    if launched is not None and not principal.may_access_task(
+        manager.get(launched.id) or launched
+    ):
+        logger.error(
+            "已授权调用 %s 产生了一条越权任务 %s（设备 %s）——调度器的设备限制未生效",
+            principal.name,
+            launched.id,
+            launched.device_serial,
+        )
+        raise _audit_denied(
+            request,
+            principal,
+            "post-inject cross-device escape",
+            "注入结果落在了未授权的设备上，已记录（请检查 allowed_devices 传递链路）",
         )
     return payload
 
 
 @app.get("/tasks/{task_id}/history")
-def task_history(task_id: str, limit: int = 50):
-    if manager.get(task_id) is None:
-        raise HTTPException(status_code=404, detail="任务不存在")
+def task_history(task_id: str, request: Request, limit: int = 50):
+    require_task_access(task_id, request)
     entries = trajectory.history(task_id)
     return {"task_id": task_id, "count": len(entries), "history": [o.model_dump() for o in entries[-limit:]]}
 
 
 @app.get("/tasks/{task_id}/events")
-def task_events(task_id: str, limit: int = 200):
+def task_events(task_id: str, request: Request, limit: int = 200):
     """审计事件流（V2.1 §二十三）。
 
     与 `/history` 的区别：history 是给下一步决策看的观察轨迹（会被裁剪），
     events 是给事后追溯看的只追加事件流（抢占、对账、失败原因都在里面），
     也是未来做 Replay 的数据源。
     """
-    if manager.get(task_id) is None:
-        raise HTTPException(status_code=404, detail="任务不存在")
+    require_task_access(task_id, request)
     events = event_log.read(task_id, limit=limit)
     return {
         "task_id": task_id,
@@ -587,7 +810,7 @@ def task_events(task_id: str, limit: int = 200):
 
 
 @app.get("/tasks/{task_id}/replay")
-def task_replay(task_id: str, format: str = "json", limit: int = 1000):
+def task_replay(task_id: str, request: Request, format: str = "json", limit: int = 1000):
     """任务回放（V2.1 §二十三）。
 
     `format=json` 返回时间轴 + 动作计划（给程序用）；
@@ -597,8 +820,7 @@ def task_replay(task_id: str, format: str = "json", limit: int = 1000):
     只读，不重放动作。要真重放请用 `agent.replay.replay()`，
     它默认 dry-run，且危险动作必须显式放行。
     """
-    if manager.get(task_id) is None:
-        raise HTTPException(status_code=404, detail="任务不存在")
+    require_task_access(task_id, request)
 
     timeline = replay_mod.load_timeline(event_log, task_id, limit=limit)
     if format == "markdown":
@@ -607,9 +829,8 @@ def task_replay(task_id: str, format: str = "json", limit: int = 1000):
 
 
 @app.get("/tasks/{task_id}/checkpoint")
-def task_checkpoint(task_id: str):
-    if manager.get(task_id) is None:
-        raise HTTPException(status_code=404, detail="任务不存在")
+def task_checkpoint(task_id: str, request: Request):
+    require_task_access(task_id, request)
     checkpoint = checkpoint_store.latest_for_task(task_id)
     if checkpoint is None:
         raise HTTPException(status_code=404, detail="该任务还没有 Checkpoint")
@@ -617,9 +838,8 @@ def task_checkpoint(task_id: str):
 
 
 @app.get("/tasks/{task_id}/shots/{n}")
-def get_shot(task_id: str, n: int):
-    if manager.get(task_id) is None:
-        raise HTTPException(status_code=404, detail="任务不存在")
+def get_shot(task_id: str, request: Request, n: int):
+    require_task_access(task_id, request)
     observations = trajectory.observations_at(task_id, n)
     if not observations:
         raise HTTPException(status_code=404, detail="该步骤截图不存在")
@@ -630,8 +850,24 @@ def get_shot(task_id: str, n: int):
 
 
 @app.get("/scheduler")
-def scheduler_state():
-    return scheduler.snapshot()
+def scheduler_state(request: Request):
+    """调度器状态。受限令牌只看得到自己那几台设备（V2.2 §四）。
+
+    这条接口会把每台设备的 owner、队列、可抢占目标都列出来——
+    对受限令牌来说，别人的任务 id 与设备占用都是不该看到的信息。
+    """
+    principal = current_principal(request)
+    allowed = principal.allowed_serials()
+    snapshot = scheduler.snapshot()
+    if allowed is None:
+        return snapshot
+
+    devices = {s: v for s, v in snapshot.get("devices", {}).items() if s in allowed}
+    visible_running = {s: v for s, v in snapshot.get("running_tasks", {}).items() if s in allowed}
+    snapshot["devices"] = devices
+    snapshot["running_tasks"] = visible_running
+    snapshot["scoped_to"] = sorted(allowed)
+    return snapshot
 
 
 @app.get("/health")
