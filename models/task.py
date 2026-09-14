@@ -58,6 +58,12 @@ ACTIVE_STATUSES = frozenset(
     }
 )
 
+# 「数据损坏」不是任务状态，所以**不**放进 TaskStatus（V2.4 §十）：
+# 任务记录已经反序列化不出来了，根本构造不出 Task 对象，谈不上它「处于哪个状态」。
+# 这个常量只用于 API 呈现——GET /tasks/{id} 对已隔离的任务回 status=recovery_error
+# 而不是 404：「不存在」与「数据坏了」是两种完全不同的故障，处置方式也不同。
+RECOVERY_ERROR = "recovery_error"
+
 # 暂停原因。进程重启后只有「用户显式暂停」该继续保持暂停；
 # 「被抢占挂起」是调度器临时让位，重启后必须自动恢复，否则任务就被永久搁置了。
 PAUSED_BY_USER = "user"

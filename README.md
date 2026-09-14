@@ -85,7 +85,7 @@ VLM 决定「下一步点哪里」，调度与检查点决定「多件事怎么�
 ├── scripts/
 │   ├── demo_preemption.py  # 抢占恢复演示（离线可跑）
 │   └── replay_task.py      # 命令行回放一个任务的事件流
-└── tests/                  # 404 个离线用例
+└── tests/                  # 412 个离线用例
 ```
 
 ## 职责边界
@@ -402,7 +402,7 @@ Scheduler
 等原设备回来（V2.3 起），改派等于把任务上下文悄悄丢到另一台手机上。
 
 单设备时只有一条车道，与旧实现逐字等价——这一点由当时的 257 个既有测试守着
-（V2.4 修复轮之后合计 404 个）。
+（V2.4 修复轮之后合计 412 个）。
 
 ### 多设备暴露出的两个正确性问题
 
@@ -585,6 +585,8 @@ CREATED → QUEUED → RUNNING ─┬→ DONE / FAILED / CANCELLED   （终态�
 |---|---|
 | `stable_meaning`（新增响应字段） | `/observe`、`/screenshot` 新增，说明 `stable` 的语义，向后兼容 |
 | `/confirm` 令牌格式 | 由 `<expires>.<sig>` 变为 `<expires>.<jti>.<sig>`；**旧格式令牌立即失效**（TTL 最长 300 秒，重新读取待确认事项即可） |
+| `GET /tasks/{id}` 对损坏任务的响应 | 数据已隔离的任务不再返回 404，改为 200 + `status=recovery_error`（附 `quarantined_as` / `recoverable`）。**「不存在」仍然是 404**——两种故障语义被分开 |
+| `GET /tasks` 新增 `corrupt` 字段 | 列出已隔离（损坏）的任务 id，避免它们从系统里静默消失 |
 
 ## 快速开始
 
@@ -702,13 +704,14 @@ pip install -r requirements.txt
 python -m pytest -q
 ```
 
-**404 个用例，全部离线**：不需要 adb、模拟器或 API Key。
+**412 个用例，全部离线**：不需要 adb、模拟器或 API Key。
 
 | 文件 | 覆盖 |
 |---|---|
 | `test_models.py` | 任务状态机、**故障/恢复态（DEGRADED / DEVICE_UNAVAILABLE）回归**、步骤依赖、动作风险（策略下限）/指纹、Checkpoint、预算、版本号、**尝试历史** |
 | `test_device.py` | ADB 封装、输入通道（含中文）、设备会话所有权与并发、**命令超时分级与总预算**、**多设备 serial 解析** |
 | `test_device_pool.py` | **DevicePool**：注册/查找、未知设备报错、空闲筛选、产物按设备分目录 |
+| `test_task_store.py` | **损坏任务**：隔离到 `quarantine/`、`corrupt_ids` 记账、`TASK_CORRUPTED` 留痕、结构漂移同样算损坏 |
 | `test_trajectory_store.py` | **轨迹落盘**：重启可读、ui_tree 不落盘、窗口裁剪、紧凑化、坏行容错 |
 | `test_vision.py` | UI 树容错、坐标落点、VLM 重试、prompt 构造、**严格验证枚举**、**风险建议与完成声明解析** |
 | `test_evidence.py` | **多级证据**：结构指纹、导航变化、目标元素状态、树坏掉时判「不可比」 |
@@ -721,7 +724,7 @@ python -m pytest -q
 | `test_scheduler.py` | 优先级、暂停/取消、**抢占与恢复**、组合式中断、**启动恢复**（含审批前重启）、**抢占延迟观测**、设备占用、**多设备并行/绑定/改派**、**revision CAS**、**worker 失败分流（DEGRADED / DEVICE_UNAVAILABLE）** |
 | `test_multi_device_e2e.py` | **双设备跨设备干扰**、逐设备 running 视图、**SUBTASK 注入 + 崩溃恢复**（含 `plan_version`）、恢复后跑完、**并发改写不碰已结束的任务** |
 | `test_runtime.py` | 闭环执行、异常收敛、死循环、HITL、Checkpoint 恢复、**三预算门控**、**动作对账**、**效果未知在线对账**、**完成申请驳回/转人工**、**风险门禁接入闭环**、事件自足性、按绑定设备取会话、**启动期持久化失败降级** |
-| `test_api.py` | HTTP 契约、状态码语义、错误脱敏、危险动作拦截、SUPER_TASK 改写与二次确认、依赖链迁移、版本门控、`/events`、`/replay`、**预算入参** |
+| `test_api.py` | HTTP 契约、状态码语义、错误脱敏、危险动作拦截、SUPER_TASK 改写与二次确认、依赖链迁移、版本门控、`/events`、`/replay`、**预算入参**、**损坏任务的 `recovery_error` 表达** |
 | `test_api_auth.py` | **鉴权/只读/设备范围/确认令牌/请求审计**、`/health` 公开、**非回环裸绑定拒绝启动**、**确认令牌一次性消费** |
 | `test_goal_policy.py` | **任务画像 → 验证严格度**：导航/副作用/纯查询/未知分类与优先级（副作用 > 导航）、默认按画像分层、显式 `GOAL_VERIFY_MODE` 覆盖、同类情形按任务类型给出不同裁定 |
 | `test_api_authz.py` | **授权边界**：设备范围裁剪（读 / inject / devices / 调度快照）、越界设备 403 而非 500、确认令牌绑定操作者、否决危险动作不杀任务 |

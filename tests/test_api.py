@@ -12,7 +12,7 @@ from device.session import DeviceSession
 from fakes import FakeDevice
 from models.action import Action, ActionType, Decision
 from models.state import Observation
-from models.task import PAUSED_BY_PREEMPTION, PAUSED_BY_USER, Task, TaskStatus
+from models.task import PAUSED_BY_PREEMPTION, PAUSED_BY_USER, RECOVERY_ERROR, Task, TaskStatus
 from models.task_relation import TaskRelation, TaskRelationResult
 from models.task_step import StepStatus
 from storage import CheckpointStore, EventLog, TaskStore, TrajectoryStore
@@ -826,73 +826,49 @@ def test_scheduler_snapshot_exposes_per_device_running_tasks(api):
     assert "devices" in snapshot
 
 
-# ---------------------------------------------------------------- V2.2 §五：预算语义统一
+# ---------------------------------------------------------------- V2.4 §十：损坏 ≠ 不存在
 
 
-def test_task_budget_can_be_specified_precisely(api):
-    """三种预算要能分别指定。
+def _break_task_file(tmp_path, task_id: str) -> None:
+    (tmp_path / "tasks" / f"{task_id}.json").write_text("{ 坏掉的 json", encoding="utf-8")
 
-    旧的 `max_steps` 只映射到「动作步数」，调用方却以为它管的是整个循环次数——
-    实际拿到的是 10 个动作 + 60 次观察 + 40 次模型调用（V2.2 §五）。
+
+def test_get_task_reports_recovery_error_instead_of_404(api, tmp_path):
+    """V2.4 §十：数据损坏的任务必须与「不存在」区分开。
+
+    404 的语义是「这条 id 没东西」；损坏意味着「它存在过、但读不出来了，需要人工介入」。
+    两者混在一起，运维只能翻日志猜——这正是 V2.3 那轮把损坏文件隔离起来要解决的问题，
+    只在存储层做了、API 层还回 404，等于没端到端打通。
     """
     client, server, *_rest = api
-    manager = _rest[-1]
+    _break_task_file(tmp_path, "t-corrupt")
+    server.task_store.load("t-corrupt")  # 触发隔离与记账
 
-    body = client.post(
-        "/tasks",
-        json={
-            "instruction": "长任务",
-            "budget": {
-                "max_action_steps": 7,
-                "max_observations": 21,
-                "max_model_calls": 14,
-            },
-        },
-    ).json()
+    response = client.get("/tasks/t-corrupt")
 
-    task = manager.get(body["id"])
-    assert task.budget.max_action_steps == 7
-    assert task.budget.max_observations == 21
-    assert task.budget.max_model_calls == 14
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == RECOVERY_ERROR
+    assert payload["recoverable"] is False
+    assert payload["quarantined_as"] == "t-corrupt.corrupt.json"
+    assert "quarantine" in payload["detail"]
 
 
-def test_legacy_max_steps_maps_to_action_budget_only(api):
-    """兼容层：`max_steps` 只约束动作步数，其余取默认值——这一点必须写死。"""
+def test_unknown_task_still_returns_404(api):
+    """没坏、只是不存在时仍然是 404——别把两种语义混起来。"""
+    client, *_rest = api
+
+    assert client.get("/tasks/never-existed").status_code == 404
+
+
+def test_list_tasks_exposes_corrupt_ids(api, tmp_path):
+    """列表要带上损坏 id：否则这条任务就从系统里静默消失了，只看 count 看不出来。"""
     client, server, *_rest = api
-    manager = _rest[-1]
+    _break_task_file(tmp_path, "t-corrupt")
+    server.task_store.load("t-corrupt")
 
-    body = client.post("/tasks", json={"instruction": "老调用方", "max_steps": 5}).json()
+    payload = client.get("/tasks").json()
 
-    task = manager.get(body["id"])
-    assert task.budget.max_action_steps == 5
-    assert task.budget.max_observations == 60, "max_steps 管不到观察预算"
-    assert task.budget.max_model_calls == 40
+    assert payload["corrupt"] == ["t-corrupt"]
 
 
-def test_partial_budget_keeps_defaults_for_the_rest(api):
-    client, server, *_rest = api
-    manager = _rest[-1]
-
-    body = client.post(
-        "/tasks", json={"instruction": "只压模型调用", "budget": {"max_model_calls": 3}}
-    ).json()
-
-    task = manager.get(body["id"])
-    assert task.budget.max_model_calls == 3
-    assert task.budget.max_action_steps == 10, "没写的字段沿用旧默认"
-    assert task.budget.max_observations == 60
-
-
-def test_health_endpoint(api):
-    client, *_ = api
-
-    assert client.get("/health").json()["ok"] is True
-
-
-def test_scheduler_snapshot_exposes_per_device_running_tasks(api):
-    client, *_ = api
-
-    snapshot = client.get("/scheduler").json()
-
-    assert "running_tasks" in snapshot
-    assert "devices" in snapshot

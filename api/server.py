@@ -30,7 +30,7 @@ from device.pool import DevicePool, UnknownDeviceError, storage_hint
 from device.session import DeviceSession
 from models.action import Action, ActionRisk, ActionType, Point
 from models.budget import TaskBudget
-from models.task import TaskPriority, TaskStatus
+from models.task import RECOVERY_ERROR, TaskPriority, TaskStatus
 from storage import CheckpointStore, EventLog, TaskStore, TrajectoryStore
 from storage.audit_log import AuditLog
 from vision.vlm import VlmError, classify_relation
@@ -61,13 +61,16 @@ device_pool = DevicePool(
 )
 # 单步调试端点（/tap、/screenshot、/owned）面向「当前主设备」，仍用第一台
 session = device_pool.first()
-task_store = TaskStore(STORAGE_DIR / "tasks")
+# 审计/重放用的事件日志（V2.1 §二十三）。与轨迹分开：轨迹服务下一步决策（会被裁剪），
+# 事件日志服务事后追溯（只追加）。
+# V2.4 起它还要接一件更早的事——TaskStore 发现损坏任务时在这里留一条 TASK_CORRUPTED，
+# 所以必须先于 task_store 构造。
+event_log = EventLog(STORAGE_DIR / "events")
+# 损坏任务的隔离与留痕都挂在同一个日志上（V2.4 §十）
+task_store = TaskStore(STORAGE_DIR / "tasks", event_log=event_log)
 checkpoint_store = CheckpointStore(STORAGE_DIR / "checkpoints")
 # 轨迹落盘（V2.1）：长跑任务重启后不能「失忆」——恢复点在，但前面几步干了什么也得在
 trajectory = TrajectoryStore(root=STORAGE_DIR / "trajectories")
-# 审计/重放用的事件日志（V2.1 §二十三）。与轨迹分开：轨迹服务下一步决策（会被裁剪），
-# 事件日志服务事后追溯（只追加）
-event_log = EventLog(STORAGE_DIR / "events")
 # 请求审计（V2.2 §九）：回答「谁在什么时候调了什么、被批准还是被拒绝」
 audit_log = AuditLog(AUDIT_DIR)
 
@@ -638,11 +641,31 @@ def list_tasks(request: Request):
     """
     principal = current_principal(request)
     visible = [t for t in manager.list_all() if principal.may_access_task(t)]
-    return {"tasks": [t.model_dump(mode="json") for t in visible], "count": len(visible)}
+    return {
+        "tasks": [t.model_dump(mode="json") for t in visible],
+        "count": len(visible),
+        # V2.4 §十：损坏任务不会出现在 tasks 里（它根本反序列化不出来），但必须让调用方
+        # 知道「有这么一条」，否则它就从系统里静默消失了——只看 count 是看不出来的。
+        "corrupt": sorted(task_store.corrupt_ids()),
+    }
 
 
 @app.get("/tasks/{task_id}")
 def get_task(task_id: str, request: Request):
+    """任务详情。
+
+    V2.4 §十：如果这条任务的数据已经损坏并被隔离，返回 `status=recovery_error`
+    而不是 404——「不存在」和「数据坏了」是完全不同的故障：前者多半是 id 写错，
+    后者需要人工介入。令牌鉴权仍然由中间件负责，不受这里影响。
+    """
+    if task_store.is_corrupt(task_id):
+        return {
+            "id": task_id,
+            "status": RECOVERY_ERROR,
+            "detail": "任务数据损坏，已隔离到任务存储的 quarantine/ 目录，不会被调度器恢复",
+            "quarantined_as": f"{task_id}.corrupt.json",
+            "recoverable": False,
+        }
     task = require_task_access(task_id, request)
     principal = current_principal(request)
     payload = task.model_dump(mode="json")
