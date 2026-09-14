@@ -85,7 +85,7 @@ VLM 决定「下一步点哪里」，调度与检查点决定「多件事怎么�
 ├── scripts/
 │   ├── demo_preemption.py  # 抢占恢复演示（离线可跑）
 │   └── replay_task.py      # 命令行回放一个任务的事件流
-└── tests/                  # 439 个离线用例
+└── tests/                  # 441 个离线用例
 ```
 
 ## 职责边界
@@ -402,7 +402,7 @@ Scheduler
 等原设备回来（V2.3 起），改派等于把任务上下文悄悄丢到另一台手机上。
 
 单设备时只有一条车道，与旧实现逐字等价——这一点由当时的 257 个既有测试守着
-（V2.7 修复轮之后合计 439 个）。
+（V2.7 修复轮之后合计 441 个）。
 
 ### 多设备暴露出的两个正确性问题
 
@@ -801,6 +801,22 @@ runtime.run(): 有恢复点 → 走既有对账（validate + needs_reconciliatio
 `recover()` 对 WAITING 任务的恢复记录改成 `queued(from waiting, confirmation_reset)`——
 让「确认上下文已作废」这件事**可见**，否则排查时会把「确认没了」当成 bug。
 
+### V2.7 补充（三）：错误分类与指纹语义（P2-2 / P2-3）
+
+**P2-2 错误分类改结构化优先。** 以前全靠正则匹配错误文本，而同一个错误在不同层措辞
+不同（`device offline` / `adb: device offline` /「设备已离线」），迟早会漏。现在：
+
+- `models.exceptions` 的每个异常自带 `error_class`（`InvalidTransitionError` / `PersistenceError`
+  → `fatal`，`DeviceUnavailableError` / `ConcurrentModificationError` → `transient`）；
+- executor 收敛异常时把 `classify_exception` 的结果塞进返回的 `error_class` 字段；
+- `verifier` 透传到 `ActionDispatch.error_class`，runtime 分类**先读它**，文本只作兜底。
+
+**P2-3 指纹语义显式化。** 核对后确认指纹**没有**被误用为全局动作身份——它只在本任务的
+运行态里比较（`denied_fingerprints`、`recent_actions` 都挂在按 task_id 隔离的 `RuntimeState`），
+死循环检测用的是带容差的 `is_same_as`。缺的是**说清楚**：`Action.fingerprint` 的 docstring
+现在明确它回答「做的是不是同一个动作」，**不含**「哪一屏、哪一次尝试」——后者由
+`current_attempt_id` 承担，两者分开存，不拿一个字段冒充两种语义。
+
 ### 对审核最后五条不变量的对照
 
 | 不变量 | 现状 |
@@ -932,7 +948,7 @@ pip install -r requirements.txt
 python -m pytest -q
 ```
 
-**439 个用例，全部离线**：不需要 adb、模拟器或 API Key。
+**441 个用例，全部离线**：不需要 adb、模拟器或 API Key。
 
 | 文件 | 覆盖 |
 |---|---|

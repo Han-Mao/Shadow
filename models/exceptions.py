@@ -2,6 +2,12 @@
 
 把「状态机拒绝」「关键持久化失败」「绑定设备不可用」这类会改变任务命运的异常
 集中定义，避免各个模块各自抛裸 RuntimeError。
+
+V2.7 P2-2 起每个异常还自带 `error_class`：错误分类**优先看它**，文本匹配只作兜底。
+同一个错误在不同层可能有完全不同的措辞（`device offline` / `adb: device offline` /
+「设备已离线」），但对异常类型来说它始终是同一个类——按类型分比按文本分可靠得多。
+这里写字符串而不是直接引用 `models.retry.ErrorClass`，是为了避免「底层设施依赖上层
+策略」的反向依赖。
 """
 from __future__ import annotations
 
@@ -9,9 +15,15 @@ from __future__ import annotations
 class ShadowError(RuntimeError):
     """Shadow 内部错误基类。"""
 
+    #: 取值同 `models.retry.ErrorClass`；子类按语义覆盖
+    error_class = "unknown"
+
 
 class InvalidTransitionError(ShadowError):
     """状态机拒绝的迁移，尤其是终态试图复活。"""
+
+    # 状态机都不让迁了，说明调用方写错了——重试没有意义
+    error_class = "fatal"
 
     def __init__(self, task_id: str, from_status: str, to_status: str, source: str = "") -> None:
         self.task_id = task_id
@@ -26,6 +38,9 @@ class InvalidTransitionError(ShadowError):
 class PersistenceError(ShadowError):
     """关键持久化失败：内存状态不能再继续领先于 durable state。"""
 
+    # 状态落不了盘：继续跑会在崩溃恢复后重复副作用
+    error_class = "fatal"
+
     def __init__(self, task_id: str, reason: str) -> None:
         self.task_id = task_id
         self.reason = reason
@@ -35,6 +50,9 @@ class PersistenceError(ShadowError):
 class DeviceUnavailableError(ShadowError):
     """任务绑定的设备当前不在池中。"""
 
+    # 设备只是暂时不在（拔线、模拟器重启），等它回来还能接着做
+    error_class = "transient"
+
     def __init__(self, task_id: str, serial: str) -> None:
         self.task_id = task_id
         self.serial = serial
@@ -42,7 +60,10 @@ class DeviceUnavailableError(ShadowError):
 
 
 class CorruptDataError(PersistenceError):
-    """从持久化层读出的数据损坏或无法解析。"""
+    """从持久化层读出的数据损坏或无法解析。
+
+    继承 `PersistenceError.error_class = "fatal"`：坏数据要人来处理，重试不会变好。
+    """
 
     def __init__(self, key: str, path: str, reason: str) -> None:
         self.key = key
@@ -63,6 +84,9 @@ class ConcurrentModificationError(ShadowError):
     语义（它到底在做什么）已经被改掉了。CAS 让后到的写入者**失败**，
     而不是静默覆盖。
     """
+
+    # 并发冲突：重新读一次、换个时机再试通常就好了，不是致命错误
+    error_class = "transient"
 
     def __init__(
         self,

@@ -93,10 +93,15 @@ _FATAL = re.compile(r"预算|budget|上限|exhausted|设备丢失|no device|未�
 
 
 def classify_error(message: str | None) -> ErrorClass:
-    """按错误文本判定错误类别。
+    """按错误文本判定错误类别（**兜底路径**，V2.7 P2-2）。
 
     判定顺序有意如此：先认「人否决过」和「不可逆」，这两类优先级最高，
     绝不能被后面的宽泛关键词（比如「设备」）抢走。
+
+    注意这是**最后一道兜底**：能拿到结构化信息时（异常对象、执行结果里的
+    `error_class`）应走 `classify_exception` / `classify_result` 的结构化分支。
+    同一个错误在不同层措辞不同（`device offline` / `adb: device offline` /「设备已离线」），
+    按文本匹配迟早会漏。
     """
     text = (message or "").strip()
     if not text:
@@ -114,12 +119,43 @@ def classify_error(message: str | None) -> ErrorClass:
     return ErrorClass.UNKNOWN
 
 
+_ERROR_CLASS_BY_VALUE: dict[str, ErrorClass] = {member.value: member for member in ErrorClass}
+
+
+def classify_exception(exc: BaseException) -> ErrorClass:
+    """按**异常类型**分类（V2.7 P2-2）：结构化优先，比文本匹配可靠得多。
+
+    我们自己的异常体系自带 `error_class`（见 `models.exceptions`），标准库异常按类型判断，
+    两者都没有才落到 UNKNOWN，由调用方决定怎么处置。
+    """
+    declared = getattr(exc, "error_class", None)
+    if declared is not None:
+        found = _ERROR_CLASS_BY_VALUE.get(str(declared))
+        if found is not None:
+            return found
+    if isinstance(exc, (TimeoutError, ConnectionError, OSError)):
+        return ErrorClass.TRANSIENT
+    if isinstance(exc, (ValueError, UnicodeDecodeError)):  # JSONDecodeError 也在这条线上
+        return ErrorClass.PARSE_ERROR
+    return ErrorClass.UNKNOWN
+
+
 def classify_result(result: dict | None) -> ErrorClass:
-    """从执行器返回值分类（executor 永不抛异常，失败是 ``{"ok": False, "error": ...}``）。"""
+    """从执行器返回值分类（executor 永不抛异常，失败是 ``{"ok": False, ...}``）。
+
+    V2.7 P2-2：**优先读结构化字段 `error_class`**，没有才回退到文本匹配。
+    executor / runtime 收敛异常时会把 `classify_exception` 的结果一起带上，
+    于是下游不必再从一句中文错误里猜它属于哪一类。
+    """
     if result is None:
         return ErrorClass.UNKNOWN
     if result.get("ok"):
         return ErrorClass.TRANSIENT  # 没出错，分类无意义
+    declared = result.get("error_class")
+    if declared:
+        found = _ERROR_CLASS_BY_VALUE.get(str(declared))
+        if found is not None:
+            return found
     return classify_error(str(result.get("error") or ""))
 
 

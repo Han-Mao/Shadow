@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from device.adb import DURATION_RANGE_MS, AdbController, AdbError
 from models.action import Action, ActionType, Point
+from models.retry import classify_exception
 from vision import grounding
 from vision.grounding import GroundingError
 
@@ -107,6 +108,12 @@ def execute(adb: AdbController, action: Action, ui_tree: str | None = None) -> d
             case _:
                 raise AdbError(f"未知 Action 类型: {action.type}")
     except (AdbError, GroundingError) as exc:
-        return {"ok": False, "error": str(exc)}
+        # V2.7 P2-2：失败除了给文本，还要带上结构化错误类别。
+        # 下游（verifier → retry 策略）宁可读这个字段，也不要从一句中文里猜它属于哪类。
+        return {"ok": False, "error": str(exc), "error_class": classify_exception(exc).value}
     except Exception as exc:  # noqa: BLE001 - 兜底，保证主循环拿到的永远是结构化结果
-        return {"ok": False, "error": f"执行异常 {type(exc).__name__}: {exc}"}
+        return {
+            "ok": False,
+            "error": f"执行异常 {type(exc).__name__}: {exc}",
+            "error_class": classify_exception(exc).value,
+        }

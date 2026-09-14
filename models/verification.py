@@ -45,6 +45,13 @@ class ActionDispatch(BaseModel):
     transport_error: str = ""
     """设备层返回的错误原文；成功时为空。"""
 
+    error_class: str = ""
+    """结构化错误类别（V2.7 P2-2），取值同 `models.retry.ErrorClass`。
+
+    这是给下游重试策略看的权威信号——宁可读它，也不要从 `transport_error` 那一句
+    中文里猜。executor 收敛异常时填上，空串表示「没这个信息，回退文本匹配」。
+    """
+
     @property
     def ok(self) -> bool:
         return self.status is not DispatchStatus.FAILED

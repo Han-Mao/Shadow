@@ -24,6 +24,7 @@ from models.retry import (
     ErrorClass,
     RetryAction,
     classify_error,
+    classify_result,
 )
 from models.state import Observation, StepOutcome
 from models.task import TERMINAL_STATUSES, Task, TaskStatus
@@ -608,7 +609,11 @@ class AgentRuntime:
 
             # ---- ERROR：先分类，再由策略决定重试 / 换策略 / 找人 / 放弃 ----
             state.failed_strategies.append(self._describe_action(action))
-            error_class = classify_error(verification.message)
+            # V2.7 P2-2：结构化错误类别优先（device 层直接带了 executor 的分类），
+            # 文本匹配只作兜底。
+            error_class = classify_result(
+                {"ok": False, "error_class": verification.dispatch.error_class}
+            ) if verification.dispatch.error_class else classify_error(verification.message)
             if step is not None:
                 # 把动作、错误分类、效果、证据层一起写进 attempt（V2.1 §二十）：
                 # 只记一句错误文本的话，事后查不出「试的是什么动作、属于哪类错误」

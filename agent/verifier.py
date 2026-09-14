@@ -100,6 +100,7 @@ def verify_action(
     # ---- L1 设备层：动作到底发出去没有 ----
     if not execution.get("ok"):
         error = execution.get("error") or "设备执行失败"
+        error_class = str(execution.get("error_class") or "")
         return Verification(
             outcome=StepOutcome.ERROR,
             should_retry=True,
@@ -107,7 +108,10 @@ def verify_action(
             layer="device",
             message=error,
             dispatch=ActionDispatch(
-                action=action, status=DispatchStatus.FAILED, transport_error=error
+                action=action,
+                status=DispatchStatus.FAILED,
+                transport_error=error,
+                error_class=error_class,
             ),
             effect=ActionEffect(
                 status=ActionEffectStatus.VERIFIED_FAILED, evidence="device", message=error
