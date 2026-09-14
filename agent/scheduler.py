@@ -684,14 +684,39 @@ class TaskScheduler:
                 return
             try:
                 self._execute(task, lane)
-            except Exception:  # noqa: BLE001 - Worker 线程绝不能因单个任务而退出
-                logger.exception("任务 %s 执行时发生未捕获异常", task.id)
+            except PersistenceError as exc:
+                # V2.4 §七：持久化失败 ≠ 任务失败。前者必须停在 DEGRADED——
+                # 内存状态已经领先 durable state，继续跑会在崩溃后重复副作用。
+                logger.error("任务 %s 因关键持久化失败降级：%s", task.id, exc)
+                self._reap_worker_failure(task, lane, TaskStatus.DEGRADED)
+            except DeviceUnavailableError as exc:
+                # 设备掉线同样不是任务失败：原设备回来还能接着做。
+                logger.warning("任务 %s 绑定的设备不可用，转入等待：%s", task.id, exc)
                 with self._cond:
-                    task.mark(TaskStatus.FAILED, source="scheduler")
-                    self._completed.append(task.id)
-                    if lane.running is not None and lane.running.id == task.id:
-                        lane.running = None
-                self._persist_or_degrade(task)
+                    self._device_unavailable[task.id] = task
+                self._reap_worker_failure(task, lane, TaskStatus.DEVICE_UNAVAILABLE)
+            except Exception:  # noqa: BLE001 - Worker 线程绝不能因单个任务而退出
+                logger.exception("任务 %s 执行时发生未捕获异常（ERROR_CLASS=INTERNAL）", task.id)
+                self._reap_worker_failure(task, lane, TaskStatus.FAILED)
+
+    def _reap_worker_failure(self, task: Task, lane: _DeviceLane, status: TaskStatus) -> None:
+        """Worker 兜底：按异常性质落状态、释放车道占用、尽力持久化（V2.4 §七）。
+
+        原来的兜底是 `except Exception: mark(FAILED)` —— 又放了一个垃圾桶，
+        把 PersistenceError / DeviceUnavailableError 一律压成「任务失败」。
+        分类之后，「这条任务为什么停下来」不用再从日志里猜：
+        DEGRADED = 状态落不了盘、别再产生副作用；DEVICE_UNAVAILABLE = 等设备回来；
+        只有真正的未知异常才是 FAILED。
+        """
+        with self._cond:
+            task.mark(status, source="scheduler")
+            # 只有终态才算「这条任务结束了」；DEVICE_UNAVAILABLE 还会回来，
+            # 记进完成列表会让 snapshot 误报。
+            if task.is_terminal:
+                self._completed.append(task.id)
+            if lane.running is not None and lane.running.id == task.id:
+                lane.running = None
+        self._persist_or_degrade(task)
 
     def _execute(self, task: Task, lane: _DeviceLane) -> None:
         if task.is_terminal:

@@ -70,9 +70,11 @@ PAUSED_BY_PREEMPTION = "preemption"
 # （审核原话：不是功能不够，而是设计文档和实际状态迁移开始分叉）。
 #
 # 所以把合法迁移写成一张表，所有写入统一走 `Task.transition_to()`。
-# 终态不可逆（DONE/FAILED/CANCELLED 之后不能再动）。
+# 终态不可逆（DONE / FAILED / CANCELLED / DEGRADED 之后不能再动）：
+# 再迁出直接抛 `InvalidTransitionError`（fail closed）。这是防止「已完成的任务被
+# 复活、然后重新产生副作用」的最后一道闸，不能只记 warning。
 #
-# 注意：非法迁移**仍然执行**，只记 warning 并返回 False。
+# 非终态的非法迁移**仍然执行**，只记 warning 并返回 False。
 # 这是刻意的——运行时最怕的是「状态卡住」，严格拒绝会让任务永远停在 running；
 # 但要能被看见，而不是悄悄发生。
 ALLOWED_TRANSITIONS: dict["TaskStatus", frozenset["TaskStatus"]] = {
@@ -164,6 +166,16 @@ class Task(BaseModel):
     # 分开之后，「目标没变但计划被 Re-plan 过」这件事才有办法表达——
     # 否则旧 Checkpoint 只能一律作废，连「页面没变、计划也没变」的安全续跑都要放弃。
     plan_version: int = 0
+
+    # 写入序号（V2.4 §二）：只由持久化层推进，每次成功 save 都 +1。
+    # 三个版本号的分工不能混：
+    #   version      = **目标**的版本（SUPER_TASK 改写目标才 +1）——语义信息
+    #   plan_version = **计划**的版本（重建 / 插步骤 +1）——语义信息
+    #   revision     = **这条记录**的写入序号——只服务于乐观并发校验（CAS）
+    # 少了它就没法回答「我手里这份状态有没有被别的线程改过」，
+    # 于是「Runtime 标记 DONE」和「TaskManager 改写目标」可以同时成功，
+    # 落盘变成 done + 新目标（见 ConcurrentModificationError）。
+    revision: int = 0
 
     # 当前聚焦的步骤（V2.1 §二十一）。由 next_pending_step 选出谁就记谁，
     # 便于 API / 日志直接回答「现在在干哪一步」，不用再从 plan 里推算一遍。

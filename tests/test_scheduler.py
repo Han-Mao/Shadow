@@ -11,6 +11,11 @@ from agent.scheduler import TaskScheduler
 from device.pool import DevicePool
 from device.session import DeviceSession
 from fakes import FakeDevice
+from models.exceptions import (
+    ConcurrentModificationError,
+    DeviceUnavailableError,
+    PersistenceError,
+)
 from models.task import PAUSED_BY_PREEMPTION, PAUSED_BY_USER, Task, TaskPriority, TaskStatus
 from storage import EventLog, TaskStore
 
@@ -899,7 +904,9 @@ class BrokenTaskStore:
     def __init__(self, wrapped: TaskStore) -> None:
         self._wrapped = wrapped
 
-    def save(self, task: Task) -> None:
+    def save(self, task: Task, *, expected_revision: int | None = None) -> None:
+        # 如实模拟真实签名（V2.4 起 TaskStore.save 多了 CAS 参数）：
+        # 替身偷懒不收 keyword 的话，主代码一加参数就会 TypeError
         raise IOError("磁盘已满")
 
     def load(self, task_id: str) -> Task | None:
@@ -952,4 +959,111 @@ def test_device_unavailable_on_submit(tmp_path):
 
     assert task.status is TaskStatus.DEVICE_UNAVAILABLE
     assert task.device_serial == "missing-device"
+    assert task.id in scheduler.snapshot()["device_unavailable"]
+
+
+# ---------------------------------------------------------------- V2.4 并发与失败语义
+
+
+class ExplodingRuntime:
+    """按需抛指定异常，用来验证 worker 兜底的分流（V2.4 §七）。"""
+
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+        self.called = threading.Event()
+
+    def run(self, task: Task) -> RunOutcome:
+        self.called.set()
+        raise self._exc
+
+
+def _wait_for_status(task: Task, status: TaskStatus, timeout: float = 3.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if task.status is status:
+            return True
+        time.sleep(0.01)
+    return task.status is status
+
+
+def test_task_store_rejects_stale_revision(tmp_path):
+    """V2.4 §二：带期望 revision 的写入遇到并发写入必须失败，而不是覆盖。
+
+    这是「已 DONE 的任务被 inject 改写」的根因防护：Runtime 落盘之后，
+    TaskManager 手里那份就已经过期了，它的改写必须被拒。
+    """
+    store = TaskStore(tmp_path / "tasks")
+    task = Task(instruction="原始目标")
+    store.save(task)  # revision 0 -> 1
+    stale = store.load(task.id)
+    assert stale is not None
+
+    # 模拟 Runtime 的并发写入：任务刚被执行完
+    live = store.load(task.id)
+    assert live is not None
+    live.mark(TaskStatus.DONE, source="runtime")
+    store.save(live)  # revision 1 -> 2
+
+    with pytest.raises(ConcurrentModificationError):
+        store.save(stale, expected_revision=stale.revision)
+
+    reloaded = store.load(task.id)
+    assert reloaded is not None
+    assert reloaded.status is TaskStatus.DONE, "过期写入不能覆盖磁盘上的终态"
+    assert reloaded.instruction == "原始目标", "过期写入也不能改写目标"
+
+
+def test_revision_advances_on_every_save(tmp_path):
+    """revision 是「写入序号」，每次落盘都要前进——否则 CAS 永远比不出新旧。"""
+    store = TaskStore(tmp_path / "tasks")
+    task = Task(instruction="x")
+    store.save(task)
+    first = store.load(task.id).revision
+    store.save(task)
+    second = store.load(task.id).revision
+
+    assert second == first + 1
+
+
+def test_worker_maps_persistence_error_to_degraded(tmp_path):
+    """V2.4 §七：worker 兜底不能把持久化失败压成 FAILED。
+
+    旧实现是 `except Exception: mark(FAILED)`——于是「状态落不了盘」与
+    「任务做不下去」被合成一个状态。但前者本该停在 DEGRADED：继续跑的话，
+    崩溃恢复后会带着过期状态重复产生副作用。
+    """
+    store = TaskStore(tmp_path / "tasks")
+    runtime = ExplodingRuntime(PersistenceError("x", "磁盘已满"))
+    session = DeviceSession(FakeDevice())
+    scheduler = TaskScheduler(runtime, session, task_store=store, idle_poll_seconds=0.01)
+    task = Task(instruction="持久化会炸")
+    scheduler.submit(task, allow_preempt=False)
+
+    scheduler.start()
+    try:
+        assert runtime.called.wait(2.0)
+        assert _wait_for_status(task, TaskStatus.DEGRADED)
+    finally:
+        scheduler.stop()
+
+    assert task.status is TaskStatus.DEGRADED
+
+
+def test_worker_maps_device_unavailable_to_waiting(tmp_path):
+    """V2.4 §七：设备掉线也不是「任务失败」——原设备回来它要能接着做。"""
+    store = TaskStore(tmp_path / "tasks")
+    runtime = ExplodingRuntime(DeviceUnavailableError("x", "emu-9"))
+    session = DeviceSession(FakeDevice())
+    scheduler = TaskScheduler(runtime, session, task_store=store, idle_poll_seconds=0.01)
+    task = Task(instruction="设备半路掉线")
+    scheduler.submit(task, allow_preempt=False)
+
+    scheduler.start()
+    try:
+        assert runtime.called.wait(2.0)
+        assert _wait_for_status(task, TaskStatus.DEVICE_UNAVAILABLE)
+    finally:
+        scheduler.stop()
+
+    assert task.status is TaskStatus.DEVICE_UNAVAILABLE
     assert task.id in scheduler.snapshot()["device_unavailable"]

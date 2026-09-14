@@ -252,3 +252,76 @@ def test_recovered_subtask_task_still_reaches_completion(tmp_path):
     assert final.status is TaskStatus.DONE
     assert len(final.plan) == 2
     assert all(step.status is StepStatus.DONE for step in final.plan)
+
+
+# ---------------------------------------------------------------- 并发改写：不能碰已结束的任务
+
+
+def test_super_task_does_not_rewrite_a_finished_task(tmp_path):
+    """V2.4 §二/§三：已经 DONE 的任务不能被 inject 改写目标。
+
+    旧实现只检查一次 `is_terminal`，检查与 `save()` 之间没有任何保护（TOCTOU），
+    于是可能写出 `{"status": "done", "instruction": "新目标"}`——状态机发现不了，
+    因为 status 根本没变，但任务语义已经被改掉了。现在改写落盘时带 revision 做
+    CAS（内存与磁盘两边都确认不是终态）；任务已结束就退化成「另起一个新任务」。
+    """
+    store = TaskStore(tmp_path / "tasks")
+    pool, _ = build_pool("emu-1")
+    scheduler = TaskScheduler(DoneRuntime(), pool, task_store=store, idle_poll_seconds=0.01)
+    manager = TaskManager(store=store, scheduler=scheduler, classifier=SuperTaskClassifier())
+
+    task = Task(instruction="在淘宝搜索运动鞋", device_serial="emu-1")
+    store.save(task)
+    live = store.load(task.id)
+    assert live is not None
+    live.mark(TaskStatus.DONE, source="runtime")
+    store.save(live)
+
+    result = manager.inject("改成搜索京东的手机", current_task_id=task.id, allow_disruptive=True)
+
+    assert result.action is InjectAction.SPAWNED, "任务已结束，新指令应当另起任务而不是改写它"
+    assert result.task is not None and result.task.id != task.id
+
+    reloaded = store.load(task.id)
+    assert reloaded is not None
+    assert reloaded.status is TaskStatus.DONE
+    assert reloaded.instruction == "在淘宝搜索运动鞋", "已结束任务的目标绝不能被改写"
+    assert reloaded.version == 1, "目标版本也不该被动过"
+
+
+def test_super_task_rewrite_loses_cas_race_gracefully(tmp_path, monkeypatch):
+    """V2.4 §二：改写途中被并发写过 → CAS 失败 → 不改写、也不把异常抛出去。
+
+    这里把「改写期间有人抢先落盘」显式摆出来：TaskManager 读到的快照是旧的，
+    磁盘上的 revision 已经前进。此时这次改写必须失败，并退化成新建任务。
+    """
+    store = TaskStore(tmp_path / "tasks")
+    pool, _ = build_pool("emu-1")
+    scheduler = TaskScheduler(DoneRuntime(), pool, task_store=store, idle_poll_seconds=0.01)
+    manager = TaskManager(store=store, scheduler=scheduler, classifier=SuperTaskClassifier())
+
+    task = manager.create("在淘宝搜索运动鞋", submit=False)
+
+    real_save = store.save
+    raced = {"done": False}
+
+    def save_with_race(candidate, *, expected_revision=None):
+        if not raced["done"] and expected_revision is not None:
+            raced["done"] = True
+            other = store.load(candidate.id)
+            assert other is not None
+            other.mark(TaskStatus.PAUSED, source="runtime")  # 模拟并发写入者
+            real_save(other)  # revision 前进，这次 CAS 应当失败
+        return real_save(candidate, expected_revision=expected_revision)
+
+    monkeypatch.setattr(store, "save", save_with_race)
+
+    result = manager.inject("改成搜索京东的手机", current_task_id=task.id, allow_disruptive=True)
+
+    assert raced["done"], "用例前提没成立：CAS 路径没有被走到"
+    assert result.action is InjectAction.SPAWNED, "CAS 失败必须退化成新建任务"
+
+    reloaded = store.load(task.id)
+    assert reloaded is not None
+    assert reloaded.instruction == "在淘宝搜索运动鞋", "改写不生效，旧目标必须原样保留"
+    assert reloaded.version == 1

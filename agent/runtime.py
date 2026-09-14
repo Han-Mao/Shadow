@@ -188,7 +188,16 @@ class AgentRuntime:
         # 所以这个 session 只作为**局部变量**贯穿本次 run，不进实例状态
         session = self._session_for(task)
         task.mark(TaskStatus.RUNNING, source="runtime")
-        self._persist(task)
+        try:
+            self._persist(task)
+        except PersistenceError as exc:
+            # V2.4 §六：启动期的首次落盘同样属于「关键持久化」。
+            # 放在 try 外面的话，这个异常会直接逃到调度器的兜底 except，
+            # 最终被判成 FAILED —— 但「持久化失败」与「任务失败」是两回事：
+            # 前者必须停在 DEGRADED（内存状态已经领先 durable state，
+            # 继续跑会在崩溃恢复后重复产生副作用），而不是假装任务做完了。
+            logger.error("任务 %s 启动期持久化失败，任务降级：%s", task.id, exc)
+            return self._degrade(task, state, f"启动期持久化失败：{exc.reason}")
         self._emit(task.id, STARTED, version=task.version, instruction=task.instruction)
 
         checkpoint = self._load_checkpoint(task)

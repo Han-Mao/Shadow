@@ -16,7 +16,15 @@ from models.retry import ErrorClass
 from models.state import Observation, StepOutcome, compact_observations
 from models.step_attempt import AttemptOutcome
 from models.exceptions import InvalidTransitionError
-from models.task import Task, TaskPriority, TaskStatus, priority_rank
+from models.task import (
+    ACTIVE_STATUSES,
+    ALLOWED_TRANSITIONS,
+    TERMINAL_STATUSES,
+    Task,
+    TaskPriority,
+    TaskStatus,
+    priority_rank,
+)
 from models.task_relation import TaskRelation, TaskRelationResult
 from models.task_step import StepStatus, TaskStep, build_steps
 
@@ -409,6 +417,24 @@ def test_non_terminal_illegal_transition_is_recorded_but_still_applied():
     assert ok is False
     assert task.illegal_transition_count == 1
     assert task.status is TaskStatus.CREATED
+
+
+def test_failure_and_recovery_states_are_real_enum_members():
+    """V2.4 §一：DEGRADED / DEVICE_UNAVAILABLE 必须是真实存在的状态。
+
+    审核担心的是「代码在写 `TaskStatus.DEGRADED`，枚举里却没有」——那样
+    「持久化失败就降级、别再产生副作用」这套安全设计会在最关键的时刻以
+    AttributeError 收场。这里把三件事一起钉住：成员存在、进了迁移表、
+    并且进了终态 / 活跃集合（只补 Enum 不补迁移表等于没补）。
+    """
+    assert TaskStatus.DEGRADED in TERMINAL_STATUSES
+    assert TaskStatus.DEVICE_UNAVAILABLE in ACTIVE_STATUSES
+    assert TaskStatus.DEVICE_UNAVAILABLE not in TERMINAL_STATUSES
+    for status in TaskStatus:
+        assert status in ALLOWED_TRANSITIONS, f"{status} 没有出现在迁移表里"
+
+    # 设备掉线之后必须能回到队列（等原设备回来）——这是「绝不改派」的前提
+    assert TaskStatus.QUEUED in ALLOWED_TRANSITIONS[TaskStatus.DEVICE_UNAVAILABLE]
 
 
 def test_paused_reason_cleared_when_leaving_paused():

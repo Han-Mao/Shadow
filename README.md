@@ -60,7 +60,7 @@ VLM 决定「下一步点哪里」，调度与检查点决定「多件事怎么�
 │   ├── replay.py           # 任务回放：事件流 → 时间轴 + 「值得注意的地方」
 │   └── scheduler.py        # 优先级队列 / 抢占 / 恢复
 ├── models/
-│   ├── task.py             # Task + 8 态状态机 + 优先级 + 预算 + 版本号
+│   ├── task.py             # Task + 10 态状态机（8 运行态 + DEGRADED / DEVICE_UNAVAILABLE）+ 优先级 + 预算 + 版本号 + revision
 │   ├── task_step.py        # TaskStep：计划是可追踪的状态机（只描述计划）
 │   ├── step_attempt.py     # StepAttempt：一次尝试的经过（动作/结果/错误分类/证据层）
 │   ├── task_relation.py    # TaskRelation：5 种任务关系
@@ -85,7 +85,7 @@ VLM 决定「下一步点哪里」，调度与检查点决定「多件事怎么�
 ├── scripts/
 │   ├── demo_preemption.py  # 抢占恢复演示（离线可跑）
 │   └── replay_task.py      # 命令行回放一个任务的事件流
-└── tests/                  # 389 个离线用例
+└── tests/                  # 404 个离线用例
 ```
 
 ## 职责边界
@@ -398,10 +398,11 @@ Scheduler
 
 **任务一旦开始执行就绑定设备**（`task.device_serial`）：中途换设备会让页面上下文对不上，
 等于把任务丢到一台陌生手机上接着做。未绑定的任务由调度器派给最闲的一台；
-绑定的设备不在池里（拔线/换机）时改派，否则这条任务永远没人取走、悄悄变成僵尸。
+绑定的设备不在池里（拔线/换机）时**绝不改派**——任务转 `DEVICE_UNAVAILABLE`
+等原设备回来（V2.3 起），改派等于把任务上下文悄悄丢到另一台手机上。
 
 单设备时只有一条车道，与旧实现逐字等价——这一点由当时的 257 个既有测试守着
-（V2.2 修复轮之后合计 389 个）。
+（V2.4 修复轮之后合计 404 个）。
 
 ### 多设备暴露出的两个正确性问题
 
@@ -498,6 +499,92 @@ VLM → DONE_REQUEST → GoalVerifier → 确认 / 打回继续做 / 转人工�
   「没表态」不等于「说了 safe」。
 - **`ActionType.DONE_REQUEST`** 是 `DONE` 的别名，模型可以直接用；
   两者都只表示「申请完成」。
+
+## V2.4 修复轮（依据 `v2.4审查建议.md`）
+
+这一轮审查同样是针对**上一版 main** 做的静态分析，所以照例先逐条核对再动手。
+结论：文档列了 11 小节、其中 10 条是可核对的技术项，**1 条已在 V2.3 修掉**
+（状态枚举补齐，#5 依赖它，随之消解），**其余 8 条仍然存在**。
+
+### 状态机现在是 10 态
+
+```text
+CREATED → QUEUED → RUNNING ─┬→ DONE / FAILED / CANCELLED   （终态，不可逆）
+                            ├→ PAUSED      （PAUSED_BY_USER 保持暂停；被抢占则自动恢复）
+                            ├→ WAITING     （等人工确认，不进任何队列）
+                            ├→ DEGRADED    （终态：关键持久化失败，禁止再产生副作用）
+                            └→ DEVICE_UNAVAILABLE → QUEUED   （等原设备回来，绝不改派）
+```
+
+`DEGRADED` 与 `DEVICE_UNAVAILABLE` 是 V2.3 引入的**故障 / 恢复态**，
+那一版只补齐了枚举与迁移表，这一轮把它们真正接进了并发与失败语义。
+
+| # | 审查项 | 现状核对 | 改动 | 落点 |
+|---|---|---|---|---|
+| 1 | P0 `TaskStatus` 缺 `DEVICE_UNAVAILABLE` / `DEGRADED`，故障路径 `AttributeError` | **已在 V2.3 修掉**：10 态 + 迁移表 + 终态集合齐备 | 本轮只更正与实现不一致的注释与 README | `models/task.py`、`README.md` |
+| 2 | P0 `DONE` 任务仍可被并发 `inject` 改写 instruction / plan | **存在**：`is_terminal` 只检查一次，检查与 `save()` 之间无保护（TOCTOU） | 改写改为「内存取最新 + revision CAS」，失败就退化成另起新任务 | `models/exceptions.py`、`storage/task_store.py`、`agent/task_manager.py` |
+| 3 | P1 版本围栏挡不住「终态任务被重新描述」 | **存在**（围栏只管 Runtime 侧） | 同上：CAS 落在持久化层，与谁在写无关 | `storage/task_store.py` |
+| 4 | P1 `SUBTASK` / `INTERRUPT` / `DUPLICATE` 同样有并发窗口 | **存在** | 所有「改当前任务」的入口共用一把 `_mutation_lock` | `agent/task_manager.py` |
+| 5 | P1 入队后落盘失败 → 依赖 `DEGRADED` 才能降级 | 依赖项已在 V2.3 补齐 | 无需额外改动，补了回归用例 | `tests/test_models.py` |
+| 6 | P1 `Runtime.run()` 首次 `_persist()` 不在 `try` 里，会逃成 `FAILED` | **存在** | 首次落盘纳入同一处理，走 `_degrade()` | `agent/runtime.py` |
+| 7 | P1 Worker 兜底 `except Exception → mark(FAILED)` | **存在** | 按异常分流：`PersistenceError → DEGRADED`、`DeviceUnavailableError → DEVICE_UNAVAILABLE`、其余 → `FAILED` | `agent/scheduler.py` |
+| 8 | P2 `stable` 容易被读成「UI 已静止」 | **存在**（只有 `before == after`） | docstring 精确化 + 响应新增 `stable_meaning` 字段 | `api/server.py` |
+| 9 | P2 确认令牌是「能力票据」而非一次性审批 | **存在**（无 `jti`，TTL 内可反复使用） | 令牌加 `jti`，`/confirm` 改为**消费式**校验，同一张票据第二次提交被拒 | `api/auth.py`、`api/server.py` |
+| 10 | P2 README 的「8 态」与代码分叉 | **存在** | README 与代码注释同步为 10 态 | `README.md`、`models/task.py` |
+
+### 并发改写：为什么加的是 CAS，而不是只加一把锁
+
+审查描述的场景很具体——任务刚被判 `DONE`，而 `inject()` 还拿着「之前读到的
+`RUNNING`」准备改写目标，最后磁盘上出现：
+
+```json
+{ "status": "done", "instruction": "搜索京东上的手机" }
+```
+
+状态机发现不了，因为 `status` 根本没变，但任务语义已经被改掉了。三层防护：
+
+```text
+① _mutation_lock   把本模块内「读 - 判 - 改 - 存」串起来（inject / complete / fail /
+                   resolve_confirmation / pause / resume / cancel 共用）
+② 终态双检         内存与磁盘两边都确认「不是终态」——调度器内存那份可能比磁盘新
+                   （刚判 RUNNING 还没落盘），只看磁盘会把它误判成「还没开始」
+③ revision CAS     落盘时校验写入序号；期间被人写过就抛 ConcurrentModificationError，
+                   本次改写不生效并回滚内存改动 —— 任务已结束则**另起一个新任务**
+```
+
+锁挡不住 Runtime（它拿的是同一批 Task 实例，却不经过这把锁），所以真正的兜底是 ③。
+
+### 失败语义：`DEGRADED` 与 `FAILED` 不是一回事
+
+```text
+关键持久化失败 → DEGRADED           「状态落不了盘，别再产生副作用」
+                                    （继续跑的话，崩溃恢复后会重复执行）
+设备绑定不可用 → DEVICE_UNAVAILABLE  「等原设备回来」，绝不改派
+真正的未知异常 → FAILED             「这条任务做不下去了」
+```
+
+以前 Worker 的兜底 `except Exception: mark(FAILED)` 会把前两者一起压成 `FAILED`，
+于是「这条任务到底为什么停了」只能去日志里猜。
+
+### 行为变化提醒
+
+- **`/confirm` 的令牌只能用一次**：确认成功后同一张票据再次提交返回 `403`
+  （原因写明「已被使用过」）。连续 `GET /tasks/{id}` 拿到的多张票据里，
+  只有第一张能真正完成确认。
+- **`SUPER_TASK` 不再改写已结束的任务**：任务已终态（或被并发改过）时，
+  新指令会**新建一个任务**，而不是改掉旧任务的 `instruction`；
+  返回的 `action` 相应为 `spawned`，不再是 `superseded`。
+- **持久化失败的落状态会看到 `degraded`** 而不是 `failed`，
+  这类任务不会被调度器重新捡起执行（防重复副作用）。
+- **`/observe` 与 `/screenshot` 多了 `stable_meaning` 字段**，
+  固定为 `no_known_shadow_write_during_observation`，用于消除对 `stable` 的误读。
+
+### API 变更
+
+| 变更 | 说明 |
+|---|---|
+| `stable_meaning`（新增响应字段） | `/observe`、`/screenshot` 新增，说明 `stable` 的语义，向后兼容 |
+| `/confirm` 令牌格式 | 由 `<expires>.<sig>` 变为 `<expires>.<jti>.<sig>`；**旧格式令牌立即失效**（TTL 最长 300 秒，重新读取待确认事项即可） |
 
 ## 快速开始
 
@@ -615,11 +702,11 @@ pip install -r requirements.txt
 python -m pytest -q
 ```
 
-**389 个用例，全部离线**：不需要 adb、模拟器或 API Key。
+**404 个用例，全部离线**：不需要 adb、模拟器或 API Key。
 
 | 文件 | 覆盖 |
 |---|---|
-| `test_models.py` | 任务状态机、步骤依赖、动作风险（策略下限）/指纹、Checkpoint、预算、版本号、**尝试历史** |
+| `test_models.py` | 任务状态机、**故障/恢复态（DEGRADED / DEVICE_UNAVAILABLE）回归**、步骤依赖、动作风险（策略下限）/指纹、Checkpoint、预算、版本号、**尝试历史** |
 | `test_device.py` | ADB 封装、输入通道（含中文）、设备会话所有权与并发、**命令超时分级与总预算**、**多设备 serial 解析** |
 | `test_device_pool.py` | **DevicePool**：注册/查找、未知设备报错、空闲筛选、产物按设备分目录 |
 | `test_trajectory_store.py` | **轨迹落盘**：重启可读、ui_tree 不落盘、窗口裁剪、紧凑化、坏行容错 |
@@ -631,11 +718,11 @@ python -m pytest -q
 | `test_event_log.py` | 事件日志：顺序、按任务隔离、limit、截断行容错、写失败不抛异常 |
 | `test_replay.py` | **回放**：时间轴顺序与偏移、异常帧挑选、Markdown 报告、动作计划、**重放的安全默认** |
 | `test_classifier.py` | 三层关系判定、相似度否决、**分关系阈值**、二次确认标记、**语义相似度** |
-| `test_scheduler.py` | 优先级、暂停/取消、**抢占与恢复**、组合式中断、**启动恢复**（含审批前重启）、**抢占延迟观测**、设备占用、**多设备并行/绑定/改派** |
-| `test_multi_device_e2e.py` | **双设备跨设备干扰**、逐设备 running 视图、**SUBTASK 注入 + 崩溃恢复**（含 `plan_version`）、恢复后跑完 |
-| `test_runtime.py` | 闭环执行、异常收敛、死循环、HITL、Checkpoint 恢复、**三预算门控**、**动作对账**、**效果未知在线对账**、**完成申请驳回/转人工**、**风险门禁接入闭环**、事件自足性、按绑定设备取会话 |
+| `test_scheduler.py` | 优先级、暂停/取消、**抢占与恢复**、组合式中断、**启动恢复**（含审批前重启）、**抢占延迟观测**、设备占用、**多设备并行/绑定/改派**、**revision CAS**、**worker 失败分流（DEGRADED / DEVICE_UNAVAILABLE）** |
+| `test_multi_device_e2e.py` | **双设备跨设备干扰**、逐设备 running 视图、**SUBTASK 注入 + 崩溃恢复**（含 `plan_version`）、恢复后跑完、**并发改写不碰已结束的任务** |
+| `test_runtime.py` | 闭环执行、异常收敛、死循环、HITL、Checkpoint 恢复、**三预算门控**、**动作对账**、**效果未知在线对账**、**完成申请驳回/转人工**、**风险门禁接入闭环**、事件自足性、按绑定设备取会话、**启动期持久化失败降级** |
 | `test_api.py` | HTTP 契约、状态码语义、错误脱敏、危险动作拦截、SUPER_TASK 改写与二次确认、依赖链迁移、版本门控、`/events`、`/replay`、**预算入参** |
-| `test_api_auth.py` | **鉴权/只读/设备范围/确认令牌/请求审计**、`/health` 公开、**非回环裸绑定拒绝启动** |
+| `test_api_auth.py` | **鉴权/只读/设备范围/确认令牌/请求审计**、`/health` 公开、**非回环裸绑定拒绝启动**、**确认令牌一次性消费** |
 | `test_goal_policy.py` | **任务画像 → 验证严格度**：导航/副作用/纯查询/未知分类与优先级（副作用 > 导航）、默认按画像分层、显式 `GOAL_VERIFY_MODE` 覆盖、同类情形按任务类型给出不同裁定 |
 | `test_api_authz.py` | **授权边界**：设备范围裁剪（读 / inject / devices / 调度快照）、越界设备 403 而非 500、确认令牌绑定操作者、否决危险动作不杀任务 |
 

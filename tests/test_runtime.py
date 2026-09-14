@@ -1401,3 +1401,41 @@ def test_version_fence_invalidates_old_decision_after_super_task(monkeypatch, tm
     # 应该至少调了两次规划：第一次被作废，第二次重新规划后完成
     plan_calls = [c for c in calls if c[0] == "plan"]
     assert len(plan_calls) >= 2
+
+
+# ---------------------------------------------------------------- V2.4 §六：启动期持久化失败
+
+
+class AlwaysFailSaveStore:
+    """关键持久化失败替身：save 永远失败，load / list 仍走真实存储。"""
+
+    def __init__(self, wrapped: TaskStore) -> None:
+        self._wrapped = wrapped
+
+    def save(self, task: Task, *, expected_revision: int | None = None) -> None:
+        raise IOError("磁盘已满")
+
+    def load(self, task_id: str) -> Task | None:
+        return self._wrapped.load(task_id)
+
+    def list_all(self) -> list[Task]:
+        return self._wrapped.list_all()
+
+
+def test_startup_persistence_failure_degrades_instead_of_failing(tmp_path):
+    """V2.4 §六：run() 开头那一次落盘也在 try 里，失败要降级而不是逃成 FAILED。
+
+    旧实现里首次 `_persist()` 在 try 外面，异常会直接冒到调度器的兜底
+    `except Exception: mark(FAILED)`——于是「状态落不了盘」被记成「任务失败」。
+    但它真正该表达的是 DEGRADED：内存状态已经领先 durable state，
+    必须停下不再产生副作用，否则崩溃恢复后会带着过期状态重复执行。
+    """
+    store = AlwaysFailSaveStore(TaskStore(tmp_path / "tasks"))
+    session = DeviceSession(FakeDevice())
+    runtime = AgentRuntime(session, artifact_dir=tmp_path, task_store=store)
+    task = Task(instruction="启动就落不了盘")
+
+    outcome = runtime.run(task)
+
+    assert outcome is RunOutcome.FAILED
+    assert task.status is TaskStatus.DEGRADED, "持久化失败要落 DEGRADED，而不是 FAILED"

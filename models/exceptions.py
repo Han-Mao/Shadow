@@ -49,3 +49,33 @@ class CorruptDataError(PersistenceError):
         self.path = path
         self.reason = reason
         super().__init__(key, f"数据损坏 {path}：{reason}")
+
+
+class ConcurrentModificationError(ShadowError):
+    """乐观并发校验失败：手里这份 Task 快照已经不是最新的一份（V2.4 §二）。
+
+    典型场景：Runtime 刚把任务判成 DONE 并落盘，TaskManager 还拿着「之前读到的
+    RUNNING」准备改写 instruction。放任写入的话，磁盘上会出现
+
+        status = done  +  instruction = 新目标
+
+    这种「语义损坏」——状态机看不出问题，因为 status 根本没变，但任务的核心
+    语义（它到底在做什么）已经被改掉了。CAS 让后到的写入者**失败**，
+    而不是静默覆盖。
+    """
+
+    def __init__(
+        self,
+        task_id: str,
+        expected_revision: int,
+        actual_revision: int,
+        source: str = "",
+    ) -> None:
+        self.task_id = task_id
+        self.expected_revision = expected_revision
+        self.actual_revision = actual_revision
+        self.source = source or "未标注"
+        super().__init__(
+            f"任务 {task_id} 已被并发修改（期望 revision={expected_revision}，"
+            f"实际 {actual_revision}，来源 {self.source}）"
+        )

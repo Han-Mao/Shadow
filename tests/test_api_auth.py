@@ -334,3 +334,36 @@ def test_requests_are_audited(secured_api):
     records = audit.read()
     assert any(r["path"] == "/tasks" and r["status"] == 200 for r in records)
     assert any(r["path"] == "/tasks" and r["status"] == 401 for r in records), "被拒绝的请求同样要留痕"
+
+
+# ---------------------------------------------------------------- V2.4 §九：一次性确认令牌
+
+
+def test_confirmation_token_is_single_use():
+    """V2.4 §九：确认令牌是一次性审批，同一张票据不能消费两次。
+
+    旧实现是纯签名令牌（能力票据）：连续 GET 会拿到多张有效票据，任意一张在
+    TTL 内都能用。现在令牌带 jti，`/confirm` 走消费式校验，第二次提交被明确拒绝。
+    """
+    auth.clear_consumed_confirmations()
+    token = auth.issue_confirmation_token("operator-A", "t1", "fp-aaa", 1)
+
+    ok, reason = auth.consume_confirmation_token(token, "operator-A", "t1", "fp-aaa", 1)
+    assert ok, reason
+
+    again, reason_again = auth.consume_confirmation_token(token, "operator-A", "t1", "fp-aaa", 1)
+    assert not again
+    assert "已被使用" in reason_again, "重复提交必须明确说明票据已被消费"
+
+
+def test_confirmation_token_carries_jti_and_precheck_is_idempotent():
+    """令牌格式为 `<expires>.<jti>.<sig>`；未消费前预检（verify）是幂等的。"""
+    auth.clear_consumed_confirmations()
+    token = auth.issue_confirmation_token("operator-A", "t1", "fp-aaa", 1)
+
+    assert len(token.split(".")) == 3, "三段式：过期时间 + jti + 签名"
+
+    assert auth.verify_confirmation_token(token, "operator-A", "t1", "fp-aaa", 1)[0]
+    assert auth.verify_confirmation_token(token, "operator-A", "t1", "fp-aaa", 1)[0], (
+        "预检不该消费令牌"
+    )

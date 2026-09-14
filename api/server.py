@@ -459,9 +459,21 @@ def back(request: Request, device_serial: str | None = None):
     return {"ok": True, "device": session_item.serial, "generation": session_item.generation}
 
 
+# `stable` 的语义常量（V2.4 §八）。审核指出这个名字容易被读成「UI 已经稳定」，
+# 但它实际只表示「这次采集没有跨越 Shadow 自己发起的写入」——页面动画自己在播、
+# 别的客户端在改，generation 都不会动。把这个含义写进响应，免得调用方自己猜。
+STABLE_MEANING = "no_known_shadow_write_during_observation"
+
+
 @app.post("/screenshot")
 def screenshot(request: Request, device_serial: str | None = None):
-    """只读端点：不加设备锁，但会明确告诉你这次截图是不是稳定态（V2.2 §九）。"""
+    """只读端点：不加设备锁，但会明确告诉你这次截图是不是「无已知写入」（V2.2 §九）。
+
+    `stable` 的准确含义是 **no known Shadow write during observation**：
+    只说明这段时间里没有 Shadow 自己的写操作越过去，**不等于**「UI 已经完全静止」
+    （V2.4 §八）。所以它适合回答「这张图能不能当权威状态用」，
+    不适合回答「这一屏是不是已经不抖了」。
+    """
     session_item = resolve_manual_device(device_serial, request)
     before = session_item.generation
     path = shots.capture(
@@ -474,8 +486,9 @@ def screenshot(request: Request, device_serial: str | None = None):
         "path": str(path),
         "device": session_item.serial,
         "generation": after,
-        # 截图前后代次不同 = 中途有动作发生，这一张可能落在动画/过渡帧上
+        # 前后代次不同 = 中途有 Shadow 的写操作发生，这一张可能落在动画/过渡帧上
         "stable": before == after,
+        "stable_meaning": STABLE_MEANING,
     }
 
 
@@ -483,8 +496,10 @@ def screenshot(request: Request, device_serial: str | None = None):
 def observe(request: Request, device_serial: str | None = None):
     """只读端点，返回带代次的整屏观察。
 
-    `stable=false` 表示这次观察跨越了一次设备写入——消费者**不能**把它
-    当成「当前稳定页面」，否则很容易把过渡动画页当成真实状态（V2.2 §九）。
+    `stable=false` 表示这次观察跨越了一次 Shadow 自己的设备写入——消费者**不能**
+    把它当成「当前稳定页面」，否则很容易把过渡动画页当成真实状态（V2.2 §九）。
+    `stable=true` 也只是 **no known Shadow write during observation**，
+    不代表 UI 已经静止（V2.4 §八）。
     """
     session_item = resolve_manual_device(device_serial, request)
     before = session_item.generation
@@ -496,6 +511,7 @@ def observe(request: Request, device_serial: str | None = None):
             "device": session_item.serial,
             "generation": after,
             "stable": before == after,
+            "stable_meaning": STABLE_MEANING,
         }
     )
     return payload
@@ -689,7 +705,8 @@ def confirm_task(task_id: str, req: ConfirmRequest, request: Request):
     `task.mark(FAILED)`，与 Runtime「拒绝后换策略」的设计相反——
     那不是权限问题，是两个模块的状态机在打架。
 
-    启用鉴权时还必须带上 `token`，它绑定调用方身份与有效期（V2.2 §五）。
+    启用鉴权时还必须带上 `token`：它绑定调用方身份、动作指纹、任务版本与有效期，
+    而且是**一次性**的——同一张票据第二次提交会被明确拒绝（V2.4 §九）。
     """
     task = require_task_access(task_id, request)
     principal = current_principal(request)
@@ -701,7 +718,7 @@ def confirm_task(task_id: str, req: ConfirmRequest, request: Request):
     if auth.enabled():
         pending = runtime.pending_confirmation(task_id)
         fingerprint = pending.fingerprint if pending is not None else "goal"
-        ok, reason = auth.verify_confirmation_token(
+        ok, reason = auth.consume_confirmation_token(
             req.token, principal.name, task_id, fingerprint, task.version
         )
         if not ok:
@@ -731,7 +748,6 @@ def confirm_task(task_id: str, req: ConfirmRequest, request: Request):
         "kind": kind,
         "task": manager.get(task_id).model_dump(mode="json"),
     }
-    return {"ok": True, "approved": req.approved, "task": manager.get(task_id).model_dump(mode="json")}
 
 
 @app.post("/tasks/{task_id}/inject")

@@ -26,6 +26,7 @@ import hmac
 import logging
 import os
 import secrets
+import threading
 import time
 from dataclasses import dataclass, field
 
@@ -188,6 +189,13 @@ def bare_bind_refused(host: str) -> str | None:
 # 而是「能力票据」——拿到就一直有效。给一个短时限，够人看清内容再点就行。
 CONFIRM_TTL_SECONDS = float(os.getenv("SHADOW_CONFIRM_TTL_SECONDS", "300"))
 
+# 已消费的确认令牌（V2.4 §九）：jti -> 过期时间戳。
+# 审核指出光有 TTL + 签名仍然只是「signed capability」：连续 GET 三次会拿到三个
+# 有效令牌，任意一个在 TTL 内都能确认。加上 jti 并在消费后记名，同一个令牌第二次
+# 提交直接被拒——确认是**一次性审批**，不是可以反复使用的凭据。
+_consumed_confirmations: dict[str, int] = {}
+_consumption_lock = threading.Lock()
+
 
 def confirmation_secret() -> bytes:
     """签名密钥：优先用配置的令牌派生，否则用进程级随机串。"""
@@ -204,18 +212,20 @@ def confirmation_payload(
     action_fingerprint: str,
     task_version: int,
     expires_at: int,
+    jti: str,
 ) -> str:
     """确认令牌绑定的内容。
 
-    绑的四样东西各有理由（V2.2 §五）：
+    绑的五样东西各有理由（V2.2 §五 / V2.4 §九）：
     - `task_id` + 动作指纹：同一个任务换了另一个危险动作，旧令牌就失效——
       否则「确认过一次」等于把这个任务的所有危险动作都放行了
     - `task_version`：任务目标被改写（SUPER_TASK）后旧令牌即失效
     - `principal`：**审核新指出的缺口**。不绑人的话，令牌是「谁拿到谁能用」——
       A 读一次任务拿到令牌，B 只要有普通写权限就能放行危险动作
     - `expires_at`：短时效，避免变成长期有效的能力票据
+    - `jti`：令牌身份，用于一次性消费（见 `consume_confirmation_token`）
     """
-    return f"{principal}|{task_id}|{action_fingerprint}|{task_version}|{expires_at}"
+    return f"{principal}|{task_id}|{action_fingerprint}|{task_version}|{expires_at}|{jti}"
 
 
 def issue_confirmation_token(
@@ -227,12 +237,55 @@ def issue_confirmation_token(
     ttl: float | None = None,
     now: float | None = None,
 ) -> str:
-    """为一次待确认的危险动作签发令牌，格式 `<过期时间戳>.<签名>`。"""
+    """为一次待确认的危险动作签发令牌，格式 `<过期时间戳>.<jti>.<签名>`。"""
     issued = time.time() if now is None else now
     expires_at = int(issued + (CONFIRM_TTL_SECONDS if ttl is None else ttl))
-    payload = confirmation_payload(principal, task_id, action_fingerprint, task_version, expires_at)
+    jti = secrets.token_hex(8)
+    payload = confirmation_payload(
+        principal, task_id, action_fingerprint, task_version, expires_at, jti
+    )
     signature = hmac.new(confirmation_secret(), payload.encode(), hashlib.sha256).hexdigest()[:32]
-    return f"{expires_at}.{signature}"
+    return f"{expires_at}.{jti}.{signature}"
+
+
+def _verify_and_parse(
+    token: str | None,
+    principal: str,
+    task_id: str,
+    action_fingerprint: str,
+    task_version: int,
+    *,
+    now: float | None = None,
+) -> tuple[bool, str, str]:
+    """校验令牌，返回 (是否通过, 不通过的原因, jti)。
+
+    返回原因是为了进审计日志——「令牌为什么被拒」是排查权限问题的第一手信息。
+    """
+    if not token:
+        return False, "缺少确认令牌", ""
+
+    raw = str(token).strip()
+    expires_text, _, rest = raw.partition(".")
+    jti, _, signature = rest.partition(".")
+    if not expires_text or not jti or not signature:
+        return False, "确认令牌格式非法", ""
+    try:
+        expires_at = int(expires_text)
+    except ValueError:
+        return False, "确认令牌格式非法", ""
+
+    current = time.time() if now is None else now
+    if current > expires_at:
+        return False, f"确认令牌已过期（{expires_at}）", ""
+
+    payload = confirmation_payload(
+        principal, task_id, action_fingerprint, task_version, expires_at, jti
+    )
+    expected = hmac.new(confirmation_secret(), payload.encode(), hashlib.sha256).hexdigest()[:32]
+    if not hmac.compare_digest(expected, signature):
+        # 指纹/版本/身份对不上都会走到这里，只回一句笼统原因，不泄露是哪一项不匹配
+        return False, "确认令牌与当前待确认事项或调用方身份不匹配", ""
+    return True, "", jti
 
 
 def verify_confirmation_token(
@@ -244,30 +297,56 @@ def verify_confirmation_token(
     *,
     now: float | None = None,
 ) -> tuple[bool, str]:
-    """校验确认令牌，返回 (是否通过, 不通过的原因)。
+    """只校验、不消费（幂等，适合做预检）。
 
-    返回原因是为了进审计日志——「令牌为什么被拒」是排查权限问题的第一手信息。
+    真正放行动作请用 `consume_confirmation_token`。
     """
-    if not token:
-        return False, "缺少确认令牌"
+    ok, reason, _ = _verify_and_parse(
+        token, principal, task_id, action_fingerprint, task_version, now=now
+    )
+    return ok, reason
 
-    raw = str(token).strip()
-    expires_text, _, signature = raw.partition(".")
-    if not expires_text or not signature:
-        return False, "确认令牌格式非法"
-    try:
-        expires_at = int(expires_text)
-    except ValueError:
-        return False, "确认令牌格式非法"
+
+def consume_confirmation_token(
+    token: str | None,
+    principal: str,
+    task_id: str,
+    action_fingerprint: str,
+    task_version: int,
+    *,
+    now: float | None = None,
+) -> tuple[bool, str]:
+    """校验并**消费**令牌：同一个令牌只能用一次（V2.4 §九）。
+
+    与 `verify_confirmation_token` 的差别只在「记名」这一步——校验通过后把 jti
+    记进已消费集合，重复提交会被明确拒绝，而不是当成一次全新的审批。
+
+    进程重启会丢掉这份记录，所以它只是 TTL 之外的第二道闸；真正的语义保障仍然
+    来自「待确认事项被消费后 `/confirm` 直接 409」，这里补的是「同一张票据不许
+    用第二次」这条显式语义。
+    """
+    ok, reason, jti = _verify_and_parse(
+        token, principal, task_id, action_fingerprint, task_version, now=now
+    )
+    if not ok:
+        return False, reason
 
     current = time.time() if now is None else now
-    if current > expires_at:
-        return False, f"确认令牌已过期（{expires_at}）"
-
-    expected = issue_confirmation_token(
-        principal, task_id, action_fingerprint, task_version, now=expires_at - CONFIRM_TTL_SECONDS
-    )
-    if not hmac.compare_digest(expected, raw):
-        # 指纹/版本/身份对不上都会走到这里，只回一句笼统原因，不泄露是哪一项不匹配
-        return False, "确认令牌与当前待确认事项或调用方身份不匹配"
+    try:
+        expires_at = int(str(token).strip().partition(".")[0])
+    except ValueError:  # pragma: no cover - _verify_and_parse 已挡住
+        expires_at = int(current)
+    with _consumption_lock:
+        # 顺手清掉过期条目，避免这个集合无限增长
+        for used_jti in [k for k, exp in _consumed_confirmations.items() if exp < current]:
+            _consumed_confirmations.pop(used_jti, None)
+        if jti in _consumed_confirmations:
+            return False, "确认令牌已被使用过（确认是一次性审批，请重新读取待确认事项）"
+        _consumed_confirmations[jti] = expires_at
     return True, ""
+
+
+def clear_consumed_confirmations() -> None:
+    """清空已消费记录（测试用）。"""
+    with _consumption_lock:
+        _consumed_confirmations.clear()

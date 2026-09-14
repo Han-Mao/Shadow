@@ -9,11 +9,14 @@
 from __future__ import annotations
 
 import logging
+import threading
 import uuid
 from datetime import datetime
 from enum import Enum
+from typing import Any, Callable
 
 from models.budget import TaskBudget
+from models.exceptions import ConcurrentModificationError
 from models.retry import DEFAULT_POLICY
 from models.task import Task, TaskPriority, TaskStatus, priority_rank
 from models.task_relation import TaskRelation, TaskRelationResult
@@ -80,6 +83,15 @@ class TaskManager:
         # 各写各的，冲突不可避免。现在这条路径只有 TaskManager 一个出口。
         self._runtime = runtime
 
+        # 改写「当前任务」时的互斥锁（V2.4 §三）：inject / complete / fail /
+        # resolve_confirmation / pause / resume / cancel 都是「读出状态 → 判断能不能改
+        # → 改 → 落盘」四步，任意两步之间被别的线程插进来，判断就失效了（TOCTOU）。
+        #
+        # 但它**不是万能的**：Runtime 与 Scheduler 拿着同一批 Task 实例，却不经过这把锁，
+        # 所以互斥只在本模块内部成立。真正的兜底是 TaskStore 的 revision CAS
+        # （见 `_rewrite`）——锁只是把窗口缩到可忽略。
+        self._mutation_lock = threading.RLock()
+
     # ---- 创建与查询 ----
 
     def create(
@@ -139,30 +151,42 @@ class TaskManager:
     # ---- 状态迁移 ----
 
     def complete(self, task_id: str) -> Task | None:
-        task = self.get(task_id)
-        if task is None:
-            return None
-        task.sync_current_step()
-        task.mark(TaskStatus.DONE, source="task_manager")
-        self._store.save(task)
-        return task
+        """把任务标记为完成（外部入口）。
+
+        V2.4 §三：与 inject 共用 `_mutation_lock`——「读状态 → 判断能不能改 →
+        改 → 落盘」是四步，任何两步之间被并发写插进来，判断就失效了。
+        """
+        with self._mutation_lock:
+            task = self.get(task_id)
+            if task is None:
+                return None
+            task.sync_current_step()
+            task.mark(TaskStatus.DONE, source="task_manager")
+            self._store.save(task)
+            return task
 
     def fail(self, task_id: str) -> Task | None:
-        task = self.get(task_id)
-        if task is None:
-            return None
-        task.mark(TaskStatus.FAILED, source="task_manager")
-        self._store.save(task)
-        return task
+        with self._mutation_lock:
+            task = self.get(task_id)
+            if task is None:
+                return None
+            task.mark(TaskStatus.FAILED, source="task_manager")
+            self._store.save(task)
+            return task
 
     def pause(self, task_id: str) -> bool:
-        return self._scheduler.pause(task_id)
+        # 也走 _mutation_lock（V2.4 §三）：pause / cancel 与 inject 都想改同一个任务时，
+        # 必须有个明确先后，不能各改一半。
+        with self._mutation_lock:
+            return self._scheduler.pause(task_id)
 
     def resume(self, task_id: str, *, allowed_devices: frozenset[str] | None = None) -> bool:
-        return self._scheduler.resume(task_id, allowed_devices=allowed_devices)
+        with self._mutation_lock:
+            return self._scheduler.resume(task_id, allowed_devices=allowed_devices)
 
     def cancel(self, task_id: str) -> bool:
-        return self._scheduler.cancel(task_id)
+        with self._mutation_lock:
+            return self._scheduler.cancel(task_id)
 
     # ---- 人工处理待确认事项（V2.2 §三 / §十一）----
 
@@ -202,18 +226,21 @@ class TaskManager:
         """
         if self._runtime is None:
             return None
-        task = self.get(task_id)
-        if task is None or not self.confirmation_pending(task_id):
-            return None
-        if not self._runtime.confirm(task_id, approved):
-            return None
+        # V2.4 §三：确认也是「改当前任务」，与 inject 用同一把锁——
+        # 否则「确认放行」与「SUPER_TASK 改写目标」可能同时生效。
+        with self._mutation_lock:
+            task = self.get(task_id)
+            if task is None or not self.confirmation_pending(task_id):
+                return None
+            if not self._runtime.confirm(task_id, approved):
+                return None
 
-        # 无论批准还是否决，都要重新入队：
-        #  批准 → 放行那一次危险动作 / 认定完成
-        #  否决 → 按 runtime 记下的黑名单或 Re-plan 理由，换一种做法继续
-        self._scheduler.submit(task, allow_preempt=False)
-        logger.info("任务 %s 的待确认事项已处理（approved=%s）", task_id, approved)
-        return task
+            # 无论批准还是否决，都要重新入队：
+            #  批准 → 放行那一次危险动作 / 认定完成
+            #  否决 → 按 runtime 记下的黑名单或 Re-plan 理由，换一种做法继续
+            self._scheduler.submit(task, allow_preempt=False)
+            logger.info("任务 %s 的待确认事项已处理（approved=%s）", task_id, approved)
+            return task
 
     # ---- 注入 ----
 
@@ -234,115 +261,170 @@ class TaskManager:
         所以除了要过专属置信度门槛，还必须由调用方显式传 ``allow_disruptive=True``
         放行；否则返回 ``NEEDS_CONFIRMATION``，什么都不会改（V2.1 §九）。
         """
-        current = self.get(current_task_id) if current_task_id else self.active_task()
+        # V2.4 §三：整段「读当前任务 → 判关系 → 改写 → 落盘」都在同一把锁里。
+        # 以前是「先读、放锁、过一会儿再改」，中间任何一步被并发写插进来，
+        # 判断都会失效（TOCTOU）。
+        with self._mutation_lock:
+            current = self.get(current_task_id) if current_task_id else self.active_task()
 
-        # 重复检测要把当前任务也算进来：用户对同一个任务又说一遍同样的话，
-        # 应当判为 duplicate 而不是当作新的子步骤再跑一遍
-        candidates = [t for t in self.list_all() if not t.is_terminal]
-        relation = self._classifier.classify(instruction, current=current, candidates=candidates)
+            # 重复检测要把当前任务也算进来：用户对同一个任务又说一遍同样的话，
+            # 应当判为 duplicate 而不是当作新的子步骤再跑一遍
+            candidates = [t for t in self.list_all() if not t.is_terminal]
+            relation = self._classifier.classify(instruction, current=current, candidates=candidates)
 
-        if relation.relation is TaskRelation.DUPLICATE:
-            target = self.get(relation.affected_task_id) if relation.affected_task_id else None
-            return InjectResult(
-                relation=relation,
-                action=InjectAction.DUPLICATE_IGNORED,
-                task=target,
-                message=f"与已有任务重复，不重复执行：{relation.reason}",
-            )
-
-        if (
-            relation.relation is TaskRelation.SUBTASK
-            and relation.is_actionable
-            and current is not None
-            and not current.is_terminal
-        ):
-            step = self._merge_subtask(current, instruction)
-            self._store.save(current)
-            return InjectResult(
-                relation=relation,
-                action=InjectAction.MERGED,
-                task=current,
-                message=f"并入任务 {current.id}，插入步骤 {step.id}：{instruction}",
-            )
-
-        if (
-            relation.relation is TaskRelation.SUPER_TASK
-            and relation.is_actionable
-            and current is not None
-            and not current.is_terminal
-        ):
-            if relation.requires_second_confirmation and not allow_disruptive:
+            if relation.relation is TaskRelation.DUPLICATE:
+                target = self.get(relation.affected_task_id) if relation.affected_task_id else None
                 return InjectResult(
                     relation=relation,
-                    action=InjectAction.NEEDS_CONFIRMATION,
-                    task=current,
-                    message=(
-                        f"判定为父任务但改写目标不可逆，需二次确认后再执行"
-                        f"（{relation.describe()}，任务 {current.id} 未被修改）"
-                    ),
+                    action=InjectAction.DUPLICATE_IGNORED,
+                    task=target,
+                    message=f"与已有任务重复，不重复执行：{relation.reason}",
                 )
 
-            # 新指令是「父任务」：重构当前任务目标，而不是另起一个任务（V2.1 §六/§七）。
-            current.instruction = instruction
-            current.version += 1            # 版本+1，旧 Checkpoint / 旧计划随之失效
-            current.plan = []               # 旧计划作废，恢复时重新规划新目标
-            current.plan_version += 1       # 计划也换了版本，便于回溯「这条恢复点属于哪一版计划」
-            current.checkpoint_id = None    # 旧 Checkpoint 因版本不匹配自动失效
-            current.priority = TaskPriority.HIGH
-            self._store.save(current)
-            if current.status is TaskStatus.RUNNING:
-                # 正在跑：请求**这一个任务**在下一个安全点让位（V2.2 §二）。
-                # 必须带 task_id —— 不带的话 scheduler 会退化成「所有车道都让出」，
-                # 多设备场景下 A 任务被改写会把 B 设备上毫不相干的任务也一起打断。
-                self._scheduler.preempt_running(current.id)
-            else:
-                self._scheduler.submit(current, allow_preempt=False, allowed_devices=allowed_devices)
-            return InjectResult(
-                relation=relation,
-                action=InjectAction.SUPERSEDED,
-                task=current,
-                message=f"任务 {current.id} 被重构为新目标（v{current.version}）：{instruction}",
+            if (
+                relation.relation is TaskRelation.SUBTASK
+                and relation.is_actionable
+                and current is not None
+            ):
+                merged = self._rewrite_authoritative(
+                    current, lambda base: self._merge_subtask(base, instruction)
+                )
+                if merged is not None:
+                    task_now, step = merged
+                    return InjectResult(
+                        relation=relation,
+                        action=InjectAction.MERGED,
+                        task=task_now,
+                        message=f"并入任务 {task_now.id}，插入步骤 {step.id}：{instruction}",
+                    )
+                # 改写失败（任务已结束 / 期间被别人改过）就落到下面「另起任务」：
+                # 用户说的事照样要做，只是不再往一条已经结束的任务里塞步骤。
+
+            if (
+                relation.relation is TaskRelation.SUPER_TASK
+                and relation.is_actionable
+                and current is not None
+            ):
+                if relation.requires_second_confirmation and not allow_disruptive:
+                    return InjectResult(
+                        relation=relation,
+                        action=InjectAction.NEEDS_CONFIRMATION,
+                        task=current,
+                        message=(
+                            f"判定为父任务但改写目标不可逆，需二次确认后再执行"
+                            f"（{relation.describe()}，任务 {current.id} 未被修改）"
+                        ),
+                    )
+
+                # 新指令是「父任务」：重构当前任务目标，而不是另起一个任务（V2.1 §六/§七）。
+                # 改写落在**磁盘权威快照**上并用 revision 做 CAS（V2.4 §二）：
+                # 若这期间 Runtime 已经把任务判成 DONE，这次改写会失败，而不是把
+                # 「status=done + instruction=新目标」写进磁盘。
+                def _supersede(base: Task) -> None:
+                    base.instruction = instruction
+                    base.version += 1             # 版本+1，旧 Checkpoint / 旧计划随之失效
+                    base.plan = []                # 旧计划作废，恢复时重新规划新目标
+                    base.plan_version += 1        # 计划也换版本，便于回溯恢复点属于哪版计划
+                    base.checkpoint_id = None     # 旧 Checkpoint 因版本不匹配自动失效
+                    base.priority = TaskPriority.HIGH
+
+                rewritten = self._rewrite_authoritative(current, _supersede)
+                if rewritten is not None:
+                    task_now, _ = rewritten
+                    if task_now.status is TaskStatus.RUNNING:
+                        # 正在跑：请求**这一个任务**在下一个安全点让位（V2.2 §二）。
+                        # 必须带 task_id —— 不带的话 scheduler 会退化成「所有车道都让出」，
+                        # 多设备场景下 A 任务被改写会把 B 设备上毫不相干的任务也一起打断。
+                        self._scheduler.preempt_running(task_now.id)
+                    else:
+                        self._scheduler.submit(
+                            task_now, allow_preempt=False, allowed_devices=allowed_devices
+                        )
+                    return InjectResult(
+                        relation=relation,
+                        action=InjectAction.SUPERSEDED,
+                        task=task_now,
+                        message=f"任务 {task_now.id} 被重构为新目标（v{task_now.version}）：{instruction}",
+                    )
+                # 任务已经结束（或被并发改过）→ 不再改写，改为新建任务承接新目标。
+
+            new_priority = priority or (
+                TaskPriority.HIGH
+                if relation.relation in {TaskRelation.INTERRUPT, TaskRelation.SUPER_TASK}
+                else TaskPriority.NORMAL
+            )
+            new_task = self.create(
+                instruction,
+                budget=budget or TaskBudget.from_max_steps(max_steps),
+                priority=new_priority,
+                parent_task_id=current.id if relation.relation is TaskRelation.SUBTASK else None,
+                # 设备授权范围一路传下去（V2.2 §二）：未绑定的新任务只能落在被允许的设备上，
+                # 绝不能因为「没指定 serial」就漂到别人的设备上
+                allowed_devices=allowed_devices,
+                # 记下「它是被判成什么关系才产生的」，事后能回溯为什么它抢占了别人
+                relation_meta={
+                    "relation": relation.relation.value,
+                    "confidence": relation.confidence,
+                    "reason": relation.reason,
+                    "signals": relation.signals,
+                    "against_task_id": current.id if current else None,
+                },
             )
 
-        new_priority = priority or (
-            TaskPriority.HIGH
-            if relation.relation in {TaskRelation.INTERRUPT, TaskRelation.SUPER_TASK}
-            else TaskPriority.NORMAL
-        )
-        new_task = self.create(
-            instruction,
-            budget=budget or TaskBudget.from_max_steps(max_steps),
-            priority=new_priority,
-            parent_task_id=current.id if relation.relation is TaskRelation.SUBTASK else None,
-            # 设备授权范围一路传下去（V2.2 §二）：未绑定的新任务只能落在被允许的设备上，
-            # 绝不能因为「没指定 serial」就漂到别人的设备上
-            allowed_devices=allowed_devices,
-            # 记下「它是被判成什么关系才产生的」，事后能回溯为什么它抢占了别人
-            relation_meta={
-                "relation": relation.relation.value,
-                "confidence": relation.confidence,
-                "reason": relation.reason,
-                "signals": relation.signals,
-                "against_task_id": current.id if current else None,
-            },
-        )
+            preempted = (
+                current is not None
+                and not current.is_terminal
+                and self._maybe_preempt(current, new_task)
+            )
 
-        preempted = (
-            current is not None
-            and not current.is_terminal
-            and self._maybe_preempt(current, new_task)
-        )
+            return InjectResult(
+                relation=relation,
+                action=InjectAction.PREEMPTED if preempted else InjectAction.SPAWNED,
+                task=new_task,
+                message=(
+                    f"新建任务 {new_task.id}（{new_priority.value}）"
+                    + (f"，已请求打断 {current.id}" if preempted and current else "")
+                    + f"：{relation.reason}"
+                ),
+            )
 
-        return InjectResult(
-            relation=relation,
-            action=InjectAction.PREEMPTED if preempted else InjectAction.SPAWNED,
-            task=new_task,
-            message=(
-                f"新建任务 {new_task.id}（{new_priority.value}）"
-                + (f"，已请求打断 {current.id}" if preempted and current else "")
-                + f"：{relation.reason}"
-            ),
-        )
+    def _rewrite_authoritative(
+        self, current: Task, mutate: Callable[[Task], Any]
+    ) -> tuple[Task, Any] | None:
+        """改写「当前任务」：内存取最新真相，落盘用 revision 做 CAS（V2.4 §二）。
+
+        为什么要 CAS，而不是「改完直接 save」：`current` 是调度器内存里那份**实时**
+        对象，可能比磁盘新（比如刚被判为 RUNNING 还没落盘），所以改写必须作用在它
+        身上；但「检查过不是终态」与「真正写入」之间隔着一段时间，Runtime 完全可能
+        在这段时间里把任务判成 DONE 并落盘。于是写入时带上磁盘 revision 校验：
+        期间被人写过就抛 ConcurrentModificationError，本次改写不生效，并把内存改动
+        回滚掉（否则内存改了、磁盘没改，两边永久分叉）。
+
+        返回 `(任务, mutate 的返回值)`；任务已结束 / 快照读不到 / revision 冲突时返回
+        None，调用方据此退化成「另起一个新任务」，而不是去改写一条已结束的任务。
+        """
+        on_disk = self._store.load(current.id)
+        if on_disk is None:
+            logger.warning("任务 %s 的持久化快照不可用，本次改写不生效", current.id)
+            return None
+        if current.is_terminal or on_disk.is_terminal:
+            logger.info(
+                "任务 %s 已处于终态（内存 %s / 磁盘 %s），本次改写不生效",
+                current.id,
+                current.status.value,
+                on_disk.status.value,
+            )
+            return None
+        backup = current.model_copy(deep=True)
+        try:
+            result = mutate(current)
+            self._store.save(current, expected_revision=on_disk.revision)
+        except ConcurrentModificationError as exc:
+            for name in type(backup).model_fields:
+                setattr(current, name, getattr(backup, name))
+            logger.warning("任务 %s 在改写期间被并发修改，本次改写不生效：%s", current.id, exc)
+            return None
+        return current, result
 
     # ---- 内部 ----
 
