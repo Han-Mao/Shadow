@@ -5,7 +5,7 @@ import json
 import os
 import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from models.exceptions import CorruptDataError
 
@@ -29,25 +29,49 @@ class JsonStore:
         return self.root / f"{safe}.json"
 
     def write(self, key: str, payload: Any) -> None:
+        with self._lock:
+            self._write_unlocked(key, payload)
+
+    def read(self, key: str) -> Any | None:
+        with self._lock:
+            return self._read_unlocked(key)
+
+    def update_atomic(self, key: str, mutate: Callable[[Any | None], Any]) -> Any | None:
+        """在**同一把锁**里完成「读 → 改 → 写」（V2.5 §一）。
+
+        为什么必须合成一个方法：`read()` 与 `write()` 各自加锁，只能保证「单次」
+        操作原子；跨两步的 CAS（读 revision → 比较 → 写 revision+1）中间仍有窗口，
+        两个写者可以**都通过比较**，然后后写的静默覆盖先写的。只有把三步放进同一个
+        临界区，才叫真正的乐观并发控制。
+
+        `mutate` 拿到当前 payload（键不存在时为 None），返回要写入的新 payload；
+        返回 None 表示放弃写入。异常原样抛给调用方（锁由 `with` 释放）。
+        """
+        with self._lock:
+            new_payload = mutate(self._read_unlocked(key))
+            if new_payload is None:
+                return None
+            self._write_unlocked(key, new_payload)
+            return new_payload
+
+    def _read_unlocked(self, key: str) -> Any | None:
+        path = self._path(key)
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            # V2.3：损坏条目必须被看见，而不是假装不存在。
+            raise CorruptDataError(key, str(path), f"JSON 解析失败：{exc}") from exc
+        except OSError as exc:
+            raise CorruptDataError(key, str(path), f"读取失败：{exc}") from exc
+
+    def _write_unlocked(self, key: str, payload: Any) -> None:
         path = self._path(key)
         text = json.dumps(payload, ensure_ascii=False, indent=2, default=str)
         tmp = path.with_suffix(".json.tmp")
-        with self._lock:
-            tmp.write_text(text, encoding="utf-8")
-            os.replace(tmp, path)
-
-    def read(self, key: str) -> Any | None:
-        path = self._path(key)
-        with self._lock:
-            if not path.exists():
-                return None
-            try:
-                return json.loads(path.read_text(encoding="utf-8"))
-            except json.JSONDecodeError as exc:
-                # V2.3：损坏条目必须被看见，而不是假装不存在。
-                raise CorruptDataError(key, str(path), f"JSON 解析失败：{exc}") from exc
-            except OSError as exc:
-                raise CorruptDataError(key, str(path), f"读取失败：{exc}") from exc
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
 
     def keys(self) -> list[str]:
         with self._lock:

@@ -60,7 +60,7 @@ VLM 决定「下一步点哪里」，调度与检查点决定「多件事怎么�
 │   ├── replay.py           # 任务回放：事件流 → 时间轴 + 「值得注意的地方」
 │   └── scheduler.py        # 优先级队列 / 抢占 / 恢复
 ├── models/
-│   ├── task.py             # Task + 10 态状态机（8 运行态 + DEGRADED / DEVICE_UNAVAILABLE）+ 优先级 + 预算 + 版本号 + revision
+│   ├── task.py             # Task + 11 态状态机（含 DEGRADED / DEVICE_UNAVAILABLE / CANCEL_REQUESTED）+ 优先级 + 预算 + 版本号 + revision
 │   ├── task_step.py        # TaskStep：计划是可追踪的状态机（只描述计划）
 │   ├── step_attempt.py     # StepAttempt：一次尝试的经过（动作/结果/错误分类/证据层）
 │   ├── task_relation.py    # TaskRelation：5 种任务关系
@@ -85,7 +85,7 @@ VLM 决定「下一步点哪里」，调度与检查点决定「多件事怎么�
 ├── scripts/
 │   ├── demo_preemption.py  # 抢占恢复演示（离线可跑）
 │   └── replay_task.py      # 命令行回放一个任务的事件流
-└── tests/                  # 412 个离线用例
+└── tests/                  # 424 个离线用例
 ```
 
 ## 职责边界
@@ -402,7 +402,7 @@ Scheduler
 等原设备回来（V2.3 起），改派等于把任务上下文悄悄丢到另一台手机上。
 
 单设备时只有一条车道，与旧实现逐字等价——这一点由当时的 257 个既有测试守着
-（V2.4 修复轮之后合计 412 个）。
+（V2.5 修复轮之后合计 424 个）。
 
 ### 多设备暴露出的两个正确性问题
 
@@ -506,7 +506,7 @@ VLM → DONE_REQUEST → GoalVerifier → 确认 / 打回继续做 / 转人工�
 结论：文档列了 11 小节、其中 10 条是可核对的技术项，**1 条已在 V2.3 修掉**
 （状态枚举补齐，#5 依赖它，随之消解），**其余 8 条仍然存在**。
 
-### 状态机现在是 10 态
+### 那一轮把状态机补到 10 态
 
 ```text
 CREATED → QUEUED → RUNNING ─┬→ DONE / FAILED / CANCELLED   （终态，不可逆）
@@ -587,6 +587,56 @@ CREATED → QUEUED → RUNNING ─┬→ DONE / FAILED / CANCELLED   （终态�
 | `/confirm` 令牌格式 | 由 `<expires>.<sig>` 变为 `<expires>.<jti>.<sig>`；**旧格式令牌立即失效**（TTL 最长 300 秒，重新读取待确认事项即可） |
 | `GET /tasks/{id}` 对损坏任务的响应 | 数据已隔离的任务不再返回 404，改为 200 + `status=recovery_error`（附 `quarantined_as` / `recoverable`）。**「不存在」仍然是 404**——两种故障语义被分开 |
 | `GET /tasks` 新增 `corrupt` 字段 | 列出已隔离（损坏）的任务 id，避免它们从系统里静默消失 |
+
+## V2.5 修复轮（依据 `v2.5审查建议.md`）
+
+这一轮审的是**并发正确性**，10 条里 9 条成立（另 1 条是上一轮我自己埋的坑，见 #4）。
+
+| # | 审查项 | 现状核对 | 改动 | 落点 |
+|---|---|---|---|---|
+| 1 | P0 CAS 不是原子的，可能两个写者都通过 | **存在**：`read()` 与 `write()` 各加各的锁，中间留了窗口 | 新增 `JsonStore.update_atomic()`，把「读 - 比较 - 递增 - 原子替换」放进同一临界区 | `storage/json_store.py`、`storage/task_store.py` |
+| 2 | P0 改写后 save 失败不回滚内存 | **存在**：只捕获 `ConcurrentModificationError` | 任何 save 异常都先按 `model_copy(deep=True)` 备份回滚，再抛出去 | `agent/task_manager.py` |
+| 3 | P1 损坏任务「第一次 404、第二次才 recovery_error」 | **存在**：隔离是惰性的，而索引只活在内存 | 启动时扫描 `quarantine/` 重建索引 + 单次请求内兜底复查 | `storage/task_store.py`、`api/server.py` |
+| 4 | P1 `recovery_error` 检查在授权之前 → 存在性泄露 | **存在**（上一轮引入的） | 只有不受设备范围限制的令牌能看；受限令牌统一 404，`corrupt` 清单同样收敛 | `api/server.py` |
+| 5 | P1 `GET /tasks` 读磁盘、`GET /tasks/{id}` 读内存 | **存在** | 新增 `Scheduler.tracked_tasks()`；`TaskManager.list_all()` 合并 live 优先 | `agent/scheduler.py`、`agent/task_manager.py` |
+| 6 | P1 `complete()` / `fail()` 可绕过 Runtime 生命周期 | **存在** | 两者对 RUNNING 任务拒绝改写（返回 None）；Runtime 安全点补终态自检 | `agent/task_manager.py`、`agent/runtime.py`、`agent/scheduler.py` |
+| 7 | P1 `CANCELLED ≠ 副作用已经停止` | **存在** | 新增 `CANCEL_REQUESTED`：运行中先落请求，安全点才落 `CANCELLED`；重启时直接落定 | `models/task.py`、`agent/scheduler.py`、`agent/runtime.py` |
+| 8 | P1 `DEVICE_UNAVAILABLE` 缺恢复触发 | **存在** | `DevicePool.subscribe()` + `Scheduler.on_device_available(serial)`：设备上线自动恢复**它名下**的任务，必要时补建车道 | `device/pool.py`、`agent/scheduler.py` |
+| 9 | P2 `_drop_from_queues` 不清理 `_device_unavailable` | **存在** | 一起清 | `agent/scheduler.py` |
+| 10 | P2 `_completed` 会重复追加 | **存在**（而且无限增长） | 换成 `deque(maxlen=200)` + `_mark_completed()` 去重 | `agent/scheduler.py` |
+
+### 状态机现在是 11 态
+
+```text
+CREATED → QUEUED → RUNNING ─┬→ DONE / FAILED / CANCELLED   （终态，不可逆）
+                            ├→ PAUSED
+                            ├→ WAITING
+                            ├→ CANCEL_REQUESTED → CANCELLED / DONE
+                            ├→ DEGRADED                （终态）
+                            └→ DEVICE_UNAVAILABLE → QUEUED
+```
+
+`CANCEL_REQUESTED` 是这一轮新增的**意图态**：强杀线程不可能安全地「在动作执行到一半」
+停下，所以「请求取消」和「已经停止」必须是两个状态。点击「发送」之后立刻取消时，
+消息其实已经发出去了——状态停在 `CANCEL_REQUESTED` 才如实表达了这一点。
+
+### 行为变化提醒
+
+- **`POST /tasks/{id}/cancel` 对运行中的任务返回 `cancel_requested`**，等 Runtime 走到
+  安全点才变 `cancelled`。指望「点一下就立刻没有任何副作用」是不可能的，状态如实反映。
+- **`complete()` / `fail()` 不再接受 RUNNING 任务**（内部 API，当前没有 HTTP 入口）。
+  要让运行中的任务结束，请走 `/cancel`。
+- **设备重新上线会自动恢复它名下等待的任务**（`DEVICE_UNAVAILABLE → QUEUED`），
+  不再依赖重启服务或人工 resume。
+- **`GET /tasks` 与 `GET /tasks/{id}` 的状态现在一致**（都优先取调度器内存的实时状态）。
+
+### API 变更
+
+| 变更 | 说明 |
+|---|---|
+| `GET /tasks/{id}` 对损坏任务的可见性 | 只有**不受设备范围限制**的令牌能看到 `status=recovery_error`；受限令牌统一 404 |
+| `GET /tasks` 的 `corrupt` 字段 | 对受限令牌返回空列表（同上理由） |
+| `POST /tasks/{id}/cancel` | 运行中的任务状态变为 `cancel_requested`，安全点后（或重启时）落定 `cancelled` |
 
 ## 快速开始
 
@@ -704,7 +754,7 @@ pip install -r requirements.txt
 python -m pytest -q
 ```
 
-**412 个用例，全部离线**：不需要 adb、模拟器或 API Key。
+**424 个用例，全部离线**：不需要 adb、模拟器或 API Key。
 
 | 文件 | 覆盖 |
 |---|---|

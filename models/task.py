@@ -25,6 +25,12 @@ class TaskStatus(str, Enum):
     DEGRADED = "degraded"
     # 任务绑定的设备当前不可用，等待原设备恢复而不是静默改派（V2.3）。
     DEVICE_UNAVAILABLE = "device_unavailable"
+    # 取消请求已收到，但设备侧可能还在动（V2.5 §七）。**不是终态**：
+    # 它表达的是「请求已下达」，真正的停止发生在 Runtime 的下一个安全点——
+    # 强杀线程不可能安全地「在动作执行到一半」停下，所以必须把
+    # 「请求取消」和「已经停止」分成两个状态，否则 CANCELLED 会被误读成
+    # 「副作用已停止」，而点击「发送」之后立刻取消时消息其实已经发出去了。
+    CANCEL_REQUESTED = "cancel_requested"
     DONE = "done"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -55,6 +61,7 @@ ACTIVE_STATUSES = frozenset(
         TaskStatus.PAUSED,
         TaskStatus.WAITING,
         TaskStatus.DEVICE_UNAVAILABLE,
+        TaskStatus.CANCEL_REQUESTED,
     }
 )
 
@@ -87,32 +94,39 @@ ALLOWED_TRANSITIONS: dict["TaskStatus", frozenset["TaskStatus"]] = {
     TaskStatus.CREATED: frozenset(
         {TaskStatus.QUEUED, TaskStatus.RUNNING, TaskStatus.PAUSED,
          TaskStatus.WAITING, TaskStatus.DEGRADED, TaskStatus.DEVICE_UNAVAILABLE,
-         TaskStatus.FAILED, TaskStatus.CANCELLED,
+         TaskStatus.CANCEL_REQUESTED, TaskStatus.FAILED, TaskStatus.CANCELLED,
          TaskStatus.DONE, TaskStatus.CREATED}
     ),
     TaskStatus.QUEUED: frozenset(
         {TaskStatus.RUNNING, TaskStatus.PAUSED, TaskStatus.WAITING,
-         TaskStatus.DEGRADED, TaskStatus.DEVICE_UNAVAILABLE,
+         TaskStatus.DEGRADED, TaskStatus.DEVICE_UNAVAILABLE, TaskStatus.CANCEL_REQUESTED,
          TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.DONE, TaskStatus.QUEUED}
     ),
     TaskStatus.RUNNING: frozenset(
         {TaskStatus.QUEUED, TaskStatus.PAUSED, TaskStatus.WAITING,
-         TaskStatus.DEGRADED, TaskStatus.DEVICE_UNAVAILABLE,
+         TaskStatus.DEGRADED, TaskStatus.DEVICE_UNAVAILABLE, TaskStatus.CANCEL_REQUESTED,
          TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.RUNNING}
     ),
     TaskStatus.PAUSED: frozenset(
         {TaskStatus.QUEUED, TaskStatus.RUNNING, TaskStatus.WAITING,
-         TaskStatus.DEGRADED, TaskStatus.DEVICE_UNAVAILABLE,
+         TaskStatus.DEGRADED, TaskStatus.DEVICE_UNAVAILABLE, TaskStatus.CANCEL_REQUESTED,
          TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.PAUSED}
     ),
     TaskStatus.WAITING: frozenset(
         {TaskStatus.QUEUED, TaskStatus.RUNNING, TaskStatus.PAUSED,
-         TaskStatus.DEGRADED, TaskStatus.DEVICE_UNAVAILABLE,
+         TaskStatus.DEGRADED, TaskStatus.DEVICE_UNAVAILABLE, TaskStatus.CANCEL_REQUESTED,
          TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.WAITING}
     ),
     TaskStatus.DEVICE_UNAVAILABLE: frozenset(
-        {TaskStatus.QUEUED, TaskStatus.DEGRADED,
+        {TaskStatus.QUEUED, TaskStatus.DEGRADED, TaskStatus.CANCEL_REQUESTED,
          TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.DEVICE_UNAVAILABLE}
+    ),
+    # 取消请求：等 Runtime 在安全点落定。正常落成 CANCELLED；退出途中出错可以是
+    # FAILED / DEGRADED；设备重新可用时也允许回到 QUEUED（取消被打断）；
+    # DONE 也是合法的——任务可能恰好抢在安全点之前跑完了，那比「已取消」更接近事实。
+    TaskStatus.CANCEL_REQUESTED: frozenset(
+        {TaskStatus.CANCELLED, TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.DEGRADED,
+         TaskStatus.QUEUED, TaskStatus.CANCEL_REQUESTED}
     ),
     # 终态：不可逆
     TaskStatus.DONE: frozenset({TaskStatus.DONE}),

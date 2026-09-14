@@ -9,11 +9,15 @@
 """
 from __future__ import annotations
 
+import logging
+import threading
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterator
+from typing import TYPE_CHECKING, Callable, Iterator
 
 if TYPE_CHECKING:  # 只用于类型标注，避免 device 包内部的循环导入
     from .session import DeviceSession
+
+logger = logging.getLogger(__name__)
 
 
 class UnknownDeviceError(KeyError):
@@ -29,17 +33,39 @@ class DevicePool:
 
     线程模型：注册发生在启动装配阶段，之后基本只读；
     但 `snapshot()` 会被 API 线程调用，所以内部仍加锁。
+
+    V2.5 §八 起还可以订阅「设备可用」事件：设备掉线不再静默改派之后，等待原设备
+    回来的任务必须有**自动**恢复的触发点，否则会永久卡在 `DEVICE_UNAVAILABLE`。
     """
 
     def __init__(self, sessions: "Iterator[DeviceSession] | list[DeviceSession] | None" = None) -> None:
         self._sessions: dict[str, "DeviceSession"] = {}
+        self._listeners: list[Callable[[str], None]] = []
+        self._lock = threading.RLock()
         for session in sessions or []:
             self.register(session)
 
+    def subscribe(self, listener: Callable[[str], None]) -> None:
+        """订阅「某台设备变为可用」。`listener(serial)` 在注册该设备时被调用。"""
+        with self._lock:
+            self._listeners.append(listener)
+
     def register(self, session: "DeviceSession") -> "DeviceSession":
         serial = session.serial or f"device-{len(self._sessions) + 1}"
-        self._sessions[serial] = session
+        with self._lock:
+            self._sessions[serial] = session
+        self._notify_available(serial)
         return session
+
+    def _notify_available(self, serial: str) -> None:
+        """通知监听器「这台设备可用了」。监听器出错不能影响设备注册本身。"""
+        with self._lock:
+            listeners = list(self._listeners)
+        for listener in listeners:
+            try:
+                listener(serial)
+            except Exception:  # noqa: BLE001 - 设备注册不能被调度器故障拖垮
+                logger.warning("设备可用监听器处理 %s 时失败", serial, exc_info=True)
 
     def get(self, serial: str | None) -> "DeviceSession | None":
         if serial is None:

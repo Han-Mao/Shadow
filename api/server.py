@@ -205,6 +205,31 @@ def require_task_access(task_id: str, request: Request):
     return task
 
 
+def recovery_error_payload(task_id: str) -> dict:
+    """损坏任务的可辨识响应（V2.4 §十 / V2.5 §三、§四）。
+
+    「不存在」与「数据坏了」是两种故障：前者多半是 id 写错，后者需要人工介入。
+    但损坏任务没有 device_serial、做不了对象级授权，所以调用方必须先过
+    `may_observe_recovery()` —— 无权的调用方统一走 404，避免存在性泄露。
+    """
+    return {
+        "id": task_id,
+        "status": RECOVERY_ERROR,
+        "detail": "任务数据损坏，已隔离到任务存储的 quarantine/ 目录，不会被调度器恢复",
+        "quarantined_as": f"{task_id}.corrupt.json",
+        "recoverable": False,
+    }
+
+
+def may_observe_recovery(request: Request) -> bool:
+    """当前调用方能不能看到「损坏任务」这种特殊状态（V2.5 §四）。
+
+    只有**不受设备范围限制**的令牌可以。受限令牌看不到任务归属，放行就等于在
+    对象级授权上开一个旁路——「知道 id 就能探测该任务是否存在、是否损坏」。
+    """
+    return current_principal(request).allowed_serials() is None
+
+
 def allowed_devices_for(request: Request) -> frozenset[str] | None:
     """当前调用方的设备授权范围（None = 不限）。要传给调度器，而不是只用来判断。"""
     return current_principal(request).allowed_serials()
@@ -646,7 +671,8 @@ def list_tasks(request: Request):
         "count": len(visible),
         # V2.4 §十：损坏任务不会出现在 tasks 里（它根本反序列化不出来），但必须让调用方
         # 知道「有这么一条」，否则它就从系统里静默消失了——只看 count 是看不出来的。
-        "corrupt": sorted(task_store.corrupt_ids()),
+        # V2.5 §四：受限令牌看不到这份清单（无法判断归属，宁可少给）。
+        "corrupt": sorted(task_store.corrupt_ids()) if may_observe_recovery(request) else [],
     }
 
 
@@ -654,18 +680,16 @@ def list_tasks(request: Request):
 def get_task(task_id: str, request: Request):
     """任务详情。
 
-    V2.4 §十：如果这条任务的数据已经损坏并被隔离，返回 `status=recovery_error`
-    而不是 404——「不存在」和「数据坏了」是完全不同的故障：前者多半是 id 写错，
-    后者需要人工介入。令牌鉴权仍然由中间件负责，不受这里影响。
+    V2.5 §三 / §四：损坏任务要能被识别，但**只能被有权的人识别**。
+
+    - 先探一次 `manager.get()`：隔离是惰性的，可能就发生在这次读取里；不复查的话
+      第一次请求会 404、第二次才 recovery_error，前后不一致。
+    - `recovery_error` 只对不受设备范围限制的令牌返回，受限令牌一律 404 ——
+      损坏任务没有 device_serial，做不了对象级授权，放行就等于存在性泄露。
     """
-    if task_store.is_corrupt(task_id):
-        return {
-            "id": task_id,
-            "status": RECOVERY_ERROR,
-            "detail": "任务数据损坏，已隔离到任务存储的 quarantine/ 目录，不会被调度器恢复",
-            "quarantined_as": f"{task_id}.corrupt.json",
-            "recoverable": False,
-        }
+    task = manager.get(task_id)
+    if task is None and task_store.is_corrupt(task_id) and may_observe_recovery(request):
+        return recovery_error_payload(task_id)
     task = require_task_access(task_id, request)
     principal = current_principal(request)
     payload = task.model_dump(mode="json")

@@ -26,7 +26,7 @@ from models.retry import (
     classify_error,
 )
 from models.state import Observation, StepOutcome
-from models.task import Task, TaskStatus
+from models.task import TERMINAL_STATUSES, Task, TaskStatus
 from models.task_step import StepStatus, TaskStep
 from models.verification import ActionDispatch, ActionEffect, DispatchStatus, GoalVerification
 from storage.event_log import (
@@ -177,8 +177,12 @@ class AgentRuntime:
 
     def run(self, task: Task) -> RunOutcome:
         """把一个任务跑到结束、失败或被挂起。"""
-        if task.status is TaskStatus.CANCELLED:
-            # 调度器已经取消了它，不要用 mark(RUNNING) 把状态又改回去
+        if task.status in (TaskStatus.CANCELLED, TaskStatus.CANCEL_REQUESTED):
+            # 调度器已经（请求）取消了它，不要用 mark(RUNNING) 把状态又改回去。
+            # V2.5 §七：CANCEL_REQUESTED 只表示「请求已下达」；但本轮压根没开始执行，
+            # 不存在副作用疑云，所以在这里直接落定 CANCELLED。
+            if task.status is TaskStatus.CANCEL_REQUESTED:
+                task.mark(TaskStatus.CANCELLED, source="runtime")
             logger.info("任务 %s 已取消，跳过执行", task.id)
             return RunOutcome.CANCELLED
 
@@ -226,7 +230,21 @@ class AgentRuntime:
     ) -> RunOutcome:
         while True:
             # ---- 安全点 ----
-            if task.status is TaskStatus.CANCELLED:
+            if task.status in TERMINAL_STATUSES:
+                # V2.5 §六：终态意味着「不该再产生任何副作用」。正常路径走不到这里
+                # （外部已经不允许把 RUNNING 改成终态），但这是最后一道闸：万一有人绕过
+                # 去，我们宁可在这里退出，也不要在一条已经结束的任务上继续点手机。
+                logger.warning(
+                    "任务 %s 在执行中被置为终态（%s），立即停止产生副作用",
+                    task.id,
+                    task.status.value,
+                )
+                return RunOutcome.CANCELLED
+            if task.status is TaskStatus.CANCEL_REQUESTED:
+                # V2.5 §七：CANCEL_REQUESTED 表示「请求已下达」，走到安全点才算真停。
+                # 此刻设备侧可能刚 dispatch 过一个动作——所以退出路径要如实区分
+                # 「动作发出前就停了」还是「动作发出后才发现要停」，审计才读得懂。
+                task.mark(TaskStatus.CANCELLED, source="runtime")
                 logger.info("任务 %s 已被取消，退出执行", task.id)
                 return RunOutcome.CANCELLED
             if task.status is TaskStatus.PAUSED:

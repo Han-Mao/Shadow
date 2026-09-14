@@ -131,7 +131,17 @@ class TaskManager:
         return self._store.load(task_id)
 
     def list_all(self) -> list[Task]:
-        return self._store.list_all()
+        """列出全部任务，**live 状态优先**（V2.5 §五）。
+
+        磁盘只是兜底，调度器内存才是当前进程的实时真相：任务刚被判 RUNNING 但还没
+        落盘时，只读磁盘会让 `GET /tasks` 显示 queued，而 `GET /tasks/{id}`（走
+        `get()`，优先内存）显示 running —— 同一时刻两个答案，排查 Agent 时最怕这个。
+        所以这里跟 `get()` 用同一套优先级，并对齐 `revision` 较大的那份。
+        """
+        merged: dict[str, Task] = {t.id: t for t in self._scheduler.tracked_tasks()}
+        for task in self._store.list_all():
+            merged.setdefault(task.id, task)
+        return sorted(merged.values(), key=lambda t: t.created_at)
 
     def active_task(self) -> Task | None:
         """当前正在执行的任务（多设备时返回优先级最高的那个）。
@@ -153,12 +163,20 @@ class TaskManager:
     def complete(self, task_id: str) -> Task | None:
         """把任务标记为完成（外部入口）。
 
-        V2.4 §三：与 inject 共用 `_mutation_lock`——「读状态 → 判断能不能改 →
-        改 → 落盘」是四步，任何两步之间被并发写插进来，判断就失效了。
+        V2.4 §三：与 inject 共用 `_mutation_lock`。
+
+        V2.5 §六：**不接受正在运行的任务**。Runtime 才是「任务做完了没有」的权威，
+        从外部把 RUNNING 直接改成 DONE 的话，Runtime 下一轮仍会继续 Observe / Think /
+        Act（`DONE → DONE` 是合法自迁移，终态硬闸拦不住），于是「DONE」不再意味着
+        「已经停止」。要让运行中的任务结束，请走 `/cancel`（安全点让出）或让它跑完。
+        返回 None 表示「这次调用什么都没做」。
         """
         with self._mutation_lock:
             task = self.get(task_id)
             if task is None:
+                return None
+            if task.status is TaskStatus.RUNNING:
+                logger.warning("任务 %s 正在执行，拒绝从外部直接标记完成（V2.5 §六）", task_id)
                 return None
             task.sync_current_step()
             task.mark(TaskStatus.DONE, source="task_manager")
@@ -166,9 +184,13 @@ class TaskManager:
             return task
 
     def fail(self, task_id: str) -> Task | None:
+        """把任务标记为失败（外部入口）。同样拒绝 RUNNING（V2.5 §六）。"""
         with self._mutation_lock:
             task = self.get(task_id)
             if task is None:
+                return None
+            if task.status is TaskStatus.RUNNING:
+                logger.warning("任务 %s 正在执行，拒绝从外部直接标记失败（V2.5 §六）", task_id)
                 return None
             task.mark(TaskStatus.FAILED, source="task_manager")
             self._store.save(task)
@@ -416,14 +438,27 @@ class TaskManager:
             )
             return None
         backup = current.model_copy(deep=True)
+
+        def _rollback() -> None:
+            # 回滚内存：否则内存已经改了、磁盘还是旧的，两边会永久分叉
+            for name in type(backup).model_fields:
+                setattr(current, name, getattr(backup, name))
+
         try:
             result = mutate(current)
             self._store.save(current, expected_revision=on_disk.revision)
         except ConcurrentModificationError as exc:
-            for name in type(backup).model_fields:
-                setattr(current, name, getattr(backup, name))
+            _rollback()
             logger.warning("任务 %s 在改写期间被并发修改，本次改写不生效：%s", current.id, exc)
             return None
+        except Exception:
+            # V2.5 §二：**任何** save 失败都要回滚，不能只处理 CAS 冲突。
+            # 磁盘满 / 权限 / 序列化失败时内存已经 mutate 过了（instruction 换了、
+            # plan 清空了），若直接抛出去，调用方拿到异常、内存却停在「新目标」——
+            # 正是我们一直在防的那条分叉。回滚之后再抛，让上层按普通故障处理。
+            _rollback()
+            logger.exception("任务 %s 改写后持久化失败，已回滚内存状态", current.id)
+            raise
         return current, result
 
     # ---- 内部 ----
