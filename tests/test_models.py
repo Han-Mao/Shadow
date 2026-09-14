@@ -1,9 +1,18 @@
 """V2 数据模型：任务状态机、步骤依赖、动作风险与指纹、Checkpoint。"""
 from __future__ import annotations
 
-from models.action import Action, ActionRisk, ActionType, Decision, Point
+from models.action import (
+    Action,
+    ActionEffectStatus,
+    ActionRisk,
+    ActionType,
+    Decision,
+    Point,
+)
 from models.checkpoint import Checkpoint
+from models.retry import ErrorClass
 from models.state import Observation, StepOutcome, compact_observations
+from models.step_attempt import AttemptOutcome
 from models.task import Task, TaskPriority, TaskStatus, priority_rank
 from models.task_relation import TaskRelation, TaskRelationResult
 from models.task_step import StepStatus, TaskStep, build_steps
@@ -98,6 +107,91 @@ def test_step_retry_budget():
 
     step.record_action(Action(type=ActionType.BACK))
     assert step.last_error is None  # 成功执行后清掉历史错误
+
+
+# ---------------------------------------------------------------- 计划 / 尝试拆分（§二十）
+
+
+def test_attempts_preserve_every_try_instead_of_overwriting():
+    """同一步骤试三次，三次的记录都要在。
+
+    这正是拆分的意义：以前 `last_action` / `last_error` 是单值字段，
+    第二次失败会把第一次的痕迹直接盖掉——而排查 Agent 的问题，
+    最需要的恰恰是「它试过哪些没用的办法」。
+    """
+    step = TaskStep(id="s1", goal="提交订单", max_retries=3)
+
+    first = step.record_failure("点错位置", action=Action(type=ActionType.TAP, value="提交"))
+    second = step.record_failure("按钮置灰", action=Action(type=ActionType.TAP, value="确认"))
+    third = step.record_failure("超时", action=Action(type=ActionType.TAP, value="再试"))
+
+    assert [a.number for a in step.attempts] == [1, 2, 3]
+    assert [a.error for a in step.attempts] == ["点错位置", "按钮置灰", "超时"]
+    assert len({a.id for a in step.attempts}) == 3, "每次尝试都要有自己的 id"
+    assert (first.id, second.id, third.id) != ("", "", "")
+
+    # 派生视图只看最后一次（不翻旧账），但历史本身留着
+    assert step.last_error == "超时"
+    assert step.attempt_count == 3
+    assert step.retry_count == 3
+
+
+def test_retry_count_counts_only_failures():
+    """只有失败才计入重试次数——成功的尝试不该消耗重试预算。"""
+    step = TaskStep(id="s1", goal="做事", max_retries=3)
+
+    step.record_action(Action(type=ActionType.BACK))
+    step.record_action(Action(type=ActionType.HOME))
+    assert step.attempt_count == 2
+    assert step.retry_count == 0
+    assert step.retryable
+
+    step.record_failure("失败了")
+    assert step.attempt_count == 3
+    assert step.retry_count == 1
+
+
+def test_success_after_failure_clears_last_error_but_keeps_the_record():
+    step = TaskStep(id="s1", goal="做事", max_retries=3)
+    step.record_failure("第一次失败")
+
+    step.record_action(Action(type=ActionType.BACK))
+
+    assert step.last_error is None, "成功之后就不该再报旧错"
+    assert step.retry_count == 1, "但失败次数仍然记着（重试预算已消耗）"
+    assert [a.outcome for a in step.attempts] == [AttemptOutcome.ERROR, AttemptOutcome.OK]
+
+
+def test_attempt_carries_error_class_and_effect_for_postmortem():
+    """事后要能回答「那次失败到底是设备抖动还是做法不对」。"""
+    step = TaskStep(id="s1", goal="做事", max_retries=3)
+    attempt = step.record_failure(
+        "页面没变",
+        action=Action(type=ActionType.TAP, value="提交"),
+        error_class=ErrorClass.ACTION_REJECTED,
+        effect=ActionEffectStatus.VERIFIED_FAILED,
+        layer="vlm",
+    )
+
+    assert attempt.error_class is ErrorClass.ACTION_REJECTED
+    assert attempt.effect is ActionEffectStatus.VERIFIED_FAILED
+    assert attempt.layer == "vlm"
+    assert attempt.action.value == "提交"
+    assert not attempt.succeeded
+
+
+def test_step_round_trips_through_json():
+    """尝试历史要能落盘再读回来，否则重启后「它试过什么」就断了。"""
+    step = TaskStep(id="s1", goal="做事", max_retries=3)
+    step.record_failure("失败了", action=Action(type=ActionType.TAP, value="提交"))
+    step.record_action(Action(type=ActionType.BACK), layer="vlm")
+
+    restored = TaskStep.model_validate(step.model_dump(mode="json"))
+
+    assert restored.attempt_count == 2
+    assert restored.retry_count == 1
+    assert restored.last_action.type is ActionType.BACK
+    assert restored.attempts[0].error == "失败了"
 
 
 def test_task_ids_are_unique():

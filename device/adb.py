@@ -4,8 +4,11 @@ from __future__ import annotations
 import re
 import subprocess
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterator
 
 DEFAULT_SERIAL = "emulator-5554"
 REMOTE_UI_DUMP = "/sdcard/window_dump.xml"
@@ -16,9 +19,21 @@ TYPE_SAFE_PATTERN = re.compile(r"^[a-zA-Z0-9_.@,/?! ]+$")
 # 容易演变成忙循环；上限防 VLM 返回天文数字把任务卡死
 DURATION_RANGE_MS = (1, 60_000)
 
+# 当前上下文的命令总预算截止时刻（monotonic 秒）。见 `deadline_budget`。
+_DEADLINE: ContextVar[float | None] = ContextVar("adb_deadline", default=None)
+
 
 class AdbError(RuntimeError):
     pass
+
+
+class AdbBudgetExhausted(AdbError):
+    """总预算用完——**不是**设备坏了，而是我们主动不再往下等。
+
+    单独一个类型是为了让上层能区分「设备真的出错」和「这次采集超预算了」：
+    后者重试一次往往就好了，前者重试没用。
+    """
+
 
 
 def escape_type_text(value: str) -> str:
@@ -36,24 +51,71 @@ def escape_type_text(value: str) -> str:
 class AdbController:
     # 所有命令统一携带 -s <serial>，从机制上保证不误触用户真机（§6.4）
     serial: str = DEFAULT_SERIAL
+
+    # 写类/交互类命令的超时（tap / text / am start …）
     timeout: float = 15.0
+
+    # 采集类命令的超时（截图 / dump / dumpsys）。
+    #
+    # 刻意比写类更紧：采集卡住时**继续干等没有任何收益**——任务不会因为多等 10 秒
+    # 就拿到页面，反而会把「让出设备」这个安全点一直往后拖，堵住高优先级任务。
+    # 写类不同：`am start` 拉冷启动的 App 确实可能慢，等一等是有意义的。
+    read_timeout: float = 6.0
 
     def _base(self) -> list[str]:
         return ["adb", "-s", self.serial]
 
-    def _run(self, args: list[str], *, text: bool = True) -> subprocess.CompletedProcess:
+    @contextmanager
+    def deadline_budget(self, seconds: float) -> Iterator[None]:
+        """给这一段内的**所有** adb 调用加一个总预算（V2.1 §十四）。
+
+        为什么需要它：单个命令早就有超时（15s），但一次采集要跑好几个命令
+        （截图 + dumpsys×2 + rm + uiautomator dump + cat = 6 条），
+        各自等 15s 的话最坏就是 90 秒——高优任务要等 90 秒才能拿到设备。
+
+        有了总预算后：每条命令的超时取 `min(命令自己的超时, 剩余预算)`，
+        预算耗尽就直接 `AdbBudgetExhausted`，不再开始新命令。
+        这样「一次采集」的耗时**真的有上界**，安全点间隔也就有上界了。
+
+        注意：它管不了「已经在飞的那一条命令」——那条只能等它自己超时。
+        所以严格上界是 `预算 + 单条命令超时`，但已经从"若干条累加"降到"一条"。
+        """
+        token = _DEADLINE.set(time.monotonic() + seconds)
+        try:
+            yield
+        finally:
+            _DEADLINE.reset(token)
+
+    def _run(
+        self,
+        args: list[str],
+        *,
+        text: bool = True,
+        timeout: float | None = None,
+    ) -> subprocess.CompletedProcess:
+        budget = self.timeout if timeout is None else timeout
+
+        remaining_deadline = _DEADLINE.get()
+        if remaining_deadline is not None:
+            remaining = remaining_deadline - time.monotonic()
+            if remaining <= 0:
+                raise AdbBudgetExhausted(
+                    f"adb 调用总预算已耗尽，跳过命令: {' '.join(args)}"
+                )
+            budget = min(budget, remaining)
+
         try:
             proc = subprocess.run(
                 self._base() + args,
                 capture_output=True,
                 text=text,
-                timeout=self.timeout,
+                timeout=budget,
                 check=False,
             )
         except FileNotFoundError as exc:
             raise AdbError("adb 未安装或不在 PATH 中") from exc
         except subprocess.TimeoutExpired as exc:
-            raise AdbError(f"adb 命令超时: {' '.join(args)}") from exc
+            raise AdbError(f"adb 命令超时（{budget:.1f}s）: {' '.join(args)}") from exc
         if proc.returncode != 0:
             stderr = proc.stderr if text else proc.stderr.decode(errors="replace")
             raise AdbError(stderr.strip() or f"adb {' '.join(args)} 失败")
@@ -61,6 +123,10 @@ class AdbController:
 
     def shell(self, *args: str) -> str:
         return self._run(["shell", *args]).stdout.strip()
+
+    def read_shell(self, *args: str) -> str:
+        """采集类 shell 命令（`dumpsys` / `wm size` 等），走更紧的 `read_timeout`。"""
+        return self._run(["shell", *args], timeout=self.read_timeout).stdout.strip()
 
     def state(self) -> str:
         return self._run(["get-state"]).stdout.strip()
@@ -101,7 +167,9 @@ class AdbController:
     # ---- 采集 ----
 
     def screenshot_bytes(self) -> bytes:
-        return self._run(["exec-out", "screencap", "-p"], text=False).stdout
+        return self._run(
+            ["exec-out", "screencap", "-p"], text=False, timeout=self.read_timeout
+        ).stdout
 
     def screenshot(self, path: str | Path) -> Path:
         path = Path(path)
@@ -111,16 +179,18 @@ class AdbController:
 
     def dump_ui(self) -> str:
         # 先清掉上一帧：dump 失败时若残留旧文件，会静默读到已经过期的页面
-        self.shell("rm", "-f", REMOTE_UI_DUMP)
+        self._run(["shell", "rm", "-f", REMOTE_UI_DUMP], timeout=self.read_timeout)
 
-        output = self.shell("uiautomator", "dump", REMOTE_UI_DUMP)
+        output = self._run(
+            ["shell", "uiautomator", "dump", REMOTE_UI_DUMP], timeout=self.read_timeout
+        ).stdout.strip()
         # uiautomator dump 失败时退出码仍可能为 0，只能靠输出判断
         if "ERROR" in output.upper():
-            raise AdbError(f"uiautomator dump 失败: {output.strip()}")
+            raise AdbError(f"uiautomator dump 失败: {output}")
 
-        xml = self._run(["exec-out", "cat", REMOTE_UI_DUMP], text=False).stdout.decode(
-            "utf-8", errors="replace"
-        )
+        xml = self._run(
+            ["exec-out", "cat", REMOTE_UI_DUMP], text=False, timeout=self.read_timeout
+        ).stdout.decode("utf-8", errors="replace")
         # 设备端偶尔只回一句提示（例如 "UI hierchary dumped to"）而没写出完整 XML。
         # 用根节点做内容校验，避免把空内容当成「页面没有可点击元素」而误导决策。
         if "<hierarchy" not in xml:
@@ -133,7 +203,7 @@ class AdbController:
         `wm size` 在设置了 override 的设备上会输出两行：Physical size 与 Override size。
         归一化坐标必须按 Override 换算，否则坐标会整体偏移（模拟器改过分辨率时必现）。
         """
-        output = self.shell("wm", "size")
+        output = self.read_shell("wm", "size")
         physical: tuple[int, int] | None = None
         override: tuple[int, int] | None = None
         for line in output.splitlines():
@@ -166,7 +236,7 @@ class AdbController:
 
     def current_focus(self) -> tuple[str, str]:
         """返回 (package, activity)。"""
-        output = self.shell("dumpsys", "window")
+        output = self.read_shell("dumpsys", "window")
         for line in output.splitlines():
             if "mCurrentFocus" in line and "/" in line:
                 # Window{... com.example/.MainActivity}

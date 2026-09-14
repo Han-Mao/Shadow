@@ -12,6 +12,7 @@ from fakes import FakeDevice
 from models.action import Action, ActionEffectStatus, ActionType, Decision, Point
 from models.budget import TaskBudget
 from models.checkpoint import Checkpoint
+from models.retry import ErrorClass
 from models.state import Observation, StepOutcome
 from models.task import Task, TaskPriority, TaskStatus
 from models.task_step import StepStatus
@@ -732,6 +733,42 @@ def test_reconcile_retries_action_when_it_never_took_effect(monkeypatch, tmp_pat
     assert len(executed) == 1, "只重做一次，不要无限重试"
     assert executed[0].is_same_as(retried), "重做的必须是恢复点里记录的那个动作"
     assert called["generate"] == 0, "只是重做动作，不需要重新规划"
+
+
+# ---------------------------------------------------------------- V2.1：执行记录（§二十）
+
+
+def test_runtime_records_failed_attempt_with_action_and_error_class(monkeypatch, tmp_path):
+    """失败要留下「试的是哪个动作、属于哪类错误」，而不只是一句错误文本。
+
+    这条是拆分的直接收益：以前失败只写 `last_error`，动作和错误分类都丢了，
+    事后没法回答「它到底试过什么、这种错该不该重试」。
+    """
+    patch_observe(monkeypatch, tmp_path)
+    failing = tap(100, 200).action
+    patch_planner(
+        monkeypatch, goals=["做事"], decisions=[Decision(action=failing) for _ in range(5)]
+    )
+    patch_verifier(monkeypatch, StepOutcome.ERROR, "ADB 超时")
+
+    session, runtime = build(tmp_path)
+    task = Task(instruction="做事", budget=TaskBudget(max_action_steps=10))
+    task.set_plan(["第一步"])
+    session.acquire(task.id)
+    try:
+        outcome = runtime.run(task)
+    finally:
+        session.release(task.id)
+
+    assert outcome is RunOutcome.FAILED
+    step = task.plan[0]
+    assert step.attempt_count >= 1, "失败必须留下尝试记录"
+
+    first = step.attempts[0]
+    assert first.action is not None and first.action.is_same_as(failing)
+    assert first.error == "ADB 超时"
+    assert first.error_class is ErrorClass.TRANSIENT, "「ADB 超时」属于设备抖动"
+    assert first.number == 1
 
 
 # ---------------------------------------------------------------- V2.1：事件日志（§二十三）

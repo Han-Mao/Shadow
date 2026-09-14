@@ -6,7 +6,8 @@ import threading
 
 import pytest
 
-from device.adb import AdbController, AdbError, escape_type_text
+import device.adb as adb_mod
+from device.adb import AdbBudgetExhausted, AdbController, AdbError, escape_type_text
 from device.input import (
     ADB_KEYBOARD_PACKAGE,
     AdbInputProvider,
@@ -87,6 +88,115 @@ def test_escape_type_text_is_shared_with_callers():
     assert escape_type_text("a b") == "a%sb"
     with pytest.raises(AdbError):
         escape_type_text("中文")
+
+
+# ---------------------------------------------------------------- 命令总预算（§十四）
+
+
+def _spy_subprocess(monkeypatch) -> list[tuple[list[str], float | None]]:
+    """截住 subprocess.run，记录每条命令实际用的超时。"""
+    captured: list[tuple[list[str], float | None]] = []
+
+    class _Proc:
+        returncode = 0
+        stdout: str | bytes = ""
+        stderr: str | bytes = ""
+
+    def fake_run(cmd, **kwargs):
+        captured.append((list(cmd), kwargs.get("timeout")))
+        return _Proc()
+
+    monkeypatch.setattr(adb_mod.subprocess, "run", fake_run)
+    return captured
+
+
+def test_read_commands_use_a_tighter_timeout_than_writes(monkeypatch):
+    """采集类命令用 read_timeout，写类用 timeout。
+
+    采集卡住时继续干等没有收益——任务不会因为多等几秒就拿到页面，
+    只会把「让出设备」的安全点一直往后拖，堵住高优先级的任务。
+    写类不同：`am start` 拉冷启动的 App 确实可能慢，等一等是有意义的。
+    """
+    captured = _spy_subprocess(monkeypatch)
+    adb = AdbController(serial="x", timeout=15.0, read_timeout=3.0)
+
+    adb.shell("input", "tap", "1", "2")
+    adb.read_shell("wm", "size")
+    adb.screenshot_bytes()
+
+    assert captured[0][1] == 15.0, "写类命令用默认 timeout"
+    assert captured[1][1] == 3.0, "dumpsys/wm size 属于采集"
+    assert captured[2][1] == 3.0, "截图属于采集"
+
+
+def test_deadline_budget_caps_each_command_to_remaining_budget(monkeypatch):
+    """总预算把单条命令的超时压到「剩余预算」，而不是各自等满自己的超时。"""
+    captured = _spy_subprocess(monkeypatch)
+    adb = AdbController(serial="x", timeout=15.0)
+
+    with adb.deadline_budget(2.0):
+        adb.shell("input", "tap", "1", "2")
+
+    assert captured[-1][1] is not None
+    assert captured[-1][1] <= 2.0, "写类默认 15s，但预算只剩 2s"
+
+
+def test_deadline_budget_exhaustion_refuses_to_start_new_command(monkeypatch):
+    """预算耗尽后**不再启动**新命令——这正是「一次采集耗时有上界」的来源。"""
+    captured = _spy_subprocess(monkeypatch)
+    adb = AdbController(serial="x")
+
+    with adb.deadline_budget(0.0):
+        with pytest.raises(AdbBudgetExhausted):
+            adb.shell("wm", "size")
+
+    assert captured == [], "预算已耗尽，不该真的去跑命令"
+
+
+def test_budget_exhaustion_is_an_adb_error_so_upper_layers_keep_working(monkeypatch):
+    """预算耗尽继承自 AdbError，上层的「失败收敛」逻辑不用改就能接住它。"""
+    _spy_subprocess(monkeypatch)
+    adb = AdbController(serial="x")
+
+    with adb.deadline_budget(0.0):
+        with pytest.raises(AdbError):
+            adb.read_shell("dumpsys", "window")
+
+
+def test_observe_applies_one_total_budget_to_the_whole_capture(monkeypatch, tmp_path):
+    """一次采集必须整体受预算约束。
+
+    采集内部有 6 条 adb 命令（截图 + wm size + dumpsys + rm + dump + cat），
+    每条各自有超时也挡不住「6 条累加」——高优任务就要等那么久。
+    """
+    from agent import observer as observer_mod
+
+    adb = make_adb(
+        {
+            "wm size": "Physical size: 1080x2400",
+            "dumpsys window": "mCurrentFocus=Window{abc com.demo/.Main}",
+            "uiautomator dump /sdcard/window_dump.xml": "UI hierchary dumped to: ok",
+        },
+        run_outputs={"exec-out cat /sdcard/window_dump.xml": b"<hierarchy></hierarchy>"},
+    )
+
+    used: list[float] = []
+    real_budget = adb.deadline_budget
+
+    def spy(seconds: float):
+        used.append(seconds)
+        return real_budget(seconds)
+
+    adb.deadline_budget = spy  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        observer_mod.screenshot, "capture", lambda *a, **k: tmp_path / "step_001.png"
+    )
+
+    observation = observer_mod.observe(adb, tmp_path, 1, budget_seconds=4.0)
+
+    assert used == [4.0], "整段采集必须包在同一个预算里"
+    assert observation.package == "com.demo"
+    assert observation.ui_tree == "<hierarchy></hierarchy>"
 
 
 # ---------------------------------------------------------------- 输入通道（中文）

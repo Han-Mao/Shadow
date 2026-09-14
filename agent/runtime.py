@@ -274,7 +274,13 @@ class AgentRuntime:
 
             if verification.outcome is StepOutcome.OK:
                 if decision.step_done:
-                    self._close_step(task, step, action)
+                    self._close_step(
+                        task,
+                        step,
+                        action,
+                        effect=verification.effect.status,
+                        layer=verification.layer,
+                    )
                 state.retry_count = 0
                 state.failed_strategies.clear()
                 self._save_checkpoint(task, state, post, action)
@@ -282,9 +288,17 @@ class AgentRuntime:
 
             # ---- ERROR：先分类，再由策略决定重试 / 换策略 / 找人 / 放弃 ----
             state.failed_strategies.append(self._describe_action(action))
-            if step is not None:
-                step.record_failure(verification.message)
             error_class = classify_error(verification.message)
+            if step is not None:
+                # 把动作、错误分类、效果、证据层一起写进 attempt（V2.1 §二十）：
+                # 只记一句错误文本的话，事后查不出「试的是什么动作、属于哪类错误」
+                step.record_failure(
+                    verification.message,
+                    action=action,
+                    error_class=error_class,
+                    effect=verification.effect.status,
+                    layer=verification.layer,
+                )
             logger.warning(
                 "任务 %s 第 %d 步失败[%s]：%s",
                 task.id,
@@ -505,12 +519,23 @@ class AgentRuntime:
     # ---- 步骤与收尾 ----
 
     @staticmethod
-    def _close_step(task: Task, step: TaskStep | None, action: Action | None = None) -> None:
+    def _close_step(
+        task: Task,
+        step: TaskStep | None,
+        action: Action | None = None,
+        *,
+        effect: ActionEffectStatus | None = None,
+        layer: str = "",
+    ) -> None:
         if step is None:
             return
         step.mark(StepStatus.DONE)
         if action is not None:
-            step.record_action(action)
+            step.record_action(
+                action,
+                effect=effect if effect is not None else ActionEffectStatus.VERIFIED_SUCCESS,
+                layer=layer,
+            )
         task.sync_current_step()
 
     def _finish(

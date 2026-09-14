@@ -56,7 +56,8 @@ VLM 决定「下一步点哪里」，调度与检查点决定「多件事怎么�
 │   └── scheduler.py        # 优先级队列 / 抢占 / 恢复
 ├── models/
 │   ├── task.py             # Task + 8 态状态机 + 优先级 + 预算 + 版本号
-│   ├── task_step.py        # TaskStep：计划是可追踪的状态机，不是字符串列表
+│   ├── task_step.py        # TaskStep：计划是可追踪的状态机（只描述计划）
+│   ├── step_attempt.py     # StepAttempt：一次尝试的经过（动作/结果/错误分类/证据层）
 │   ├── task_relation.py    # TaskRelation：5 种任务关系
 │   ├── checkpoint.py       # Checkpoint：恢复所需的最小状态 + 版本门控
 │   ├── action.py           # Action + 风险等级（策略下限）+ 指纹 + 动作效果状态
@@ -128,7 +129,7 @@ python scripts/demo_preemption.py
 
 ### 3. 每一步都有据可查
 
-- `TaskStep` 记录每个计划步骤的状态、重试次数、最后一次动作与错误
+- `TaskStep` 记录计划步骤的状态、依赖与重试上限；**每一次尝试**（动作、结果、错误分类、证据层）进 `StepAttempt`，只追加不覆盖
 - `Checkpoint` 保存「恢复所需的最小状态」（当前页、package/activity、结构指纹、已用预算、最近轨迹）
 - 每个执行完的步骤都进 `TrajectoryStore`，供下一步决策取上下文
 - 关键事件进 `EventLog`（`GET /tasks/{id}/events`）：抢占、对账、危险动作等待、失败原因
@@ -247,8 +248,51 @@ python scripts/demo_preemption.py
 所以这里做的是「记录真实延迟 + 超过 `MAX_PREEMPTION_LATENCY_SECONDS`(2s) 打 warning」，
 让「高优任务被长命令堵住」这件事能被看见。真正的有界延迟需要给 ADB 调用加命令级超时。
 
-**仍未做（下一批）**：§20 PlanStep/StepAttempt 拆分、§24 目录重构（此前已确认不改）、
-多设备 Lease、Replay（事件日志已就位，它是 Replay 的前置）。
+**仍未做（下一批）**：§24 目录重构（此前已确认不改）、多设备 Lease、
+Replay（事件日志已就位，它是 Replay 的前置）。
+
+## V2.1 第四轮改造
+
+第三轮补了可追溯性，第四轮收掉两个一直挂着的硬骨头：**执行记录被覆盖**和
+**一次采集耗时没有上界**（后者直接决定抢占延迟）。
+
+| # | 审核项 | 改动 | 落点 |
+|---|---|---|---|
+| 16 | §20 计划 / 尝试拆分 | 新增 `models/step_attempt.py`。`TaskStep` 只描述计划，执行记录全进 `attempts`；`retry_count` / `last_action` / `last_error` 改为派生属性 | `models/step_attempt.py`、`models/task_step.py`、`runtime.py` |
+| 17 | §14 补：采集总预算 | `AdbController.deadline_budget()` + 读写超时分离（写 15s / 采集 6s）；`observe()` 整段包在 12s 总预算里 | `device/adb.py`、`agent/observer.py` |
+
+### 1. 执行历史不再被覆盖
+
+`TaskStep` 原来是「计划 + 执行记录」的混合体，而执行记录是**单值字段**：
+同一个步骤失败三次，`last_action` / `last_error` 只剩第三次的内容。
+可排查 Agent 问题最需要的恰恰是「它试过哪些没用的办法」——那些全被盖掉了。
+
+拆开之后每次尝试都是独立的 `StepAttempt`（第几次、什么动作、结果、错误分类、证据来自哪层），
+历史只追加不覆盖。调用方写法不变，`retry_count` / `last_action` / `last_error` 保留原名，
+改成从 `attempts` 派生的只读视图。附带的好处：失败时也记下动作，
+Re-plan 的上下文里终于有「上一个动作」可用了。
+
+### 2. 一次采集终于有耗时上界
+
+我上一轮说「要靠给 ADB 调用加命令级超时来解决抢占延迟」——**那句是错的**，
+`AdbController` 一直有 `timeout=15.0`。真正的问题是 `observe()` 内部要跑 **6 条** adb 命令
+（截图 + `wm size` + `dumpsys window` + rm + uiautomator dump + cat），
+每条各自等 15s 累起来就是 90 秒，而采集正是 runtime 循环里最容易卡住的一步——
+它的耗时直接等于高优任务要等多久。
+
+修法是**总预算**而不是再加超时：
+
+```python
+with adb.deadline_budget(12):      # 整段采集共用 12 秒
+    ...                            # 每条命令的超时 = min(自己的超时, 剩余预算)
+```
+
+预算耗尽就直接 `AdbBudgetExhausted`（继承 `AdbError`，上层失败收敛逻辑不用改），
+不再启动下一条命令。于是采集耗时的上界从「6 条累加」降到「预算 + 1 条」，可论证。
+
+顺带把超时分成两档：**采集类 6s、写类 15s**。采集卡住时继续干等没有收益——
+任务不会因为多等几秒就拿到页面，只会把安全点一直往后拖；而 `am start` 拉冷启动 App
+确实可能慢，等一等是有意义的。
 
 ## 快速开始
 
@@ -277,7 +321,9 @@ python -m api.server    # 监听 127.0.0.1:8010
 | `VLM_MODEL` | VLM 模型名 | `gpt-4o` |
 | `VLM_DETAIL_PLAN` / `_DECIDE` / `_VERIFY` | 各阶段图片精度 | `low` / `high` / `low` |
 | `ARTIFACT_DIR` | 截图落盘目录 | `artifacts/shots` |
-| `STORAGE_DIR` | 任务与检查点持久化目录 | `artifacts/state` |
+| `STORAGE_DIR` | 任务 / 检查点 / 事件持久化目录 | `artifacts/state` |
+| `OBSERVE_BUDGET_SECONDS` | 一次采集（截图 + UI 树 + 上下文）的**总**预算，决定抢占延迟上界 | `12` |
+| `ADB_READ_TIMEOUT_SECONDS` | 采集类 adb 命令的单条超时（写类固定 15s） | `6` |
 | `PORT` | API 端口 | `8010` |
 | `SHADOW_DEBUG` | 置 1 时 500 响应回传异常摘要（默认脱敏） | 未设置 |
 
@@ -340,18 +386,18 @@ pip install -r requirements.txt
 python -m pytest -q
 ```
 
-**193 个用例，全部离线**：不需要 adb、模拟器或 API Key。
+**204 个用例，全部离线**：不需要 adb、模拟器或 API Key。
 
 | 文件 | 覆盖 |
 |---|---|
-| `test_models.py` | 任务状态机、步骤依赖、动作风险（策略下限）/指纹、Checkpoint、预算、版本号 |
-| `test_device.py` | ADB 封装、输入通道（含中文）、设备会话所有权与并发 |
+| `test_models.py` | 任务状态机、步骤依赖、动作风险（策略下限）/指纹、Checkpoint、预算、版本号、**尝试历史** |
+| `test_device.py` | ADB 封装、输入通道（含中文）、设备会话所有权与并发、**命令超时分级与总预算** |
 | `test_vision.py` | UI 树容错、坐标落点、VLM 重试、prompt 构造 |
 | `test_verifier.py` | **验证三概念**：发出 / 效果 / 目标，含「VLM 说成功但页面没变 → 效果存疑」 |
 | `test_event_log.py` | 事件日志：顺序、按任务隔离、limit、截断行容错、写失败不抛异常 |
 | `test_classifier.py` | 三层关系判定、相似度否决、**分关系阈值**、二次确认标记、**语义相似度** |
 | `test_scheduler.py` | 优先级、暂停/取消、**抢占与恢复**、组合式中断、**启动恢复**（含审批前重启）、**抢占延迟观测**、设备占用 |
-| `test_runtime.py` | 闭环执行、异常收敛、死循环、HITL、Checkpoint 恢复、**三预算门控**、**动作对账**（继续/重做）、批准一次性、**事件流** |
+| `test_runtime.py` | 闭环执行、异常收敛、死循环、HITL、Checkpoint 恢复、**三预算门控**、**动作对账**（继续/重做）、批准一次性、**执行记录**、事件流 |
 | `test_api.py` | HTTP 契约、状态码语义、错误脱敏、危险动作拦截、SUPER_TASK 改写与二次确认、**依赖链迁移**、版本门控、**/events 审计流** |
 
 ## 注意事项

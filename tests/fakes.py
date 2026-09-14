@@ -64,14 +64,30 @@ def make_adb(
         return shell_outputs.get(" ".join(args), "")
 
     class _Completed:
-        def __init__(self, stdout: bytes) -> None:
+        def __init__(self, stdout) -> None:
             self.stdout = stdout
 
-    def fake_run(args: list[str], *, text: bool = True) -> "_Completed":
+    def fake_run(
+        args: list[str], *, text: bool = True, timeout: float | None = None
+    ) -> "_Completed":
+        # 记录时剥掉前导 "shell"：record 表达的是「对设备做了什么」，
+        # 而不是 adb 的参数拼装细节。shell() 与 read_shell() 都经这里，
+        # 两条路径的记录格式因此保持一致。
+        effective = args[1:] if args and args[0] == "shell" else args
         if record is not None:
-            record.append(list(args))
-        data = (run_outputs or {}).get(" ".join(args), b"")
-        return _Completed(data if isinstance(data, bytes) else data.encode())
+            record.append(list(effective))
+
+        def as_declared(payload: str | bytes) -> "_Completed":
+            # 模拟 subprocess 的 text 语义：调用方要 str 就给 str，要 bytes 就给 bytes
+            if isinstance(payload, bytes):
+                return _Completed(payload.decode("utf-8", errors="replace") if text else payload)
+            return _Completed(payload if text else payload.encode())
+
+        if args and args[0] == "shell":
+            # 采集类命令（read_shell）会带更紧的 timeout，同样从这张表取输出
+            return as_declared(shell_outputs.get(" ".join(effective), ""))
+
+        return as_declared((run_outputs or {}).get(" ".join(effective), b""))
 
     adb.shell = fake_shell  # type: ignore[method-assign]
     adb._run = fake_run  # type: ignore[method-assign]
