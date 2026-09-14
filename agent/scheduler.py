@@ -29,6 +29,7 @@ from typing import Any, Protocol
 
 from device.pool import DevicePool
 from device.session import DeviceSession
+from models.exceptions import DeviceUnavailableError, PersistenceError
 from models.task import (
     PAUSED_BY_PREEMPTION,
     PAUSED_BY_USER,
@@ -144,6 +145,8 @@ class TaskScheduler:
         # 完成记录只是审计，用一把 Condition 统管也省得死锁
         self._cond = threading.Condition(threading.RLock())
         self._paused: dict[str, Task] = {}
+        # V2.3：绑定设备不可用、等待原设备恢复的任务，不进入任何车道。
+        self._device_unavailable: dict[str, Task] = {}
         self._completed: list[str] = []
         self._counter = itertools.count()
         self._stopping = False
@@ -236,45 +239,47 @@ class TaskScheduler:
         if self._task_store is None:
             return {}
 
-        restored = {"queued": 0, "resuming": 0, "paused": 0}
+        restored = {"queued": 0, "resuming": 0, "paused": 0, "device_unavailable": 0}
         with self._cond:
             for task in self._task_store.list_active():
                 if self._find_locked(task.id) is not None:
                     continue
 
-                # 上次绑定的设备可能已经不在池里（拔线/换机）——改派给现有设备，
-                # 否则这条任务永远没人取走，会悄悄变成僵尸
-                if task.device_serial and task.device_serial not in self._lanes:
-                    logger.warning(
-                        "任务 %s 原先绑定的设备 %s 不在池中，改派给可用设备",
-                        task.id,
-                        task.device_serial,
-                    )
-                    task.device_serial = None
+                restored_as = ""
+                try:
+                    if task.status is TaskStatus.PAUSED and task.paused_reason == PAUSED_BY_USER:
+                        # 用户主动暂停的：重启后保持暂停，不替他做决定
+                        self._paused[task.id] = task
+                        restored["paused"] += 1
+                        restored_as = "paused"
+                    elif task.status is TaskStatus.PAUSED:
+                        # 被抢占挂起的：自动恢复，但仍要排在抢占者之后（_pop_next 会做优先级比较）
+                        lane = self._lane_for(task)
+                        lane.suspended.append(task)
+                        restored["resuming"] += 1
+                        restored_as = "resuming"
+                    else:
+                        # created / queued / running / waiting
+                        # running 说明上次是进程被杀、动作已中断 —— 交给 Checkpoint 校验后重跑；
+                        # waiting 说明在等人工确认，重启后重新决策一次比沿用旧确认更安全
+                        previous = task.status.value
+                        task.mark(TaskStatus.QUEUED, source="scheduler")
+                        lane = self._lane_for(task)
+                        lane.push_ready(task, self._counter)
+                        restored["queued"] += 1
+                        restored_as = f"queued(from {previous})"
+                except DeviceUnavailableError:
+                    task.mark(TaskStatus.DEVICE_UNAVAILABLE, source="scheduler")
+                    self._device_unavailable[task.id] = task
+                    restored["device_unavailable"] += 1
+                    restored_as = "device_unavailable"
 
-                if task.status is TaskStatus.PAUSED and task.paused_reason == PAUSED_BY_USER:
-                    # 用户主动暂停的：重启后保持暂停，不替他做决定
-                    self._paused[task.id] = task
-                    restored["paused"] += 1
-                    restored_as = "paused"
-                elif task.status is TaskStatus.PAUSED:
-                    # 被抢占挂起的：自动恢复，但仍要排在抢占者之后（_pop_next 会做优先级比较）
-                    lane = self._lane_for(task)
-                    lane.suspended.append(task)
-                    restored["resuming"] += 1
-                    restored_as = "resuming"
-                else:
-                    # created / queued / running / waiting
-                    # running 说明上次是进程被杀、动作已中断 —— 交给 Checkpoint 校验后重跑；
-                    # waiting 说明在等人工确认，重启后重新决策一次比沿用旧确认更安全
-                    previous = task.status.value
-                    task.mark(TaskStatus.QUEUED)
-                    lane = self._lane_for(task)
-                    lane.push_ready(task, self._counter)
-                    restored["queued"] += 1
-                    restored_as = f"queued(from {previous})"
-
-                self._persist(task)
+                if not self._persist_or_degrade(task):
+                    # 已降级并移出队列，不计入恢复成功
+                    if restored_as.startswith("queued"):
+                        restored["queued"] -= 1
+                    elif restored_as == "resuming":
+                        restored["resuming"] -= 1
                 self._emit(task.id, RECOVERED, restored_as=restored_as)
 
             self._cond.notify_all()
@@ -296,15 +301,23 @@ class TaskScheduler:
         """
         # 先解析车道（授权不足会在这里抛），**再**改状态与入队。
         # 反过来的话，被拒绝的任务会被改成 queued 却从没进过队列——变成僵尸。
-        with self._cond:
-            lane = self._lane_for(task, allowed_devices)
-            task.mark(TaskStatus.QUEUED)
-            lane.push_ready(task, self._counter)
+        try:
+            with self._cond:
+                lane = self._lane_for(task, allowed_devices)
+                task.mark(TaskStatus.QUEUED, source="scheduler")
+                lane.push_ready(task, self._counter)
+        except DeviceUnavailableError:
+            with self._cond:
+                task.mark(TaskStatus.DEVICE_UNAVAILABLE, source="scheduler")
+                self._device_unavailable[task.id] = task
+            self._persist_or_degrade(task)
+            return task
 
         # **先落盘、再唤醒 worker**。反过来的话，worker 可能在任务还没持久化时
         # 就开始跑，进程恰在这一刻崩溃就会把任务整个丢掉——
         # 队列是内存的，磁盘上没记就等于没提交过。
-        self._persist(task)
+        if not self._persist_or_degrade(task):
+            return task
         self._emit(task.id, QUEUED, priority=task.priority.value, device=lane.serial)
 
         with self._cond:
@@ -337,8 +350,9 @@ class TaskScheduler:
             if lane is not None:
                 lane.drop(task_id)
             self._paused[task_id] = task
-            task.mark(TaskStatus.PAUSED, paused_reason=PAUSED_BY_USER)
-        self._persist(task)
+            task.mark(TaskStatus.PAUSED, paused_reason=PAUSED_BY_USER, source="scheduler")
+        if not self._persist_or_degrade(task):
+            return False
         self._emit(task_id, SUSPENDED, reason=PAUSED_BY_USER)
         return True
 
@@ -350,11 +364,16 @@ class TaskScheduler:
             if not task.resumable:
                 self._paused[task_id] = task
                 return False
-            lane = self._lane_for(task, allowed_devices)
-            task.mark(TaskStatus.QUEUED)
+            try:
+                lane = self._lane_for(task, allowed_devices)
+            except DeviceUnavailableError:
+                self._paused[task_id] = task
+                return False
+            task.mark(TaskStatus.QUEUED, source="scheduler")
             lane.push_ready(task, self._counter)
             self._cond.notify_all()
-        self._persist(task)
+        if not self._persist_or_degrade(task):
+            return False
         self._emit(task_id, RESUMED)
         return True
 
@@ -372,15 +391,17 @@ class TaskScheduler:
                 and lane.running is not None
                 and lane.running.id == task_id
             ):
-                task.mark(TaskStatus.CANCELLED)
-                self._persist(task)
+                task.mark(TaskStatus.CANCELLED, source="scheduler")
+                if not self._persist_or_degrade(task):
+                    return False
                 return True
 
             if lane is not None:
                 lane.drop(task_id)
             self._paused.pop(task_id, None)
-            task.mark(TaskStatus.CANCELLED)
-        self._persist(task)
+            task.mark(TaskStatus.CANCELLED, source="scheduler")
+        if not self._persist_or_degrade(task):
+            return False
         return True
 
     def preempt(self, by_task_id: str) -> bool:
@@ -452,6 +473,7 @@ class TaskScheduler:
                 "ready": sorted(entry[3].id for lane in lanes for entry in lane.ready),
                 "paused": sorted(self._paused),
                 "suspended": [task.id for lane in lanes for task in lane.suspended],
+                "device_unavailable": sorted(self._device_unavailable),
                 "completed": list(self._completed[-20:]),
                 # 单设备时平铺成那台设备的状态（保持既有契约）
                 "device": lanes[0].session.snapshot() if lanes else {},
@@ -487,6 +509,9 @@ class TaskScheduler:
         paused = self._paused.get(task_id)
         if paused is not None:
             return None, paused
+        unavailable = self._device_unavailable.get(task_id)
+        if unavailable is not None:
+            return None, unavailable
         return None, None
 
     def _pick_lane(self, allowed_devices: Any = None) -> _DeviceLane:
@@ -524,6 +549,9 @@ class TaskScheduler:
 
         绑定发生在提交/恢复时，之后任务就固定在设备上——中途换设备会让
         页面上下文对不上，比排队等待更糟。
+
+        V2.3：绑定设备不在池中时不静默改派，而是抛 DeviceUnavailableError，
+        由调用方把任务置为 DEVICE_UNAVAILABLE 等待原设备恢复。
         """
         if task.device_serial:
             lane = self._lanes.get(task.device_serial)
@@ -531,10 +559,7 @@ class TaskScheduler:
                 if allowed_devices is not None and lane.serial not in allowed_devices:
                     raise DeviceNotAllowedError(allowed_devices, sorted(self._lanes))
                 return lane
-            logger.warning(
-                "任务 %s 绑定的设备 %s 不在池中，改派给可用设备", task.id, task.device_serial
-            )
-            task.device_serial = None
+            raise DeviceUnavailableError(task.id, task.device_serial)
 
         lane = self._pick_lane(allowed_devices)
         task.device_serial = lane.serial
@@ -577,11 +602,42 @@ class TaskScheduler:
         return granted
 
     def _persist(self, task: Task) -> None:
-        if self._task_store is not None:
+        """关键持久化：失败时抛 PersistenceError，由调用方决定如何降级。"""
+        if self._task_store is None:
+            return
+        try:
+            self._task_store.save(task)
+        except Exception as exc:  # noqa: BLE001 - 转换后重新抛出
+            logger.exception("保存任务 %s 失败", task.id)
+            raise PersistenceError(task.id, str(exc)) from exc
+
+    def _persist_or_degrade(self, task: Task) -> bool:
+        """尽力持久化；失败时将任务降级并移出队列。
+
+        返回 True 表示持久化成功，False 表示已降级。
+        """
+        try:
+            self._persist(task)
+            return True
+        except PersistenceError:
+            logger.error("任务 %s 持久化失败，从调度队列降级", task.id)
+            task.mark(TaskStatus.DEGRADED, source="scheduler")
             try:
-                self._task_store.save(task)
-            except Exception:  # noqa: BLE001 - 持久化失败不应中断调度
-                logger.exception("保存任务 %s 失败", task.id)
+                self._persist(task)
+            except PersistenceError:
+                logger.exception("任务 %s 降级状态也无法持久化", task.id)
+            with self._cond:
+                self._drop_from_queues(task.id)
+                self._completed.append(task.id)
+            return False
+
+    def _drop_from_queues(self, task_id: str) -> None:
+        """把任务从所有车道的就绪队列、挂起区和全局暂停区移除。"""
+        for lane in self._lanes.values():
+            lane.drop(task_id)
+            if lane.running is not None and lane.running.id == task_id:
+                lane.running = None
+        self._paused.pop(task_id, None)
 
     # ---- 内部：取出与执行 ----
 
@@ -631,11 +687,11 @@ class TaskScheduler:
             except Exception:  # noqa: BLE001 - Worker 线程绝不能因单个任务而退出
                 logger.exception("任务 %s 执行时发生未捕获异常", task.id)
                 with self._cond:
-                    task.mark(TaskStatus.FAILED)
+                    task.mark(TaskStatus.FAILED, source="scheduler")
                     self._completed.append(task.id)
                     if lane.running is not None and lane.running.id == task.id:
                         lane.running = None
-                self._persist(task)
+                self._persist_or_degrade(task)
 
     def _execute(self, task: Task, lane: _DeviceLane) -> None:
         if task.is_terminal:
@@ -662,8 +718,9 @@ class TaskScheduler:
 
             acquired = True
             if task.status is not TaskStatus.RUNNING:
-                task.mark(TaskStatus.RUNNING)
-                self._persist(task)
+                task.mark(TaskStatus.RUNNING, source="scheduler")
+                if not self._persist_or_degrade(task):
+                    return
             logger.info("开始执行任务 %s（设备 %s）：%s", task.id, lane.serial, task.instruction)
 
             with self._cond:
@@ -690,11 +747,11 @@ class TaskScheduler:
         name = getattr(outcome, "value", str(outcome))
 
         if name == "done":
-            task.mark(TaskStatus.DONE)
+            task.mark(TaskStatus.DONE, source="scheduler")
         elif name == "cancelled":
-            task.mark(TaskStatus.CANCELLED)
+            task.mark(TaskStatus.CANCELLED, source="scheduler")
         elif name == "suspended":
-            task.mark(TaskStatus.PAUSED, paused_reason=PAUSED_BY_PREEMPTION)
+            task.mark(TaskStatus.PAUSED, paused_reason=PAUSED_BY_PREEMPTION, source="scheduler")
             with self._cond:
                 lane.suspended.append(task)
             self._record_preemption_latency(task.id)
@@ -702,15 +759,15 @@ class TaskScheduler:
         elif name == "awaiting_confirmation":
             # 等人工确认：既不算完成也不算失败，**不能**放进任何队列——
             # 放进去会被 worker 立刻取出重跑，再次撞上同一个危险动作，变成死循环。
-            task.mark(TaskStatus.WAITING)
+            task.mark(TaskStatus.WAITING, source="scheduler")
             logger.info("任务 %s 等待人工确认危险动作", task.id)
         else:
-            task.mark(TaskStatus.FAILED)
+            task.mark(TaskStatus.FAILED, source="scheduler")
 
         if task.is_terminal:
             with self._cond:
                 self._completed.append(task.id)
-        self._persist(task)
+        self._persist_or_degrade(task)
 
     def _record_preemption_latency(self, task_id: str) -> None:
         """结算一次抢占的真实延迟：从「请求让出」到「真的挂起」（V2.1 §十四）。"""

@@ -7,6 +7,8 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from models.exceptions import CorruptDataError
+
 
 class JsonStore:
     """把每个实体存成 `<root>/<key>.json`。
@@ -41,9 +43,11 @@ class JsonStore:
                 return None
             try:
                 return json.loads(path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                # 单个损坏条目不应让整个 store 不可用
-                return None
+            except json.JSONDecodeError as exc:
+                # V2.3：损坏条目必须被看见，而不是假装不存在。
+                raise CorruptDataError(key, str(path), f"JSON 解析失败：{exc}") from exc
+            except OSError as exc:
+                raise CorruptDataError(key, str(path), f"读取失败：{exc}") from exc
 
     def keys(self) -> list[str]:
         with self._lock:

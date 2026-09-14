@@ -9,6 +9,7 @@ from enum import Enum
 from pydantic import BaseModel, Field
 
 from .budget import TaskBudget
+from .exceptions import InvalidTransitionError
 from .task_step import StepStatus, TaskStep, build_steps
 
 logger = logging.getLogger(__name__)
@@ -20,6 +21,10 @@ class TaskStatus(str, Enum):
     RUNNING = "running"
     PAUSED = "paused"
     WAITING = "waiting"
+    # 关键持久化失败：任务不能再继续产生 side effect（V2.3）。
+    DEGRADED = "degraded"
+    # 任务绑定的设备当前不可用，等待原设备恢复而不是静默改派（V2.3）。
+    DEVICE_UNAVAILABLE = "device_unavailable"
     DONE = "done"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -39,9 +44,19 @@ _PRIORITY_RANK = {
     TaskPriority.CRITICAL: 3,
 }
 
-TERMINAL_STATUSES = frozenset({TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.CANCELLED})
+TERMINAL_STATUSES = frozenset(
+    {TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.DEGRADED}
+)
 # 已进入调度视野、但尚未结束
-ACTIVE_STATUSES = frozenset({TaskStatus.QUEUED, TaskStatus.RUNNING, TaskStatus.PAUSED, TaskStatus.WAITING})
+ACTIVE_STATUSES = frozenset(
+    {
+        TaskStatus.QUEUED,
+        TaskStatus.RUNNING,
+        TaskStatus.PAUSED,
+        TaskStatus.WAITING,
+        TaskStatus.DEVICE_UNAVAILABLE,
+    }
+)
 
 # 暂停原因。进程重启后只有「用户显式暂停」该继续保持暂停；
 # 「被抢占挂起」是调度器临时让位，重启后必须自动恢复，否则任务就被永久搁置了。
@@ -63,29 +78,39 @@ PAUSED_BY_PREEMPTION = "preemption"
 ALLOWED_TRANSITIONS: dict["TaskStatus", frozenset["TaskStatus"]] = {
     TaskStatus.CREATED: frozenset(
         {TaskStatus.QUEUED, TaskStatus.RUNNING, TaskStatus.PAUSED,
-         TaskStatus.WAITING, TaskStatus.FAILED, TaskStatus.CANCELLED,
+         TaskStatus.WAITING, TaskStatus.DEGRADED, TaskStatus.DEVICE_UNAVAILABLE,
+         TaskStatus.FAILED, TaskStatus.CANCELLED,
          TaskStatus.DONE, TaskStatus.CREATED}
     ),
     TaskStatus.QUEUED: frozenset(
         {TaskStatus.RUNNING, TaskStatus.PAUSED, TaskStatus.WAITING,
+         TaskStatus.DEGRADED, TaskStatus.DEVICE_UNAVAILABLE,
          TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.DONE, TaskStatus.QUEUED}
     ),
     TaskStatus.RUNNING: frozenset(
         {TaskStatus.QUEUED, TaskStatus.PAUSED, TaskStatus.WAITING,
+         TaskStatus.DEGRADED, TaskStatus.DEVICE_UNAVAILABLE,
          TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.RUNNING}
     ),
     TaskStatus.PAUSED: frozenset(
         {TaskStatus.QUEUED, TaskStatus.RUNNING, TaskStatus.WAITING,
+         TaskStatus.DEGRADED, TaskStatus.DEVICE_UNAVAILABLE,
          TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.PAUSED}
     ),
     TaskStatus.WAITING: frozenset(
         {TaskStatus.QUEUED, TaskStatus.RUNNING, TaskStatus.PAUSED,
+         TaskStatus.DEGRADED, TaskStatus.DEVICE_UNAVAILABLE,
          TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.WAITING}
+    ),
+    TaskStatus.DEVICE_UNAVAILABLE: frozenset(
+        {TaskStatus.QUEUED, TaskStatus.DEGRADED,
+         TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.DEVICE_UNAVAILABLE}
     ),
     # 终态：不可逆
     TaskStatus.DONE: frozenset({TaskStatus.DONE}),
     TaskStatus.FAILED: frozenset({TaskStatus.FAILED}),
     TaskStatus.CANCELLED: frozenset({TaskStatus.CANCELLED}),
+    TaskStatus.DEGRADED: frozenset({TaskStatus.DEGRADED}),
 }
 
 # 条件合法：从 PAUSED 恢复成 QUEUED 时，只有「被抢占挂起」才该自动恢复。
@@ -167,16 +192,21 @@ class Task(BaseModel):
 
     # ---- 状态 ----
 
-    def mark(self, status: TaskStatus, *, paused_reason: str | None = None) -> None:
+    def mark(
+        self, status: TaskStatus, *, paused_reason: str | None = None, source: str = ""
+    ) -> None:
         """切换状态（所有状态写入的统一入口）。
 
         `paused_reason` 只在 PAUSED 时有意义，切到其它状态会被自动清空，
         避免把「上次为什么暂停」的信息带到下一次运行里。
 
-        真正干活的是 `transition_to`——它按 `ALLOWED_TRANSITIONS` 校验，
-        非法迁移记 warning 但**仍然执行**（运行时最怕状态卡住）。
+        `source` 回答「谁改了这个状态」，审计与排查时 indispensable。
+
+        真正干活的是 `transition_to`——它按 `ALLOWED_TRANSITIONS` 校验。
+        终态（DONE/FAILED/CANCELLED/DEGRADED）不允许再迁出；
+        其它非法迁移仍先记 warning 并执行，避免运行时状态卡住，但要能被看见。
         """
-        self.transition_to(status, paused_reason=paused_reason)
+        self.transition_to(status, paused_reason=paused_reason, source=source)
 
     def transition_to(
         self,
@@ -191,7 +221,16 @@ class Task(BaseModel):
         `task.status = x`，于是「Runtime 想拒绝后继续、API 却直接 FAILED」这类
         跨模块语义冲突几乎无法避免——因为没有一处能回答「这个迁移该不该发生」。
         `source` 让 warning 能指出是谁做的，排查时不用猜。
+
+        V2.3：终态不可逆是安全底线。终态任务一旦再被迁出，直接抛
+        `InvalidTransitionError`——这比「记 warning 但执行」更能防止副作用重复。
         """
+        if self.is_terminal and status is not self.status:
+            self.illegal_transition_count += 1
+            raise InvalidTransitionError(
+                self.id, self.status.value, status.value, source=source or "未标注"
+            )
+
         legal = status in ALLOWED_TRANSITIONS.get(self.status, frozenset())
         if not legal:
             self.illegal_transition_count += 1

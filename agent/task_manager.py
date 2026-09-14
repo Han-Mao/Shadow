@@ -105,7 +105,7 @@ class TaskManager:
             relation_meta=dict(relation_meta or {}),
             device_serial=device_serial,
         )
-        task.mark(TaskStatus.CREATED)
+        task.mark(TaskStatus.CREATED, source="task_manager")
         self._store.save(task)
         if submit:
             self._scheduler.submit(task, allowed_devices=allowed_devices)
@@ -143,7 +143,7 @@ class TaskManager:
         if task is None:
             return None
         task.sync_current_step()
-        task.mark(TaskStatus.DONE)
+        task.mark(TaskStatus.DONE, source="task_manager")
         self._store.save(task)
         return task
 
@@ -151,7 +151,7 @@ class TaskManager:
         task = self.get(task_id)
         if task is None:
             return None
-        task.mark(TaskStatus.FAILED)
+        task.mark(TaskStatus.FAILED, source="task_manager")
         self._store.save(task)
         return task
 

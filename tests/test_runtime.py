@@ -8,6 +8,8 @@ import agent.runtime as runtime_mod
 from agent.runtime import AgentRuntime, RunOutcome
 from agent.verifier import Verification
 from device.adb import AdbError
+from models.verification import ActionDispatch, ActionEffect, DispatchStatus, GoalVerification
+from agent.goal_verifier import GoalCheck, GoalVerdict
 from device.pool import DevicePool
 from device.session import DeviceSession
 from fakes import FakeDevice
@@ -1317,3 +1319,85 @@ def test_runtime_records_model_risk_downgrade_attempt(monkeypatch, tmp_path):
     assert assessed.data["downgrade_blocked"] is True
     assert assessed.data["policy"] == "dangerous"
     assert assessed.data["model"] == "safe"
+
+
+def test_version_fence_invalidates_old_decision_after_super_task(monkeypatch, tmp_path):
+    """V2.3：任务版本变化后，runtime 必须丢弃旧 decision 并重新规划。
+
+    模拟 SUPER_TASK 在 Think 之后改写了 task.version：下一轮循环开始时版本围栏
+    应发现变化、清空旧计划、重新规划，而不是用旧 observation + 新目标混着做决策。
+    """
+    patch_observe(monkeypatch, tmp_path)
+
+    calls = []
+
+    def fake_plan_next_action(instruction, screenshot_path, ui_tree, history, plan, step):
+        calls.append(("plan", instruction, len(plan)))
+        if len(calls) == 1:
+            # 第一次决策正常返回一个点击动作，同时「外部」改写了任务版本
+            return Decision(action=Action(type=ActionType.TAP, target=Point(x=10, y=20)))
+        # 第二次决策（版本围栏触发后重新规划）直接申请完成
+        return Decision(action=Action(type=ActionType.DONE_REQUEST))
+
+    monkeypatch.setattr(runtime_mod.planner, "plan_next_action", fake_plan_next_action)
+    monkeypatch.setattr(runtime_mod.planner, "generate_plan", lambda *args, **kwargs: ["完成"])
+
+    events = EventLog(tmp_path / "events")
+    session, runtime = build(tmp_path, event_log=events)
+    task = Task(instruction="旧目标", budget=TaskBudget(max_action_steps=3))
+
+    def bump_version_after_first_decision(task=task, original=runtime_mod.planner.plan_next_action):
+        # 这个钩子会在第一次决策返回后被调用，模拟 SUPER_TASK 改写目标
+        if len(calls) == 1 and task.version == 1:
+            task.version += 1
+            task.instruction = "新目标"
+            task.plan = []  # SUPER_TASK 也会清空计划
+        return original
+
+    # 由于 monkeypatch 已经替换了 plan_next_action，上面的 bump 逻辑直接写在 fake 里更省事：
+    # 重写 fake，在第一次返回前先改版本
+    def fake_plan_next_action_v2(instruction, screenshot_path, ui_tree, history, plan, step):
+        if len(calls) == 0:
+            task.version += 1
+            task.instruction = "新目标"
+            task.plan = []
+        return fake_plan_next_action(instruction, screenshot_path, ui_tree, history, plan, step)
+
+    monkeypatch.setattr(runtime_mod.planner, "plan_next_action", fake_plan_next_action_v2)
+
+    # 让 verifier 对 DONE_REQUEST 放行，对 TAP 返回 OK 以便进入下一轮
+    def fake_verify_action(instruction, pre, action, post, result):
+        if action.type is ActionType.DONE_REQUEST:
+            return Verification(
+                outcome=StepOutcome.DONE,
+                should_retry=False,
+                layer="l6_goal",
+                message="完成",
+                dispatch=ActionDispatch(action=action, status=DispatchStatus.SENT),
+                effect=ActionEffect(status=ActionEffectStatus.VERIFIED_SUCCESS, changed=True),
+                goal=GoalVerification(achieved=True, layer="l6_goal", message="完成"),
+            )
+        return Verification(
+            outcome=StepOutcome.OK,
+            should_retry=False,
+            layer="l3_structure",
+            message="ok",
+            dispatch=ActionDispatch(action=action, status=DispatchStatus.SENT),
+            effect=ActionEffect(status=ActionEffectStatus.UI_CHANGED, changed=True),
+            goal=GoalVerification(achieved=False, layer="l1_device", message=""),
+        )
+
+    monkeypatch.setattr(runtime_mod.verifier, "verify_action", fake_verify_action)
+    monkeypatch.setattr(runtime_mod.goal_verifier, "verify_goal", lambda **kwargs: GoalCheck(GoalVerdict.CONFIRMED, "ok"))
+
+    session.acquire(task.id)
+    try:
+        outcome = runtime.run(task)
+    finally:
+        session.release(task.id)
+
+    assert outcome is RunOutcome.DONE
+    assert task.instruction == "新目标"
+    # 应该至少调了两次规划：第一次被作废，第二次重新规划后完成
+    plan_calls = [c for c in calls if c[0] == "plan"]
+    assert len(plan_calls) >= 2

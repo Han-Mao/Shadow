@@ -592,7 +592,7 @@ def test_recover_keeps_user_paused_task_paused(tmp_path):
     scheduler = TaskScheduler(DoneRuntime(), DeviceSession(FakeDevice()), task_store=store)
     restored = scheduler.recover()
 
-    assert restored == {"queued": 0, "resuming": 0, "paused": 1}
+    assert restored == {"queued": 0, "resuming": 0, "paused": 1, "device_unavailable": 0}
     assert scheduler.snapshot()["paused"] == [task.id]
 
 
@@ -638,7 +638,12 @@ def test_recover_ignores_finished_tasks(tmp_path):
         store.save(task)
 
     scheduler = TaskScheduler(DoneRuntime(), DeviceSession(FakeDevice()), task_store=store)
-    assert scheduler.recover() == {"queued": 0, "resuming": 0, "paused": 0}
+    assert scheduler.recover() == {
+        "queued": 0,
+        "resuming": 0,
+        "paused": 0,
+        "device_unavailable": 0,
+    }
     assert scheduler.snapshot()["ready"] == []
 
 
@@ -809,18 +814,22 @@ def test_task_bound_to_one_device_does_not_leak_to_another():
     assert task.id not in devices["emu-1"]["ready"]
 
 
-def test_task_bound_to_a_missing_device_is_reassigned_on_recover(tmp_path):
-    """绑定的设备不在池里（拔线/换机）时必须改派，否则任务永远没人取走、变成僵尸。"""
+def test_task_bound_to_a_missing_device_waits_for_it_on_recover(tmp_path):
+    """V2.3：绑定的设备不在池里时不再静默改派，而是进入 device_unavailable 等待原设备。"""
     store = TaskStore(tmp_path / "tasks")
     task = Task(instruction="原本绑在 emu-9", device_serial="emu-9")
     task.mark(TaskStatus.QUEUED)
     store.save(task)
 
     scheduler = TaskScheduler(DoneRuntime(), two_devices(), task_store=store)
-    assert scheduler.recover()["queued"] == 1
+    restored = scheduler.recover()
+    assert restored["queued"] == 0
+    assert restored["device_unavailable"] == 1
 
     reloaded = store.load(task.id)
-    assert reloaded.device_serial in {"emu-1", "emu-2"}, "必须改派给现有设备"
+    assert reloaded.status is TaskStatus.DEVICE_UNAVAILABLE
+    assert reloaded.device_serial == "emu-9"
+    assert task.id in scheduler.snapshot()["device_unavailable"]
 
 
 def test_snapshot_exposes_per_device_state():
@@ -879,3 +888,68 @@ def test_pool_must_not_be_empty():
     """一台设备都没有时应当直接报错，而不是让任务静默地永远拿不到设备。"""
     with pytest.raises(ValueError, match="设备"):
         TaskScheduler(DoneRuntime(), DevicePool())
+
+
+# ---------------------------------------------------------------- V2.3 故障注入
+
+
+class BrokenTaskStore:
+    """关键持久化失败替身：save 永远抛 IOError。"""
+
+    def __init__(self, wrapped: TaskStore) -> None:
+        self._wrapped = wrapped
+
+    def save(self, task: Task) -> None:
+        raise IOError("磁盘已满")
+
+    def load(self, task_id: str) -> Task | None:
+        return self._wrapped.load(task_id)
+
+    def list_all(self) -> list[Task]:
+        return self._wrapped.list_all()
+
+    def list_active(self) -> list[Task]:
+        return self._wrapped.list_active()
+
+    def delete(self, task_id: str) -> None:
+        self._wrapped.delete(task_id)
+
+
+def test_persistence_failure_during_submit_degrades_task(tmp_path):
+    """V2.3：submit 时关键持久化失败，任务必须被降级而不是继续产生副作用。"""
+    real_store = TaskStore(tmp_path / "tasks")
+    broken_store = BrokenTaskStore(real_store)
+    scheduler = TaskScheduler(DoneRuntime(), DeviceSession(FakeDevice()), task_store=broken_store)
+    task = Task(instruction="会持久化失败")
+
+    scheduler.submit(task, allow_preempt=False)
+
+    assert task.status is TaskStatus.DEGRADED
+    assert task.id not in scheduler.snapshot()["ready"]
+    assert task.id in scheduler.snapshot()["completed"]
+
+
+def test_persistence_failure_during_cancel_degrades_task(tmp_path):
+    """V2.3：cancel 时持久化失败也要降级，避免状态不一致。"""
+    real_store = TaskStore(tmp_path / "tasks")
+    broken_store = BrokenTaskStore(real_store)
+    scheduler = TaskScheduler(DoneRuntime(), DeviceSession(FakeDevice()), task_store=broken_store)
+    task = Task(instruction="x")
+    scheduler.submit(task, allow_preempt=False)
+
+    # 现在把 store 换成坏的
+    scheduler._task_store = broken_store  # noqa: SLF001
+    assert scheduler.cancel(task.id) is False
+    assert task.status is TaskStatus.DEGRADED
+
+
+def test_device_unavailable_on_submit(tmp_path):
+    """V2.3：提交时就绑定到不在池中的设备，任务进入 device_unavailable。"""
+    scheduler = TaskScheduler(DoneRuntime(), DeviceSession(FakeDevice()), task_store=TaskStore(tmp_path / "tasks"))
+    task = Task(instruction="设备不在池里", device_serial="missing-device")
+
+    scheduler.submit(task, allow_preempt=False)
+
+    assert task.status is TaskStatus.DEVICE_UNAVAILABLE
+    assert task.device_serial == "missing-device"
+    assert task.id in scheduler.snapshot()["device_unavailable"]

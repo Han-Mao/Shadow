@@ -1,6 +1,8 @@
 """V2 数据模型：任务状态机、步骤依赖、动作风险与指纹、Checkpoint。"""
 from __future__ import annotations
 
+import pytest
+
 from models.action import (
     Action,
     ActionEffectStatus,
@@ -13,6 +15,7 @@ from models.checkpoint import Checkpoint
 from models.retry import ErrorClass
 from models.state import Observation, StepOutcome, compact_observations
 from models.step_attempt import AttemptOutcome
+from models.exceptions import InvalidTransitionError
 from models.task import Task, TaskPriority, TaskStatus, priority_rank
 from models.task_relation import TaskRelation, TaskRelationResult
 from models.task_step import StepStatus, TaskStep, build_steps
@@ -29,7 +32,7 @@ def test_task_starts_created_and_is_not_terminal():
 
 
 def test_task_status_coverage():
-    """V2 的八态：单任务 MVP 的 pending/running/done/failed 不够描述排队与暂停。"""
+    """V2.3 十态：新增 degraded / device_unavailable。"""
     values = {s.value for s in TaskStatus}
     assert values == {
         "created",
@@ -37,12 +40,21 @@ def test_task_status_coverage():
         "running",
         "paused",
         "waiting",
+        "degraded",
+        "device_unavailable",
         "done",
         "failed",
         "cancelled",
     }
-    for status in (TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.CANCELLED):
+    for status in (
+        TaskStatus.DONE,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+        TaskStatus.DEGRADED,
+    ):
         assert Task(instruction="x", status=status).is_terminal
+    for status in (TaskStatus.DEVICE_UNAVAILABLE,):
+        assert Task(instruction="x", status=status).is_active
 
 
 def test_priority_rank_orders_correctly():
@@ -372,20 +384,31 @@ def test_legal_transitions_are_not_flagged():
     assert task.illegal_transition_count == 0
 
 
-def test_illegal_transition_is_recorded_but_still_applied():
-    """非法迁移**仍然执行**，但会被记账、被日志看见。
+def test_terminal_transition_is_rejected():
+    """V2.3：终态（DONE/FAILED/CANCELLED/DEGRADED）不允许再迁出。
 
-    刻意不拒绝：运行时最怕的是「状态卡住」——严格拒绝会让任务永远停在 running，
-    比一次不该发生的迁移更难排查。要的是「能被发现」，不是「静默失败」。
+    这是防止「任务复活并重复产生副作用」的最后一道防线，必须 fail closed。
     """
     task = Task(instruction="x")
     task.mark(TaskStatus.DONE)
 
-    ok = task.transition_to(TaskStatus.RUNNING, source="test_suite")
+    with pytest.raises(InvalidTransitionError):
+        task.transition_to(TaskStatus.RUNNING, source="test_suite")
 
-    assert ok is False, "终态不可逆"
     assert task.illegal_transition_count == 1
-    assert task.status is TaskStatus.RUNNING, "但仍然生效"
+    assert task.status is TaskStatus.DONE
+
+
+def test_non_terminal_illegal_transition_is_recorded_but_still_applied():
+    """非终态之间的非法迁移仍先执行，避免运行时状态卡住；但要被记账。"""
+    task = Task(instruction="x")
+    task.mark(TaskStatus.RUNNING)
+
+    ok = task.transition_to(TaskStatus.CREATED, source="test_suite")
+
+    assert ok is False
+    assert task.illegal_transition_count == 1
+    assert task.status is TaskStatus.CREATED
 
 
 def test_paused_reason_cleared_when_leaving_paused():

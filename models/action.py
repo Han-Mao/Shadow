@@ -63,7 +63,7 @@ def strictest(*risks: "ActionRisk") -> "ActionRisk":
 
 
 class ActionEffectStatus(str, Enum):
-    """一次动作「到底有没有在设备上生效」的判定（V2.1 §五）。
+    """一次动作「到底有没有在设备上生效」的判定（V2.1 §五 · V2.3）。
 
     手机 Agent 最大的恢复难题不是「当前页面是什么」，而是「上一次动作到底执行没执行」。
     例如进程在「点击提交订单」之后、拿到验证截图之前崩溃：重启时只知道 Step = 提交订单，
@@ -72,6 +72,8 @@ class ActionEffectStatus(str, Enum):
     - NOT_STARTED      ：还没发出去
     - DISPATCHED       ：ADB 命令已发出（executor 返回 ok），但还没验证页面变化
     - EFFECT_UNKNOWN   ：dispatch 后拿不到验证观察 → 效果未知，绝不能默认 retry
+    - NAVIGATED        ：页面确实发生了导航/activity 变化，但不等于原始动作的最终 side effect 已确认
+    - UI_CHANGED       ：页面结构或目标元素发生变化，但未确认是不可逆 side effect
     - VERIFIED_SUCCESS ：验证通过（页面确实按预期变化）
     - VERIFIED_FAILED  ：验证失败
     """
@@ -79,6 +81,8 @@ class ActionEffectStatus(str, Enum):
     NOT_STARTED = "not_started"
     DISPATCHED = "dispatched"
     EFFECT_UNKNOWN = "effect_unknown"
+    NAVIGATED = "navigated"
+    UI_CHANGED = "ui_changed"
     VERIFIED_SUCCESS = "verified_success"
     VERIFIED_FAILED = "verified_failed"
 

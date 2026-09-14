@@ -18,6 +18,7 @@ from device.pool import DevicePool, storage_hint
 from device.session import DeviceBusyError, DeviceSession
 from models.action import Action, ActionType, ActionRisk, ActionEffectStatus, Decision
 from models.checkpoint import Checkpoint
+from models.exceptions import PersistenceError
 from models.retry import (
     DEFAULT_POLICY,
     ErrorClass,
@@ -122,6 +123,10 @@ class RuntimeState:
 
     retry_count: int = 0
     prepared: bool = False
+    # V2.3：SUPER_TASK / re-plan / 人工干预时 task.version 会变化。
+    # 每一轮决策前检查 task.version == run_version，否则旧 decision 必须作废，
+    # 防止「新目标 + 旧 observation + 旧 trajectory」混合规划。
+    run_version: int = 0
     forced_action: Action | None = None
     """对账判定「上次动作未生效」后要强制重做的动作（跳过一次模型决策）。"""
 
@@ -178,10 +183,11 @@ class AgentRuntime:
             return RunOutcome.CANCELLED
 
         state = self._state_for(task)
+        state.run_version = task.version
         # 本任务跑在哪台设备上，由绑定决定——多设备时 worker 线程各跑各的，
         # 所以这个 session 只作为**局部变量**贯穿本次 run，不进实例状态
         session = self._session_for(task)
-        task.mark(TaskStatus.RUNNING)
+        task.mark(TaskStatus.RUNNING, source="runtime")
         self._persist(task)
         self._emit(task.id, STARTED, version=task.version, instruction=task.instruction)
 
@@ -189,6 +195,26 @@ class AgentRuntime:
         observation: Observation | None = None
         last_observation: Observation | None = None
 
+        try:
+            outcome = self._run_loop(
+                task, state, session, checkpoint, observation, last_observation
+            )
+        except PersistenceError as exc:
+            # V2.3：关键持久化失败必须停下来，不能再继续产生 side effect。
+            # 此时内存状态已经领先于磁盘，继续执行可能在崩溃后重复副作用。
+            logger.error("任务 %s 关键持久化失败，任务降级：%s", task.id, exc)
+            return self._degrade(task, state, f"持久化失败：{exc.reason}")
+        return outcome
+
+    def _run_loop(
+        self,
+        task: Task,
+        state: RuntimeState,
+        session: DeviceSession,
+        checkpoint: Checkpoint | None,
+        observation: Observation | None,
+        last_observation: Observation | None,
+    ) -> RunOutcome:
         while True:
             # ---- 安全点 ----
             if task.status is TaskStatus.CANCELLED:
@@ -208,6 +234,21 @@ class AgentRuntime:
             if state.model_call_count >= task.budget.max_model_calls:
                 self._save_checkpoint(task, state, last_observation)
                 return self._fail(task, f"已达模型调用上限 {task.budget.max_model_calls}")
+
+            # ---- 版本围栏（V2.3）：目标/计划被外部改写后，旧决策上下文作废 ----
+            if task.version != state.run_version:
+                logger.info(
+                    "任务 %s 版本已变化（%d → %d），作废当前决策上下文并重新规划",
+                    task.id,
+                    state.run_version,
+                    task.version,
+                )
+                state.run_version = task.version
+                task.plan = []
+                state.prepared = False
+                checkpoint = None
+                self._save_checkpoint(task, state, last_observation)
+                continue
 
             # ---- Observe ----
             observation = self._observe(task, state, session)
@@ -299,7 +340,7 @@ class AgentRuntime:
             if assessment.requires_confirmation and not state.approved_dangerous:
                 state.pending_confirmation = action
                 self._save_checkpoint(task, state, observation)
-                task.mark(TaskStatus.WAITING)
+                task.mark(TaskStatus.WAITING, source="runtime")
                 self._persist(task)
                 logger.warning("任务 %s 命中危险动作，等待人工确认：%s", task.id, action.type.value)
                 self._emit(
@@ -626,9 +667,16 @@ class AgentRuntime:
         )
 
         if settled.action is reconciliation.ReconcileAction.CONTINUE:
-            state.last_action_effect = ActionEffectStatus.VERIFIED_SUCCESS
+            # V2.3：Activity/结构变化只能证明「页面动了」，不等于原始动作的 side effect
+            # 已经成立。按证据强度区分 effect 状态，避免把导航直接当成动作成功。
+            if settled.layer == "l5_success_marker":
+                state.last_action_effect = ActionEffectStatus.VERIFIED_SUCCESS
+            elif settled.layer == "l2_navigation":
+                state.last_action_effect = ActionEffectStatus.NAVIGATED
+            else:
+                state.last_action_effect = ActionEffectStatus.UI_CHANGED
             state.pending_effect_reconcile = False
-            logger.info("任务 %s 确认上次动作已生效，从恢复点继续", task.id)
+            logger.info("任务 %s 确认上次动作已生效（%s），从恢复点继续", task.id, settled.layer)
             return None
 
         if settled.action is reconciliation.ReconcileAction.RETRY:
@@ -675,7 +723,7 @@ class AgentRuntime:
     ) -> RunOutcome:
         """把无法自行决断的事交给人，并把任务停在 WAITING。"""
         state.pending_confirmation = action
-        task.mark(TaskStatus.WAITING)
+        task.mark(TaskStatus.WAITING, source="runtime")
         self._persist(task)
         logger.warning("任务 %s 转人工确认：%s", task.id, message)
         self._emit(
@@ -767,7 +815,7 @@ class AgentRuntime:
         )
         if state.goal_rejections > goal_verifier.MAX_GOAL_REJECTIONS:
             state.awaiting_goal_decision = True
-            task.mark(TaskStatus.WAITING)
+            task.mark(TaskStatus.WAITING, source="runtime")
             self._persist(task)
             logger.warning(
                 "任务 %s 完成申请连续被驳回 %d 次，转人工裁定", task.id, state.goal_rejections
@@ -993,7 +1041,7 @@ class AgentRuntime:
                 step.mark(StepStatus.DONE)
         task.sync_current_step()
         self._save_checkpoint(task, state, observation)
-        task.mark(TaskStatus.DONE)
+        task.mark(TaskStatus.DONE, source="runtime")
         self._persist(task)
         logger.info("任务 %s 完成：%s", task.id, action.reason or "模型判定已完成")
         check = state.last_goal_check
@@ -1016,9 +1064,25 @@ class AgentRuntime:
         虽然调度器那边也会兜底标记，但 Runtime 自身不能依赖调用方补齐。
         """
         logger.warning("任务 %s 判定失败：%s", task.id, reason)
-        task.mark(TaskStatus.FAILED)
+        task.mark(TaskStatus.FAILED, source="runtime")
         self._persist(task)
         self._emit(task.id, FAILED, reason=reason)
+        return RunOutcome.FAILED
+
+    def _degrade(self, task: Task, state: RuntimeState, reason: str) -> RunOutcome:
+        """关键持久化失败后的安全态：任务不能再产生 side effect（V2.3）。
+
+        与 _fail 不同：_fail 是「任务执行不下去」；_degrade 是「状态已经落不了盘，
+        继续执行会在崩溃后丢失进度并可能重复副作用」。
+        """
+        logger.error("任务 %s 降级：%s", task.id, reason)
+        task.mark(TaskStatus.DEGRADED, source="runtime")
+        # 降级本身也要尽力落盘；再失败就无力回天了，但至少不会再产生新动作。
+        try:
+            self._persist(task)
+        except PersistenceError:
+            logger.exception("任务 %s 降级状态也无法持久化", task.id)
+        self._emit(task.id, FAILED, reason=reason, degraded=True)
         return RunOutcome.FAILED
 
     # ---- 失败结算（V2.1 §十二 / §十三）----
@@ -1051,7 +1115,7 @@ class AgentRuntime:
         if decision.action is RetryAction.ASK_HUMAN:
             if pending is not None:
                 state.pending_confirmation = pending
-            task.mark(TaskStatus.WAITING)
+            task.mark(TaskStatus.WAITING, source="runtime")
             self._persist(task)
             logger.warning("任务 %s 无法自行决断，转人工确认：%s", task.id, decision.reason)
             return RunOutcome.AWAITING_CONFIRMATION
@@ -1132,6 +1196,9 @@ class AgentRuntime:
         )
         self._checkpoints.save(checkpoint)
         task.checkpoint_id = checkpoint.id
+        # V2.3：checkpoint 与 task pointer 必须一次提交。只写 checkpoint 不写 task
+        # 会在崩溃后产生「checkpoint 存在但 task 不知道它」的孤儿恢复点。
+        self._persist(task)
         self._emit(
             task.id,
             CHECKPOINT_SAVED,
@@ -1164,9 +1231,16 @@ class AgentRuntime:
         return self._trajectory.prompt_context(task.id, 5)
 
     def _persist(self, task: Task) -> None:
+        """关键持久化：任务状态、checkpoint_id、version 等必须落盘。
+
+        V2.3：这是关键持久化，失败不再被吞掉——内存状态继续领先 durable state
+        会导致崩溃恢复后重复执行副作用。失败时抛 PersistenceError，由调用方
+        把任务降级并停止产生新的 side effect。
+        """
         if self._task_store is None:
             return
         try:
             self._task_store.save(task)
-        except Exception:  # noqa: BLE001 - 持久化失败不应中断执行
+        except Exception as exc:  # noqa: BLE001 - 转换后重新抛出
             logger.exception("保存任务 %s 失败", task.id)
+            raise PersistenceError(task.id, str(exc)) from exc

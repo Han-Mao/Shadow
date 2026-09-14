@@ -40,6 +40,9 @@ FAILED = "failed"
 CANCELLED = "cancelled"
 RECOVERED = "recovered"
 
+# V2.3：数据损坏必须被看见，而不是 404。
+TASK_CORRUPTED = "task_corrupted"
+
 # ---- V2.2 新增：把「谁做的决定」也变成可追溯事实 ----
 
 GOAL_REQUESTED = "goal_requested"
