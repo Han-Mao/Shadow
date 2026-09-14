@@ -817,6 +817,32 @@ runtime.run(): 有恢复点 → 走既有对账（validate + needs_reconciliatio
 现在明确它回答「做的是不是同一个动作」，**不含**「哪一屏、哪一次尝试」——后者由
 `current_attempt_id` 承担，两者分开存，不拿一个字段冒充两种语义。
 
+### V2.7 补充（四）：runtime 拆解 + P1-5 的取舍（P2-1 / P1-5）
+
+**P2-1 完成**：`runtime.py` 从 1475 行拆成 6 个文件，用 mixin 组合、零行为改动：
+
+| 文件 | 职责 | 行数 |
+|---|---|---|
+| `runtime.py` | 主类骨架 + 设备选择 + 持久化/事件基础设施 | 297 |
+| `_runtime_types.py` | `RunOutcome` / `RuntimeState` / `ApprovalGrant` 共享类型 | 124 |
+| `_execution.py` | Observe→Think→Act→Verify 主循环 + 阶段方法 + 失败结算 | 816 |
+| `_goal.py` | 完成申请与裁定（GoalVerifier 独立证据） | 172 |
+| `_reconcile.py` | 效果对账（EFFECT_UNKNOWN → 继续/重做/换策略/问人） | 139 |
+| `_confirm.py` | 人工确认（危险动作 / 完成裁定 / 崩溃恢复） | 113 |
+
+拆解方法：**只做物理移动，不改任何行为**。方法之间通过 `self` 互相引用（`_emit` /
+`_persist` / `_save_checkpoint` / `_ask_human`），用 mixin 共享同一实例——所以
+`AgentRuntime` 的公共 API（`run` / `confirm` / `forget` / `is_goal_decision` /
+`last_goal_check` / `pending_confirmation` / `recovery_pending`）逐字不变，441 个用例
+零回归就是证明。
+
+**P1-5（事件驱动状态迁移）本轮不做，如实说明**：文档建议把 Runtime / Scheduler 的
+`task.mark(...)` 全部替换成「产生事件 → TaskManager.transition」的调用。核对后发现：
+当前已有**唯一迁移实现**（`Task.transition_to`）+ **`source` 全量审计** + **终态硬闸**，
+「迁移是否合法」这个正确性已经由状态机兜住；缺的只是「单入口」这个工程洁癖。而它牵涉
+Runtime / Scheduler / TaskManager 三处全部写入点，回归风险远大于收益。留给真正需要
+多进程 / 多写者时再和 V2.6 §8 的 TaskMutationService 一起做。
+
 ### 对审核最后五条不变量的对照
 
 | 不变量 | 现状 |
