@@ -490,7 +490,8 @@ VLM → DONE_REQUEST → GoalVerifier → 确认 / 打回继续做 / 转人工�
 
 - **完成变得更保守**：模型声称完成时若既没走完计划、页面一次都没推进、又没给理由，
   会被驳回并塞一个 Re-plan 理由继续做；连续驳回超过 `MAX_GOAL_REJECTIONS`(2) 次转人工。
-  想回到旧行为可设 `GOAL_VERIFY_MODE=off`，要更严可设 `strict`。
+  严格度默认**按任务画像自动分层**（见环境变量表）：纯查询走 `advisory`，
+  导航 / 副作用 / 改设置走 `strict`。显式设 `GOAL_VERIFY_MODE` 会**整体覆盖**该分层。
 - **拿不到验证观察时会重做一次动作**（普通动作）。这是有意的：页面结构完全没变
   说明上次很可能没生效；危险动作不在其列。
 - **风险告警不再误报**：只有模型**明确声明**了更低的风险才算降级尝试，
@@ -534,7 +535,7 @@ python -m api.server    # 监听 127.0.0.1:8010
 | `SHADOW_API_READONLY_TOKEN` | 只读令牌（仅 GET） | 未设置 |
 | `SHADOW_API_DEVICE_ALLOW` | 令牌可操作的设备 serial，逗号分隔 | 不限 |
 | `SHADOW_REQUIRE_AUTH` | 置 1 时即使没配令牌也拒绝一切请求 | 未设置 |
-| `GOAL_VERIFY_MODE` | 完成验证严格度：`off` / `advisory`(默认) / `strict` | `advisory` |
+| `GOAL_VERIFY_MODE` | 完成验证严格度。未设置 / `auto`：**按任务画像**自动判定（纯查询→`advisory`、导航/副作用→`strict`）；`off` / `advisory` / `strict`：**全局覆盖**该判定 | 未设置（按画像） |
 | `AUDIT_DIR` | 请求审计目录 | `$STORAGE_DIR/audit` |
 | `SHADOW_AUDIT` | 置 0 关闭请求审计 | 开启 |
 | `SHADOW_DEBUG` | 置 1 时 500 响应回传异常摘要（默认脱敏） | 未设置 |
