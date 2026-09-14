@@ -227,6 +227,24 @@ class AgentRuntime:
 
     # ---- 对外 ----
 
+    @staticmethod
+    def _sync_durable_state(task: Task, state: RuntimeState) -> None:
+        """把该跨重启存活的运行时状态同步到 Task 上（V2.7 P0-1）。
+
+        「哪些运行时状态必须落盘」是有判断的，不是越多越好：
+
+        - **`denied_fingerprints` 必须持久化**：它记的是「用户明确拒绝过这个动作」。
+          只放内存的话，重启后系统会重新请求同一个动作——骚扰，而且让人以为系统没记住。
+        - **`approval`（放行凭据）刻意不落盘**：批准是针对**当时那一屏**给的，重启后
+          页面可能已经变了；把批准带过重启，等于执行一个用户从没真正看过的东西。
+          恢复后重新请人确认是**正确行为**，不是缺陷。
+        - `pending_confirmation` / `goal_approved_by_human` 同理：都是「此刻这一屏」的
+          上下文，重启即失效（`recover()` 会留下 `confirmation_reset` 的记录）。
+        """
+        for fingerprint in state.denied_fingerprints:
+            if fingerprint not in task.denied_fingerprints:
+                task.denied_fingerprints.append(fingerprint)
+
     def _gate_crash_recovery(self, task: Task) -> RunOutcome | None:
         """崩溃恢复门禁（V2.6 §七）：先回答「上次那个动作到底发出去没有」。
 
@@ -271,6 +289,8 @@ class AgentRuntime:
 
         state = self._state_for(task)
         state.run_version = task.version
+        # 载入跨重启存活的决策状态（V2.7 P0-1）：用户否决过的动作，重启之后依然算数
+        state.denied_fingerprints.update(task.denied_fingerprints)
         # 本任务跑在哪台设备上，由绑定决定——多设备时 worker 线程各跑各的，
         # 所以这个 session 只作为**局部变量**贯穿本次 run，不进实例状态
         session = self._session_for(task)
@@ -320,6 +340,10 @@ class AgentRuntime:
         last_observation: Observation | None,
     ) -> RunOutcome:
         while True:
+            # V2.7 P0-1：把该跨重启存活的运行时状态同步到任务上（随下一次 persist 落盘）。
+            # 只同步「否决黑名单」这类必须记住的东西，取舍见 `_sync_durable_state`。
+            self._sync_durable_state(task, state)
+
             # ---- 安全点 ----
             if task.status in TERMINAL_STATUSES:
                 # V2.5 §六：终态意味着「不该再产生任何副作用」。正常路径走不到这里

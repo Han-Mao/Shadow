@@ -203,6 +203,13 @@ class Task(BaseModel):
     # 严禁默认「从 QUEUED 重新规划然后接着点手机」。
     recovery_required: bool = False
 
+    # 用户明确否决过的动作指纹（V2.7 P0-1）：必须**跨重启存活**。
+    # 只存在内存里时，重启后系统会再问一遍用户已经拒绝过的动作——除了骚扰，更糟的是
+    # 让人以为「系统没记住我说的话」。
+    # 与之相对，**放行凭据（ApprovalGrant）刻意不落盘**：批准是针对当时那一屏给的，
+    # 重启后页面可能早就变了，重新请人确认才是正确行为。
+    denied_fingerprints: list[str] = Field(default_factory=list)
+
     # 当前聚焦的步骤（V2.1 §二十一）。由 next_pending_step 选出谁就记谁，
     # 便于 API / 日志直接回答「现在在干哪一步」，不用再从 plan 里推算一遍。
     active_step_id: str | None = None

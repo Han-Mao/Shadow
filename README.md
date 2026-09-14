@@ -85,7 +85,7 @@ VLM 决定「下一步点哪里」，调度与检查点决定「多件事怎么�
 ├── scripts/
 │   ├── demo_preemption.py  # 抢占恢复演示（离线可跑）
 │   └── replay_task.py      # 命令行回放一个任务的事件流
-└── tests/                  # 436 个离线用例
+└── tests/                  # 439 个离线用例
 ```
 
 ## 职责边界
@@ -402,7 +402,7 @@ Scheduler
 等原设备回来（V2.3 起），改派等于把任务上下文悄悄丢到另一台手机上。
 
 单设备时只有一条车道，与旧实现逐字等价——这一点由当时的 257 个既有测试守着
-（V2.7 修复轮之后合计 436 个）。
+（V2.7 修复轮之后合计 439 个）。
 
 ### 多设备暴露出的两个正确性问题
 
@@ -761,7 +761,7 @@ runtime.run(): 有恢复点 → 走既有对账（validate + needs_reconciliatio
 
 | 审查项 | 为什么先不做 / 打算什么时候做 |
 |---|---|
-| P0-1 运行时状态只在内存 | 这些状态丢失的方向是**保守**的：`pending_confirmation` / `approved_dangerous` 丢了意味着**重新请人确认**，不是悄悄放行。唯一真实的副作用是 `denied_fingerprints` 丢失后可能再问一次已被否决的动作（骚扰，不危险）。修法（确认状态持久化）应该和 P0-2 的凭证一起设计——本轮先把凭证做成**可持久化的形状**（`ApprovalGrant` 已是 dataclass），落盘是下一步 |
+| P0-1 运行时状态只在内存 | **已在后续补充里按「有选择的持久化」做掉**（见下）：`denied_fingerprints` 落盘到 Task；`approval` / `pending_confirmation` / `goal_approved_by_human` **刻意不落盘**，理由写在代码里 |
 | P1-5 状态迁移分散 | 已有唯一实现 `Task.transition_to()` + `source` 审计 + 终态硬闸；「事件驱动迁移」是更大的重构 |
 | P1-6 队列与持久化非原子 | 单进程内每 lane 单 worker + `lane.running` 单一，「两个 worker 拥有同一任务」不会发生；**跨进程**才需要 Task Lease —— 与 V2.6 §8 同一条触发条件 |
 | P1-9 checkpoint 门控 | `task_version` 已门控（不匹配直接 STALE）；`plan_version` **刻意不门控**（页面没变就该能续跑，V2.2 §十一 的取舍）；`action_attempt_id` 通过 `needs_reconciliation` 参与「先对账、再继续」 |
@@ -783,6 +783,23 @@ runtime.run(): 有恢复点 → 走既有对账（validate + needs_reconciliatio
   （语言标记撑住，字面几乎零重叠也无妨）；而 LLM 只给 0.5 置信度、两句又零共享时不再并入。
 - `AFFINITY_FLOOR` 由 `0.08` 提到 `0.35` 并重新定位：它不再是「唯一否决器」，
   而是「既没有语言标记、也没有共享实词时」的那一档门槛。
+
+### V2.7 补充（二）：确认状态哪些该落盘、哪些故意不落
+
+审核要求「任何影响恢复后是否允许执行动作的状态，都不能只存在内存里」。核对之后结论是
+**分而治之**，而不是一股脑全落盘：
+
+| 状态 | 处置 | 理由 |
+|---|---|---|
+| `denied_fingerprints`（用户否决过的动作） | **落盘**到 `Task.denied_fingerprints` | 丢了只会在重启后又问一遍用户已经拒绝过的动作——骚扰之外，更让人以为系统没记住 |
+| `approval`（危险动作放行凭据） | **不落盘** | 批准是针对**当时那一屏**给的；重启后页面可能早就变了，把批准带过重启等于执行一个用户从没真正看过的东西 |
+| `pending_confirmation`（待确认动作） | **不落盘** | 同上；`recover()` 会重新决策并再次请求确认 |
+| `goal_approved_by_human`（人工认定完成） | **不落盘** | 同样是「当时那一屏」的上下文 |
+
+实现：`run()` 起始把 `task.denied_fingerprints` 载入运行时状态；循环每轮
+`_sync_durable_state()` 把新增的否决回写到 Task，随下一次 persist 落盘。
+`recover()` 对 WAITING 任务的恢复记录改成 `queued(from waiting, confirmation_reset)`——
+让「确认上下文已作废」这件事**可见**，否则排查时会把「确认没了」当成 bug。
 
 ### 对审核最后五条不变量的对照
 
@@ -915,7 +932,7 @@ pip install -r requirements.txt
 python -m pytest -q
 ```
 
-**436 个用例，全部离线**：不需要 adb、模拟器或 API Key。
+**439 个用例，全部离线**：不需要 adb、模拟器或 API Key。
 
 | 文件 | 覆盖 |
 |---|---|

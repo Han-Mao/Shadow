@@ -315,13 +315,20 @@ class TaskScheduler:
                         restored_as = "queued(from running, recovery_required)"
                     else:
                         # created / queued / waiting
-                        # waiting 说明在等人工确认，重启后重新决策一次比沿用旧确认更安全
+                        # waiting 说明在等人工确认。**确认上下文（危险动作待确认、人工完成
+                        # 认定）不跨重启**（V2.7 P0-1）：确认是针对「当时那一屏」给的，
+                        # 重启后重新决策一次比沿用旧确认更安全。这里把这件事写进恢复记录，
+                        # 免得后人把「确认没了」当成 bug。
                         previous = task.status.value
                         task.mark(TaskStatus.QUEUED, source="scheduler")
                         lane = self._lane_for(task)
                         lane.push_ready(task, self._counter)
                         restored["queued"] += 1
-                        restored_as = f"queued(from {previous})"
+                        restored_as = (
+                            "queued(from waiting, confirmation_reset)"
+                            if previous == TaskStatus.WAITING.value
+                            else f"queued(from {previous})"
+                        )
                 except DeviceUnavailableError:
                     task.mark(TaskStatus.DEVICE_UNAVAILABLE, source="scheduler")
                     self._device_unavailable[task.id] = task
