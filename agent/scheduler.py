@@ -667,6 +667,10 @@ class TaskScheduler:
         if self._task_store is None:
             return
         try:
+            # 与 runtime._persist 同一条约定（V2.6 §八）：**刻意不带** `expected_revision`。
+            # 单进程内三个模块共享内存 Task 实例，revision 随任一写者推进，磁盘与内存一致，
+            # 这里加 CAS 只会把「内存比磁盘新」的正常情形误判成冲突。
+            # 跨进程保护要靠文件锁 / 数据库事务，届时统一收口，而不是逐点补参数。
             self._task_store.save(task)
         except Exception as exc:  # noqa: BLE001 - 转换后重新抛出
             logger.exception("保存任务 %s 失败", task.id)

@@ -1340,6 +1340,13 @@ class AgentRuntime:
         if self._task_store is None:
             return
         try:
+            # 这里**刻意不带** `expected_revision`（V2.6 §八，有理由的延期）：
+            # 本进程内 Runtime / Scheduler / TaskManager 持有的是同一批内存 Task 实例，
+            # `task.revision` 随任一写者推进，磁盘序号与内存天然一致——再加 CAS 不增加
+            # 保护，反而会把「内存比磁盘新」（调度器先改内存、稍后统一落盘）这种**正常**
+            # 情形误判成冲突。
+            # 真正需要 CAS 的是**跨进程**写入，那得靠文件锁或数据库事务；到时候统一收口到
+            # 一个 TaskMutationService，而不是在这里逐点补 expected_revision。
             self._task_store.save(task)
         except Exception as exc:  # noqa: BLE001 - 转换后重新抛出
             logger.exception("保存任务 %s 失败", task.id)

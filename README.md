@@ -693,16 +693,26 @@ runtime.run(): 有恢复点 → 走既有对账（validate + needs_reconciliatio
 
 ### 这一轮没有做的事（如实说明）
 
-审核 §8 指出根因：**TaskManager 有 CAS，而 Runtime 与 Scheduler 仍直接 `save()`** ——
-三个模块各有一份写权限，CAS 只是「改写入口保护」。文档建议引入统一的
-`TaskMutationService`。本轮**没有做这个重构**，理由：
+审核 §8 指出根因：**CAS 只覆盖了「改写入口」，其他写入路径都是普通 `save()`** ——
+整个 Task 写入协议并不统一：
 
-- 单进程内三者持有的是**同一批内存 Task 实例**，`task.revision` 会随任一写者推进；
-  给 Runtime / Scheduler 的 `save` 硬加 `expected_revision` 并不增加保护，反而会把
-  「内存比磁盘新」这类正常情形误判成冲突；
+| 写入点 | 是否带 CAS | 说明 |
+|---|---|---|
+| `TaskManager._rewrite_authoritative` | ✅ `expected_revision` | 改写当前任务（SUBTASK / SUPER_TASK） |
+| `TaskManager.create / complete / fail`、恢复否决 | ❌ | 都在 `_mutation_lock` 内；`create` 本来就无旧记录可校验 |
+| `Runtime._persist`（`runtime.py:1343`） | ❌ | 执行过程中的状态推进 |
+| `Scheduler._persist`（`scheduler.py:670`） | ❌ | 调度过程中的状态推进 |
+
+本轮**没有**做文档建议的 `TaskMutationService` 重构，理由：
+
+- 单进程内这几处持有的是**同一批内存 Task 实例**，`task.revision` 随任一写者推进，
+  磁盘序号与内存天然一致；硬加 `expected_revision` 不增加保护，反而会把
+  「内存比磁盘新」（调度器先改内存、稍后统一落盘）这类**正常**情形误判成冲突；
 - 真正的跨进程保护需要文件锁 / 数据库事务——已在待办里标为「多进程部署前必须先做」。
 
-也就是说：**这一条适合等存储换成 SQLite 时一起做**，而不是现在加一层解决不了问题的封装。
+**这不是「忘了做」，而是带明确复查条件的延期**：两处 `save` 调用点旁边已经就地写了
+注释，说明为什么这里不带 CAS、以及什么时候必须改。触发条件只有两个——**多进程 /
+多实例部署**，或**存储换成 SQLite**；届时把写入统一收口成一个协议，而不是逐点补参数。
 
 ## 快速开始
 
