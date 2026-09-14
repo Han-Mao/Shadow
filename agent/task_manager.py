@@ -18,7 +18,7 @@ from typing import Any, Callable
 from models.budget import TaskBudget
 from models.exceptions import ConcurrentModificationError
 from models.retry import DEFAULT_POLICY
-from models.task import Task, TaskPriority, TaskStatus, priority_rank
+from models.task import Task, TaskEvent, TaskPriority, TaskStatus, priority_rank
 from models.task_relation import TaskRelation, TaskRelationResult
 from models.task_step import StepStatus, TaskStep
 
@@ -117,7 +117,7 @@ class TaskManager:
             relation_meta=dict(relation_meta or {}),
             device_serial=device_serial,
         )
-        task.mark(TaskStatus.CREATED, source="task_manager")
+        task.apply_event(TaskEvent.CREATED, source="task_manager")
         self._store.save(task)
         if submit:
             self._scheduler.submit(task, allowed_devices=allowed_devices)
@@ -179,7 +179,7 @@ class TaskManager:
                 logger.warning("任务 %s 正在执行，拒绝从外部直接标记完成（V2.5 §六）", task_id)
                 return None
             task.sync_current_step()
-            task.mark(TaskStatus.DONE, source="task_manager")
+            task.apply_event(TaskEvent.COMPLETED, source="task_manager")
             self._store.save(task)
             return task
 
@@ -192,7 +192,7 @@ class TaskManager:
             if task.status is TaskStatus.RUNNING:
                 logger.warning("任务 %s 正在执行，拒绝从外部直接标记失败（V2.5 §六）", task_id)
                 return None
-            task.mark(TaskStatus.FAILED, source="task_manager")
+            task.apply_event(TaskEvent.FAILED, source="task_manager")
             self._store.save(task)
             return task
 
@@ -263,7 +263,7 @@ class TaskManager:
                 # V2.6 §七：人判断「不要继续」——不再自动重跑，落在 DEGRADED 等人工处置
                 if not self._runtime.confirm(task_id, approved):
                     return None
-                task.mark(TaskStatus.DEGRADED, source="task_manager")
+                task.apply_event(TaskEvent.DEGRADED, source="task_manager")
                 self._store.save(task)
                 logger.warning("任务 %s 的崩溃恢复被否决，转入 degraded 等人工处置", task_id)
                 return task

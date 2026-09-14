@@ -85,7 +85,7 @@ VLM 决定「下一步点哪里」，调度与检查点决定「多件事怎么�
 ├── scripts/
 │   ├── demo_preemption.py  # 抢占恢复演示（离线可跑）
 │   └── replay_task.py      # 命令行回放一个任务的事件流
-└── tests/                  # 441 个离线用例
+└── tests/                  # 445 个离线用例
 ```
 
 ## 职责边界
@@ -402,7 +402,7 @@ Scheduler
 等原设备回来（V2.3 起），改派等于把任务上下文悄悄丢到另一台手机上。
 
 单设备时只有一条车道，与旧实现逐字等价——这一点由当时的 257 个既有测试守着
-（V2.7 修复轮之后合计 441 个）。
+（V2.7 修复轮之后合计 445 个）。
 
 ### 多设备暴露出的两个正确性问题
 
@@ -755,15 +755,15 @@ runtime.run(): 有恢复点 → 走既有对账（validate + needs_reconciliatio
 |---|---|
 | P1-1 抢占被长 ADB 阻塞 | `adb.deadline_budget(seconds)` 给整段采集加总预算，每条命令超时取 `min(自己的, 剩余预算)`；采集类 6s、写类 15s。另有抢占延迟观测与超阈值告警 |
 | P1-10 完成验证过度依赖页面变化 | `goal_verifier` 的三条独立证据里「页面推进过」只是其中之一；strict 模式还要求计划跑完 + 可核验声明与真实页面相符——页面变化**单独**不足以放行完成 |
-| P1-7 只读端点是否真的只读 | `/screenshot`、`/observe` 底层是截图 + `uiautomator dump`，都不改变设备状态；真正会动手机的 `/tap`、`/text`、`/actions` 才拿设备独占锁 |
+| P1-7 只读端点是否真的只读 | **已强化**（见「V2.7 补充（五）」）：新增 `device.adb.is_read_only()` 结构化声明，只读端点调用的底层操作可查证；不再只靠端点名约定 |
 
 ### 有理由的延期（附触发条件）
 
 | 审查项 | 为什么先不做 / 打算什么时候做 |
 |---|---|
 | P0-1 运行时状态只在内存 | **已在后续补充里按「有选择的持久化」做掉**（见下）：`denied_fingerprints` 落盘到 Task；`approval` / `pending_confirmation` / `goal_approved_by_human` **刻意不落盘**，理由写在代码里 |
-| P1-5 状态迁移分散 | 已有唯一实现 `Task.transition_to()` + `source` 审计 + 终态硬闸；「事件驱动迁移」是更大的重构 |
-| P1-6 队列与持久化非原子 | 单进程内每 lane 单 worker + `lane.running` 单一，「两个 worker 拥有同一任务」不会发生；**跨进程**才需要 Task Lease —— 与 V2.6 §8 同一条触发条件 |
+| P1-5 状态迁移分散 | **已完成**（见「V2.7 补充（五）」）：`Task.apply_event` 事件驱动迁移，33 处 `task.mark(TaskStatus.X)` 全部改为 `apply_event(TaskEvent.X)`，语义映射集中到 `_EVENT_TO_STATUS` |
+| P1-6 队列与持久化非原子 | **已完成**（见「V2.7 补充（五）」）：`resume()` / `on_device_available()` 的「入队先于落盘」顺序瑕疵修复，统一为「先落盘、再唤醒 worker」；跨进程 Task Lease 仍留待多进程部署 |
 | P1-9 checkpoint 门控 | `task_version` 已门控（不匹配直接 STALE）；`plan_version` **刻意不门控**（页面没变就该能续跑，V2.2 §十一 的取舍）；`action_attempt_id` 通过 `needs_reconciliation` 参与「先对账、再继续」 |
 | P2-1 / 2 / 3 | runtime 过大、错误分类依赖文本、fingerprint 语义分层——代码质量项，进待办 |
 
@@ -833,7 +833,7 @@ runtime.run(): 有恢复点 → 走既有对账（validate + needs_reconciliatio
 拆解方法：**只做物理移动，不改任何行为**。方法之间通过 `self` 互相引用（`_emit` /
 `_persist` / `_save_checkpoint` / `_ask_human`），用 mixin 共享同一实例——所以
 `AgentRuntime` 的公共 API（`run` / `confirm` / `forget` / `is_goal_decision` /
-`last_goal_check` / `pending_confirmation` / `recovery_pending`）逐字不变，441 个用例
+`last_goal_check` / `pending_confirmation` / `recovery_pending`）逐字不变，445 个用例
 零回归就是证明。
 
 **P1-5（事件驱动状态迁移）本轮不做，如实说明**：文档建议把 Runtime / Scheduler 的
@@ -842,6 +842,26 @@ runtime.run(): 有恢复点 → 走既有对账（validate + needs_reconciliatio
 「迁移是否合法」这个正确性已经由状态机兜住；缺的只是「单入口」这个工程洁癖。而它牵涉
 Runtime / Scheduler / TaskManager 三处全部写入点，回归风险远大于收益。留给真正需要
 多进程 / 多写者时再和 V2.6 §8 的 TaskMutationService 一起做。
+
+### V2.7 补充（五）：P1-5 / P1-6 / P1-7 收尾
+
+**P1-5 事件驱动状态迁移**（上文的「不做」被推翻，用户确认要做）：
+
+- 新增 `TaskEvent` 枚举 + `_EVENT_TO_STATUS` 集中映射 + `Task.apply_event(event, source=)`。
+- 33 处 `task.mark(TaskStatus.X)` 全部改为 `task.apply_event(TaskEvent.X)`：
+  各模块不再指定目标状态，而是声明「发生了什么」（如 `DISPATCHED`、`AWAITING_CONFIRMATION`、
+  `DEVICE_LOST`、`PAUSED_BY_PREEMPTION`），目标状态由 `_EVENT_TO_STATUS` 唯一裁决。
+- `mark` / `transition_to` 仍是底层原语，**终态硬闸与 source 审计的语义完全不变**——
+  事件驱动是「语义收口」，不是「另起炉灶」。
+
+**P1-6 队列/持久化原子性**：`resume()` 和 `on_device_available()` 原来「入队（push_ready）
+先于落盘（persist）」，worker 可能在任务还没持久化时就被唤醒取走，进程恰在那刻崩溃会导致
+`recover()` 重复投递。统一改为**先落盘、再唤醒 worker**（与 `submit` 同一条纪律）。
+
+**P1-7 只读操作结构化声明**：新增 `device.adb.is_read_only(operation)` 与
+`READ_ONLY_OPERATIONS` 集合。只读封装（`screenshot` / `dump_ui` / `screen_size` /
+`current_focus` / `state`）返回 True；`shell` / `read_shell` 是万能口、保守返回 False。
+「只读端点是否真的只读」从此可从代码查证，而不是靠人记住约定。
 
 ### 对审核最后五条不变量的对照
 
@@ -974,7 +994,7 @@ pip install -r requirements.txt
 python -m pytest -q
 ```
 
-**441 个用例，全部离线**：不需要 adb、模拟器或 API Key。
+**445 个用例，全部离线**：不需要 adb、模拟器或 API Key。
 
 | 文件 | 覆盖 |
 |---|---|

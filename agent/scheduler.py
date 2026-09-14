@@ -35,6 +35,7 @@ from models.task import (
     PAUSED_BY_PREEMPTION,
     PAUSED_BY_USER,
     Task,
+    TaskEvent,
     TaskStatus,
     priority_rank,
 )
@@ -299,7 +300,7 @@ class TaskScheduler:
                     elif task.status is TaskStatus.CANCEL_REQUESTED:
                         # V2.5 §七：重启前收到的取消请求——现在没有 runtime 在跑，直接落定。
                         # 绝不能把一条「已请求取消」的任务重新投递出去执行。
-                        task.mark(TaskStatus.CANCELLED, source="scheduler")
+                        task.apply_event(TaskEvent.CANCELLED, source="scheduler")
                         self._mark_completed(task.id)
                         restored["cancelled"] += 1
                         restored_as = "cancelled"
@@ -308,7 +309,7 @@ class TaskScheduler:
                         # 没有是未知的。标上 recovery_required，让 runtime 在真正跑之前
                         # 先处理（有恢复点就对账，没有就转人工），而不是当普通任务重跑。
                         task.recovery_required = True
-                        task.mark(TaskStatus.QUEUED, source="scheduler")
+                        task.apply_event(TaskEvent.RESUMED, source="scheduler")
                         lane = self._lane_for(task)
                         lane.push_ready(task, self._counter)
                         restored["queued"] += 1
@@ -320,7 +321,7 @@ class TaskScheduler:
                         # 重启后重新决策一次比沿用旧确认更安全。这里把这件事写进恢复记录，
                         # 免得后人把「确认没了」当成 bug。
                         previous = task.status.value
-                        task.mark(TaskStatus.QUEUED, source="scheduler")
+                        task.apply_event(TaskEvent.RESUMED, source="scheduler")
                         lane = self._lane_for(task)
                         lane.push_ready(task, self._counter)
                         restored["queued"] += 1
@@ -330,7 +331,7 @@ class TaskScheduler:
                             else f"queued(from {previous})"
                         )
                 except DeviceUnavailableError:
-                    task.mark(TaskStatus.DEVICE_UNAVAILABLE, source="scheduler")
+                    task.apply_event(TaskEvent.DEVICE_LOST, source="scheduler")
                     self._device_unavailable[task.id] = task
                     restored["device_unavailable"] += 1
                     restored_as = "device_unavailable"
@@ -365,11 +366,11 @@ class TaskScheduler:
         try:
             with self._cond:
                 lane = self._lane_for(task, allowed_devices)
-                task.mark(TaskStatus.QUEUED, source="scheduler")
+                task.apply_event(TaskEvent.SUBMITTED, source="scheduler")
                 lane.push_ready(task, self._counter)
         except DeviceUnavailableError:
             with self._cond:
-                task.mark(TaskStatus.DEVICE_UNAVAILABLE, source="scheduler")
+                task.apply_event(TaskEvent.DEVICE_LOST, source="scheduler")
                 self._device_unavailable[task.id] = task
             self._persist_or_degrade(task)
             return task
@@ -411,7 +412,7 @@ class TaskScheduler:
             if lane is not None:
                 lane.drop(task_id)
             self._paused[task_id] = task
-            task.mark(TaskStatus.PAUSED, paused_reason=PAUSED_BY_USER, source="scheduler")
+            task.apply_event(TaskEvent.PAUSED_BY_USER, source="scheduler")
         if not self._persist_or_degrade(task):
             return False
         self._emit(task_id, SUSPENDED, reason=PAUSED_BY_USER)
@@ -430,11 +431,16 @@ class TaskScheduler:
             except DeviceUnavailableError:
                 self._paused[task_id] = task
                 return False
-            task.mark(TaskStatus.QUEUED, source="scheduler")
+            task.apply_event(TaskEvent.RESUMED, source="scheduler")
             lane.push_ready(task, self._counter)
-            self._cond.notify_all()
+        # V2.7 P1-6：**先落盘、再唤醒 worker**（与 submit 同一条纪律，见 submit 注释）。
+        # 原来 notify_all 在锁内、persist 在锁外——worker 可能在任务还没持久化时就被唤醒
+        # 取走，进程恰在那一刻崩溃，磁盘上仍是 PAUSED，而内存队列里它已经进过 ready，
+        # recover() 会重复投递。把 persist 提到 notify 之前，先让「已恢复」这个事实落盘。
         if not self._persist_or_degrade(task):
             return False
+        with self._cond:
+            self._cond.notify_all()
         self._emit(task_id, RESUMED)
         return True
 
@@ -456,7 +462,7 @@ class TaskScheduler:
                 # CANCEL_REQUESTED（请求已收到、设备侧可能还在动），由 Runtime 在下一个
                 # 安全点退出、经 `_handle_outcome` 落成 CANCELLED。否则「点击发送 →
                 # 立刻取消」会显示 cancelled，而消息其实已经发出去了。
-                task.mark(TaskStatus.CANCEL_REQUESTED, source="scheduler")
+                task.apply_event(TaskEvent.CANCEL_REQUESTED, source="scheduler")
                 if not self._persist_or_degrade(task):
                     return False
                 logger.info("任务 %s 已记录取消请求，等待安全点退出", task_id)
@@ -467,7 +473,7 @@ class TaskScheduler:
             self._paused.pop(task_id, None)
             self._device_unavailable.pop(task_id, None)
             # 没在跑的任务：设备侧本来就没有动作在途，直接落定
-            task.mark(TaskStatus.CANCELLED, source="scheduler")
+            task.apply_event(TaskEvent.CANCELLED, source="scheduler")
         if not self._persist_or_degrade(task):
             return False
         return True
@@ -693,7 +699,7 @@ class TaskScheduler:
             return True
         except PersistenceError:
             logger.error("任务 %s 持久化失败，从调度队列降级", task.id)
-            task.mark(TaskStatus.DEGRADED, source="scheduler")
+            task.apply_event(TaskEvent.DEGRADED, source="scheduler")
             try:
                 self._persist(task)
             except PersistenceError:
@@ -753,14 +759,16 @@ class TaskScheduler:
                     self._device_unavailable.pop(task_id, None)
                     continue
                 self._device_unavailable.pop(task_id, None)
-                task.mark(TaskStatus.QUEUED, source="scheduler")
+                task.apply_event(TaskEvent.RESUMED, source="scheduler")
                 lane.push_ready(task, self._counter)
                 recovered.append(task)
-            if recovered:
-                self._cond.notify_all()
+        # V2.7 P1-6：**先落盘、再唤醒 worker**（与 submit / resume 同一条纪律）。
         for task in recovered:
             self._persist_or_degrade(task)
             logger.info("设备 %s 恢复，任务 %s 重新入队", serial, task.id)
+        if recovered:
+            with self._cond:
+                self._cond.notify_all()
         return [task.id for task in recovered]
 
     def _ensure_lane(self, serial: str) -> _DeviceLane | None:
@@ -842,18 +850,18 @@ class TaskScheduler:
                 # V2.4 §七：持久化失败 ≠ 任务失败。前者必须停在 DEGRADED——
                 # 内存状态已经领先 durable state，继续跑会在崩溃后重复副作用。
                 logger.error("任务 %s 因关键持久化失败降级：%s", task.id, exc)
-                self._reap_worker_failure(task, lane, TaskStatus.DEGRADED)
+                self._reap_worker_failure(task, lane, TaskEvent.DEGRADED)
             except DeviceUnavailableError as exc:
                 # 设备掉线同样不是任务失败：原设备回来还能接着做。
                 logger.warning("任务 %s 绑定的设备不可用，转入等待：%s", task.id, exc)
                 with self._cond:
                     self._device_unavailable[task.id] = task
-                self._reap_worker_failure(task, lane, TaskStatus.DEVICE_UNAVAILABLE)
+                self._reap_worker_failure(task, lane, TaskEvent.DEVICE_LOST)
             except Exception:  # noqa: BLE001 - Worker 线程绝不能因单个任务而退出
                 logger.exception("任务 %s 执行时发生未捕获异常（ERROR_CLASS=INTERNAL）", task.id)
-                self._reap_worker_failure(task, lane, TaskStatus.FAILED)
+                self._reap_worker_failure(task, lane, TaskEvent.FAILED)
 
-    def _reap_worker_failure(self, task: Task, lane: _DeviceLane, status: TaskStatus) -> None:
+    def _reap_worker_failure(self, task: Task, lane: _DeviceLane, event: TaskEvent) -> None:
         """Worker 兜底：按异常性质落状态、释放车道占用、尽力持久化（V2.4 §七）。
 
         原来的兜底是 `except Exception: mark(FAILED)` —— 又放了一个垃圾桶，
@@ -863,7 +871,7 @@ class TaskScheduler:
         只有真正的未知异常才是 FAILED。
         """
         with self._cond:
-            task.mark(status, source="scheduler")
+            task.apply_event(event, source="scheduler")
             # 只有终态才算「这条任务结束了」；DEVICE_UNAVAILABLE 还会回来，
             # 记进完成列表会让 snapshot 误报。
             if task.is_terminal:
@@ -897,7 +905,7 @@ class TaskScheduler:
 
             acquired = True
             if task.status is not TaskStatus.RUNNING:
-                task.mark(TaskStatus.RUNNING, source="scheduler")
+                task.apply_event(TaskEvent.DISPATCHED, source="scheduler")
                 if not self._persist_or_degrade(task):
                     return
             logger.info("开始执行任务 %s（设备 %s）：%s", task.id, lane.serial, task.instruction)
@@ -941,11 +949,11 @@ class TaskScheduler:
             return
 
         if name == "done":
-            task.mark(TaskStatus.DONE, source="scheduler")
+            task.apply_event(TaskEvent.COMPLETED, source="scheduler")
         elif name == "cancelled":
-            task.mark(TaskStatus.CANCELLED, source="scheduler")
+            task.apply_event(TaskEvent.CANCELLED, source="scheduler")
         elif name == "suspended":
-            task.mark(TaskStatus.PAUSED, paused_reason=PAUSED_BY_PREEMPTION, source="scheduler")
+            task.apply_event(TaskEvent.PAUSED_BY_PREEMPTION, source="scheduler")
             with self._cond:
                 lane.suspended.append(task)
             self._record_preemption_latency(task.id)
@@ -953,10 +961,10 @@ class TaskScheduler:
         elif name == "awaiting_confirmation":
             # 等人工确认：既不算完成也不算失败，**不能**放进任何队列——
             # 放进去会被 worker 立刻取出重跑，再次撞上同一个危险动作，变成死循环。
-            task.mark(TaskStatus.WAITING, source="scheduler")
+            task.apply_event(TaskEvent.AWAITING_CONFIRMATION, source="scheduler")
             logger.info("任务 %s 等待人工确认危险动作", task.id)
         else:
-            task.mark(TaskStatus.FAILED, source="scheduler")
+            task.apply_event(TaskEvent.FAILED, source="scheduler")
 
         if task.is_terminal:
             with self._cond:

@@ -36,6 +36,57 @@ class TaskStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+class TaskEvent(str, Enum):
+    """任务状态迁移的**语义事件**（V2.7 P1-5）。
+
+    事件驱动的价值不在「换个写法」，而在于把「发生了什么 → 该变成什么状态」的映射
+    **集中到一处**（`Task.apply_event`），而不是散落在 Runtime / Scheduler /
+    TaskManager 的 33 处 `task.mark(TaskStatus.X)` 里各自拍脑袋。
+
+    各模块不再直接指定目标状态，而是声明「发生了什么」；迁移目标由这里统一决定，
+    于是「Runtime 说暂停了、Scheduler 说还在跑」这类跨模块语义冲突在源头就无从发生。
+    `mark` / `transition_to` 仍是底层唯一原语（终态硬闸 + source 审计不变）。
+    """
+
+    # 生命周期
+    CREATED = "created"              # 任务刚创建
+    SUBMITTED = "submitted"          # 入队待执行
+    DISPATCHED = "dispatched"        # worker 开始执行
+    COMPLETED = "completed"          # 正常跑完
+    FAILED = "failed"                # 执行失败
+    CANCELLED = "cancelled"          # 已取消（副作用已停止）
+    CANCEL_REQUESTED = "cancel_requested"  # 取消请求下达（副作用可能还在途）
+
+    # 中断与恢复
+    PAUSED_BY_USER = "paused_by_user"
+    PAUSED_BY_PREEMPTION = "paused_by_preemption"
+    RESUMED = "resumed"
+
+    # 等待与故障
+    AWAITING_CONFIRMATION = "awaiting_confirmation"  # 危险动作 / 完成裁定 / 崩溃恢复
+    DEVICE_LOST = "device_lost"      # 绑定设备不可用
+    DEGRADED = "degraded"            # 关键持久化失败
+
+
+# 事件 → 目标状态的集中映射（V2.7 P1-5）。
+# 这是「唯一」的语义裁决点：一个事件该落到哪个状态，只有这里说了算。
+_EVENT_TO_STATUS: dict[TaskEvent, TaskStatus] = {
+    TaskEvent.CREATED: TaskStatus.CREATED,
+    TaskEvent.SUBMITTED: TaskStatus.QUEUED,
+    TaskEvent.DISPATCHED: TaskStatus.RUNNING,
+    TaskEvent.COMPLETED: TaskStatus.DONE,
+    TaskEvent.FAILED: TaskStatus.FAILED,
+    TaskEvent.CANCELLED: TaskStatus.CANCELLED,
+    TaskEvent.CANCEL_REQUESTED: TaskStatus.CANCEL_REQUESTED,
+    TaskEvent.PAUSED_BY_USER: TaskStatus.PAUSED,
+    TaskEvent.PAUSED_BY_PREEMPTION: TaskStatus.PAUSED,
+    TaskEvent.RESUMED: TaskStatus.QUEUED,
+    TaskEvent.AWAITING_CONFIRMATION: TaskStatus.WAITING,
+    TaskEvent.DEVICE_LOST: TaskStatus.DEVICE_UNAVAILABLE,
+    TaskEvent.DEGRADED: TaskStatus.DEGRADED,
+}
+
+
 class TaskPriority(str, Enum):
     LOW = "low"
     NORMAL = "normal"
@@ -252,6 +303,24 @@ class Task(BaseModel):
         其它非法迁移仍先记 warning 并执行，避免运行时状态卡住，但要能被看见。
         """
         self.transition_to(status, paused_reason=paused_reason, source=source)
+
+    def apply_event(self, event: TaskEvent, *, source: str = "") -> None:
+        """按**语义事件**迁移状态（V2.7 P1-5）。
+
+        这是事件驱动迁移的入口：调用方声明「发生了什么」，目标状态由 `_EVENT_TO_STATUS`
+        统一裁决，而不是各自写 `TaskStatus.X`。`source` 仍会被带入 `transition_to`
+        用于审计，终态硬闸与非法迁移告警的语义**完全不变**。
+
+        两个暂停事件会带上 `paused_reason`，其余事件自动清空它。
+        """
+        paused_reason = None
+        if event is TaskEvent.PAUSED_BY_USER:
+            paused_reason = PAUSED_BY_USER
+        elif event is TaskEvent.PAUSED_BY_PREEMPTION:
+            paused_reason = PAUSED_BY_PREEMPTION
+        self.transition_to(
+            _EVENT_TO_STATUS[event], paused_reason=paused_reason, source=source
+        )
 
     def transition_to(
         self,

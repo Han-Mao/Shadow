@@ -27,7 +27,7 @@ from models.retry import (
     classify_result,
 )
 from models.state import Observation, StepOutcome
-from models.task import TERMINAL_STATUSES, Task, TaskStatus
+from models.task import TERMINAL_STATUSES, Task, TaskEvent, TaskStatus
 from models.task_step import StepStatus, TaskStep
 from models.verification import ActionDispatch, ActionEffect, DispatchStatus, GoalVerification
 from storage.event_log import (
@@ -183,7 +183,7 @@ class AgentRuntime(
             self._recovery_notes[task.id] = reason
         # 这次标记已经处理过了，人工放行后不该被同一个门禁拦第二次
         task.recovery_required = False
-        task.mark(TaskStatus.WAITING, source="runtime")
+        task.apply_event(TaskEvent.AWAITING_CONFIRMATION, source="runtime")
         self._emit(task.id, WAITING, reason="recovery_requires_human", detail=reason)
         return RunOutcome.AWAITING_CONFIRMATION
 

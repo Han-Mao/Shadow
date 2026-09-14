@@ -501,6 +501,9 @@ def screenshot(request: Request, device_serial: str | None = None):
     只说明这段时间里没有 Shadow 自己的写操作越过去，**不等于**「UI 已经完全静止」
     （V2.4 §八）。所以它适合回答「这张图能不能当权威状态用」，
     不适合回答「这一屏是不是已经不抖了」。
+
+    只读性由 `device.adb.is_read_only` 结构化声明（V2.7 P1-7）：
+    这里只调 `screenshot.capture` → `adb.screenshot`，属于只读封装，不改变设备状态。
     """
     session_item = resolve_manual_device(device_serial, request)
     before = session_item.generation
@@ -528,6 +531,9 @@ def observe(request: Request, device_serial: str | None = None):
     把它当成「当前稳定页面」，否则很容易把过渡动画页当成真实状态（V2.2 §九）。
     `stable=true` 也只是 **no known Shadow write during observation**，
     不代表 UI 已经静止（V2.4 §八）。
+
+    只读性由 `device.adb.is_read_only` 结构化声明（V2.7 P1-7）：observer 只调
+    截图 / `wm size` / `dumpsys` / `uiautomator dump`，都是只读采集，不改设备状态。
     """
     session_item = resolve_manual_device(device_serial, request)
     before = session_item.generation

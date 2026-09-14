@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 
 from models.state import Observation
-from models.task import Task, TaskStatus
+from models.task import Task, TaskEvent, TaskStatus
 from models.task_step import StepStatus, TaskStep
 from storage.event_log import CONFIRMED, GOAL_CONFIRMED, GOAL_REJECTED, GOAL_REQUESTED, WAITING
 
@@ -102,7 +102,7 @@ class GoalControllerMixin:
         )
         if state.goal_rejections > goal_verifier.MAX_GOAL_REJECTIONS:
             state.awaiting_goal_decision = True
-            task.mark(TaskStatus.WAITING, source="runtime")
+            task.apply_event(TaskEvent.AWAITING_CONFIRMATION, source="runtime")
             self._persist(task)
             logger.warning(
                 "任务 %s 完成申请连续被驳回 %d 次，转人工裁定", task.id, state.goal_rejections

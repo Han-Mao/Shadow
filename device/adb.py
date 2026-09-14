@@ -35,6 +35,40 @@ class AdbBudgetExhausted(AdbError):
     """
 
 
+# 只读操作（V2.7 P1-7）：这些方法只**读取**设备状态，不改变设备上的任何东西。
+# API 的只读端点（/screenshot、/observe）只能调用这里面的方法；会改设备的
+# tap / text / swipe / keyevent / am start 一律不在此列。
+# 之前「只读」只是端点名约定，没有结构化声明——加了这个集合之后，
+# 「只读端点是否真的只读」可以从代码里查证，而不是靠人记住约定。
+READ_ONLY_OPERATIONS = frozenset(
+    {
+        "screenshot",
+        "screenshot_bytes",
+        "dump_ui",
+        "screen_size",
+        "current_focus",
+        "state",
+        "read_shell",
+        "shell",  # 危险：shell 本身可以执行任意命令，见 is_read_only 的说明
+    }
+)
+
+# 但 `shell` 是万能执行口，把它算「只读」只在**调用方只传只读命令**时成立。
+# 这里保守处理：`shell` 单独列出来，`is_read_only` 默认对它返回 False，
+# 只有明确的只读封装（screenshot / dump_ui / screen_size / current_focus）才算只读。
+_READ_ONLY_SAFE = READ_ONLY_OPERATIONS - {"shell", "read_shell"}
+
+
+def is_read_only(operation: str) -> bool:
+    """这次设备操作会不会改变设备状态（V2.7 P1-7）。
+
+    只读封装（screenshot / dump_ui / screen_size / current_focus / state）返回 True；
+    `shell` / `read_shell` 是万能口、无法保证只读，保守返回 False；
+    其余（tap / text / swipe / keyevent / launch 等）都是改设备的，返回 False。
+    """
+    return operation in _READ_ONLY_SAFE
+
+
 
 def escape_type_text(value: str) -> str:
     """校验并转义 `input text` 的输入，不合法时抛 AdbError。

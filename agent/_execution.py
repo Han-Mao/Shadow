@@ -22,7 +22,7 @@ from models.retry import (
     classify_result,
 )
 from models.state import Observation, StepOutcome
-from models.task import TERMINAL_STATUSES, Task, TaskStatus
+from models.task import TERMINAL_STATUSES, Task, TaskEvent, TaskStatus
 from models.task_step import StepStatus, TaskStep
 from models.verification import ActionDispatch, ActionEffect, DispatchStatus, GoalVerification
 from storage.event_log import (
@@ -56,7 +56,7 @@ class ExecutionMixin:
             # V2.5 §七：CANCEL_REQUESTED 只表示「请求已下达」；但本轮压根没开始执行，
             # 不存在副作用疑云，所以在这里直接落定 CANCELLED。
             if task.status is TaskStatus.CANCEL_REQUESTED:
-                task.mark(TaskStatus.CANCELLED, source="runtime")
+                task.apply_event(TaskEvent.CANCELLED, source="runtime")
             logger.info("任务 %s 已取消，跳过执行", task.id)
             return RunOutcome.CANCELLED
 
@@ -75,7 +75,7 @@ class ExecutionMixin:
             if gate is not None:
                 return gate
 
-        task.mark(TaskStatus.RUNNING, source="runtime")
+        task.apply_event(TaskEvent.DISPATCHED, source="runtime")
         try:
             self._persist(task)
         except PersistenceError as exc:
@@ -133,7 +133,7 @@ class ExecutionMixin:
                 # V2.5 §七：CANCEL_REQUESTED 表示「请求已下达」，走到安全点才算真停。
                 # 此刻设备侧可能刚 dispatch 过一个动作——所以退出路径要如实区分
                 # 「动作发出前就停了」还是「动作发出后才发现要停」，审计才读得懂。
-                task.mark(TaskStatus.CANCELLED, source="runtime")
+                task.apply_event(TaskEvent.CANCELLED, source="runtime")
                 logger.info("任务 %s 已被取消，退出执行", task.id)
                 return RunOutcome.CANCELLED
             if task.status is TaskStatus.PAUSED:
@@ -276,7 +276,7 @@ class ExecutionMixin:
                     state.pending_task_version = task.version
                     state.pending_plan_version = task.plan_version
                     self._save_checkpoint(task, state, observation)
-                    task.mark(TaskStatus.WAITING, source="runtime")
+                    task.apply_event(TaskEvent.AWAITING_CONFIRMATION, source="runtime")
                     self._persist(task)
                     logger.warning(
                         "任务 %s 命中危险动作，等待人工确认：%s", task.id, action.type.value
@@ -474,7 +474,7 @@ class ExecutionMixin:
     ) -> RunOutcome:
         """把无法自行决断的事交给人，并把任务停在 WAITING。"""
         state.pending_confirmation = action
-        task.mark(TaskStatus.WAITING, source="runtime")
+        task.apply_event(TaskEvent.AWAITING_CONFIRMATION, source="runtime")
         self._persist(task)
         logger.warning("任务 %s 转人工确认：%s", task.id, message)
         self._emit(
@@ -683,7 +683,7 @@ class ExecutionMixin:
                 step.mark(StepStatus.DONE)
         task.sync_current_step()
         self._save_checkpoint(task, state, observation)
-        task.mark(TaskStatus.DONE, source="runtime")
+        task.apply_event(TaskEvent.COMPLETED, source="runtime")
         self._persist(task)
         logger.info("任务 %s 完成：%s", task.id, action.reason or "模型判定已完成")
         check = state.last_goal_check
@@ -707,7 +707,7 @@ class ExecutionMixin:
         虽然调度器那边也会兜底标记，但 Runtime 自身不能依赖调用方补齐。
         """
         logger.warning("任务 %s 判定失败：%s", task.id, reason)
-        task.mark(TaskStatus.FAILED, source="runtime")
+        task.apply_event(TaskEvent.FAILED, source="runtime")
         self._persist(task)
         self._emit(task.id, FAILED, reason=reason)
         return RunOutcome.FAILED
@@ -720,7 +720,7 @@ class ExecutionMixin:
         继续执行会在崩溃后丢失进度并可能重复副作用」。
         """
         logger.error("任务 %s 降级：%s", task.id, reason)
-        task.mark(TaskStatus.DEGRADED, source="runtime")
+        task.apply_event(TaskEvent.DEGRADED, source="runtime")
         # 降级本身也要尽力落盘；再失败就无力回天了，但至少不会再产生新动作。
         try:
             self._persist(task)
@@ -760,7 +760,7 @@ class ExecutionMixin:
         if decision.action is RetryAction.ASK_HUMAN:
             if pending is not None:
                 state.pending_confirmation = pending
-            task.mark(TaskStatus.WAITING, source="runtime")
+            task.apply_event(TaskEvent.AWAITING_CONFIRMATION, source="runtime")
             self._persist(task)
             logger.warning("任务 %s 无法自行决断，转人工确认：%s", task.id, decision.reason)
             return RunOutcome.AWAITING_CONFIRMATION
