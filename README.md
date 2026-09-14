@@ -747,7 +747,11 @@ curl http://127.0.0.1:8010/scheduler
 | `502` / `503` | 设备不可用 / VLM 调用失败 |
 | `504` | `wait=true` 超时，任务仍在后台执行，可继续轮询 |
 
-## 测试
+## 测试（不随仓库发布）
+
+> **本仓库只发布运行时。** `tests/` 与 `scripts/` 由开发侧本地维护，不进版本控制——
+> 从远程 clone 下来的副本里没有测试代码，下面这条命令是给持有完整开发副本的人看的。
+> 需要取回某一轮的测试基线：`git checkout <commit> -- tests scripts`。
 
 ```powershell
 pip install -r requirements.txt

@@ -5,6 +5,11 @@ _ref_extract/
 # 开发文档（不入库）
 bluewhale-shadow-phone/
 
+# 开发侧本地维护、不随仓库发布：运行时不需要它们（V2.5 起）
+# 需要某一轮的测试基线时，可从历史提交里取回（git checkout <commit> -- tests）
+tests/
+scripts/
+
 # IDE
 .idea/
 
