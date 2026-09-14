@@ -7,7 +7,15 @@ import threading
 import pytest
 
 import device.adb as adb_mod
-from device.adb import AdbBudgetExhausted, AdbController, AdbError, escape_type_text
+import device.emulator as emulator_mod
+from device.adb import (
+    DEFAULT_SERIAL,
+    AdbBudgetExhausted,
+    AdbController,
+    AdbError,
+    escape_type_text,
+)
+from device.emulator import resolve_serial, resolve_serials
 from device.input import (
     ADB_KEYBOARD_PACKAGE,
     AdbInputProvider,
@@ -200,6 +208,51 @@ def test_observe_applies_one_total_budget_to_the_whole_capture(monkeypatch, tmp_
 
 
 # ---------------------------------------------------------------- 输入通道（中文）
+
+
+def test_resolve_serials_splits_comma_separated_env(monkeypatch):
+    """ADB_SERIAL="emu-1,emu-2" 就能一次拉起两台设备（V2.1 §十三）。"""
+    monkeypatch.setenv("ADB_SERIAL", "emu-1, emu-2")
+
+    assert resolve_serials() == ["emu-1", "emu-2"]
+
+
+def test_resolve_serials_uses_every_available_device(monkeypatch):
+    """自动发现时有多少用多少，这正是多设备想要的行为。"""
+    monkeypatch.delenv("ADB_SERIAL", raising=False)
+    monkeypatch.setattr(
+        emulator_mod,
+        "_list_devices",
+        lambda: [("a", "device"), ("b", "device"), ("c", "offline")],
+    )
+
+    assert resolve_serials() == ["a", "b"]
+
+
+def test_resolve_serials_honours_explicit_choice_without_autodiscovery(monkeypatch):
+    """显式指定时不再自动发现——「我只想连 A」不该被自动发现的 B 悄悄打破。"""
+    monkeypatch.setattr(emulator_mod, "_list_devices", lambda: [("emu-9", "device")])
+
+    assert resolve_serials("emu-1") == ["emu-1"]
+
+
+def test_resolve_serials_falls_back_to_default(monkeypatch):
+    monkeypatch.delenv("ADB_SERIAL", raising=False)
+
+    def boom() -> list[tuple[str, str]]:
+        raise RuntimeError("adb 不在 PATH 里")
+
+    monkeypatch.setattr(emulator_mod, "_list_devices", boom)
+
+    assert resolve_serials() == [DEFAULT_SERIAL]
+
+
+def test_resolve_serials_keeps_legacy_single_serial_behaviour(monkeypatch):
+    """老的 resolve_serial() 语义不变，避免影响既有装配路径。"""
+    monkeypatch.delenv("ADB_SERIAL", raising=False)
+    monkeypatch.setattr(emulator_mod, "_list_devices", lambda: [("only", "device")])
+
+    assert resolve_serial() == "only"
 
 
 def test_is_plain_ascii():

@@ -23,8 +23,9 @@ from agent.scheduler import TaskScheduler
 from agent.task_manager import TaskManager
 from device import screenshot as shots
 from device.adb import AdbController, AdbError
-from device.emulator import resolve_serial
+from device.emulator import resolve_serial, resolve_serials
 from device.input import build_default_input
+from device.pool import DevicePool
 from device.session import DeviceSession
 from models.action import Action, ActionRisk, ActionType, Point
 from models.budget import TaskBudget
@@ -47,23 +48,32 @@ _MANUAL_OWNER = "__manual__"
 # ---- 依赖装配 ----
 
 adb = AdbController(serial=resolve_serial())
-session = DeviceSession(adb, serial=adb.serial)
+# 多设备（V2.1 §十三）：ADB_SERIAL 支持逗号分隔，调度器会为每台设备起一个 worker。
+# 单设备时 pool 里就一台，行为与老版本完全一致。
+device_pool = DevicePool(
+    [DeviceSession(AdbController(serial=serial), serial=serial) for serial in resolve_serials()]
+)
+# 单步调试端点（/tap、/screenshot、/owned）面向「当前主设备」，仍用第一台
+session = device_pool.first()
 task_store = TaskStore(STORAGE_DIR / "tasks")
 checkpoint_store = CheckpointStore(STORAGE_DIR / "checkpoints")
-trajectory = TrajectoryStore()
+# 轨迹落盘（V2.1）：长跑任务重启后不能「失忆」——恢复点在，但前面几步干了什么也得在
+trajectory = TrajectoryStore(root=STORAGE_DIR / "trajectories")
 # 审计/重放用的事件日志（V2.1 §二十三）。与轨迹分开：轨迹服务下一步决策（会被裁剪），
 # 事件日志服务事后追溯（只追加）
 event_log = EventLog(STORAGE_DIR / "events")
 
 runtime = AgentRuntime(
-    session,
+    device_pool,
     artifact_dir=ARTIFACT_DIR,
     trajectory=trajectory,
     checkpoints=checkpoint_store,
     task_store=task_store,
     event_log=event_log,
 )
-scheduler = TaskScheduler(runtime, session, task_store=task_store, event_log=event_log)
+scheduler = TaskScheduler(
+    runtime, device_pool, task_store=task_store, event_log=event_log
+)
 input_provider = build_default_input(adb)
 
 # 没有 API Key 时不接 LLM 判定，Classifier 自动退化为「规则 + 相似度」两层
@@ -120,6 +130,8 @@ class TaskRequest(BaseModel):
     # 默认后台执行：同步等一整个 loop 会长期占用 worker 线程
     wait: bool = False
     wait_timeout: float = Field(default=120.0, ge=1, le=600)
+    # 指定跑在哪台设备上（V2.1 §十三）。不填就由调度器派给最闲的一台。
+    device_serial: str | None = None
 
 
 class InjectRequest(BaseModel):
@@ -269,6 +281,7 @@ def create_task(req: TaskRequest):
         context=req.context,
         budget=TaskBudget(max_action_steps=req.max_steps),
         priority=req.priority,
+        device_serial=req.device_serial,
     )
     if req.wait:
         payload = _wait_for(task.id, req.wait_timeout)

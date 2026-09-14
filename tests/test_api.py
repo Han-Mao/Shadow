@@ -28,7 +28,7 @@ def api(tmp_path, monkeypatch):
     session = DeviceSession(FakeDevice(), serial="fake-serial")
     task_store = TaskStore(tmp_path / "tasks")
     checkpoint_store = CheckpointStore(tmp_path / "checkpoints")
-    trajectory = TrajectoryStore()
+    trajectory = TrajectoryStore(root=tmp_path / "trajectories")
 
     event_log = EventLog(tmp_path / "events")
 
@@ -105,7 +105,10 @@ def test_create_task_defaults_to_background(api):
     body = resp.json()
     assert body["mode"] == "background"
     assert body["id"]
-    assert body["status"] == "queued"
+    # 后台模式不等结果，任务立刻入队——而 worker 可能已经把它取走开跑了。
+    # 所以这里只断言「已进入调度」，不去赌线程时序：
+    # 真想要终态请查 /tasks/{id}，或用 wait=True。
+    assert body["status"] in {"queued", "running"}
     assert body["priority"] == "normal"
 
 

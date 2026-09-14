@@ -8,6 +8,7 @@ import agent.runtime as runtime_mod
 from agent.runtime import AgentRuntime, RunOutcome
 from agent.verifier import Verification
 from device.adb import AdbError
+from device.pool import DevicePool
 from device.session import DeviceSession
 from fakes import FakeDevice
 from models.action import Action, ActionEffectStatus, ActionType, Decision, Point
@@ -848,6 +849,100 @@ def test_runtime_events_are_self_sufficient_for_replay(monkeypatch, tmp_path):
     report = timeline.render_markdown()
     assert "(120,340)" in report
     assert "## 时间轴" in report
+
+
+def test_runtime_persists_trajectory_so_restart_keeps_context(monkeypatch, tmp_path):
+    """跑完后轨迹要落盘：重启后模型还能拿到前面的上下文（V2.1）。
+
+    否则恢复点虽然在，模型却「失忆」了——只能盯着当前一屏重新猜，
+    跟从零开始差不多。长跑任务上这个差别很大。
+    """
+    patch_observe(monkeypatch, tmp_path)
+    patch_planner(
+        monkeypatch,
+        goals=["做事"],
+        decisions=[tap(1, 2), Decision(action=Action(type=ActionType.DONE, reason="完成"))],
+    )
+    patch_verifier(monkeypatch)
+
+    root = tmp_path / "trajectories"
+    session, runtime = build(tmp_path, trajectory=TrajectoryStore(root=root))
+    task = Task(instruction="点一下", budget=TaskBudget(max_action_steps=5))
+    session.acquire(task.id)
+    try:
+        assert runtime.run(task) is RunOutcome.DONE
+    finally:
+        session.release(task.id)
+
+    restarted = TrajectoryStore(root=root)
+
+    assert restarted.last_step(task.id) >= 1, "轨迹必须落盘"
+    assert restarted.prompt_context(task.id), "重启后仍要能拼出决策上下文"
+
+
+def test_runtime_targets_the_bound_device_not_the_first_one(monkeypatch, tmp_path):
+    """任务绑在 emu-2，动作就必须发到 emu-2 上（V2.1 §十三）。
+
+    不按绑定取会话的话，两台设备的任务会全跑到第一台上——「多设备」就成了摆设，
+    而真实场景下这意味着**去操作了错误的手机**。
+    """
+    patch_observe(monkeypatch, tmp_path)
+    patch_planner(
+        monkeypatch,
+        goals=["做事"],
+        decisions=[tap(10, 20), Decision(action=Action(type=ActionType.DONE, reason="完成"))],
+    )
+    patch_verifier(monkeypatch)
+
+    first_device, second_device = FakeDevice(), FakeDevice()
+    pool = DevicePool(
+        [
+            DeviceSession(first_device, serial="emu-1"),
+            DeviceSession(second_device, serial="emu-2"),
+        ]
+    )
+    runtime = AgentRuntime(pool, artifact_dir=tmp_path, trajectory=TrajectoryStore())
+
+    task = Task(
+        instruction="点一下",
+        device_serial="emu-2",
+        budget=TaskBudget(max_action_steps=5),
+    )
+    pool.require("emu-2").acquire(task.id)  # runtime 假设调用方（调度器）已持有设备
+    try:
+        assert runtime.run(task) is RunOutcome.DONE
+    finally:
+        pool.require("emu-2").release(task.id)
+
+    assert ("tap", 10, 20) in second_device.events, "动作应发到绑定的 emu-2"
+    assert first_device.events == [], "绝不能碰到 emu-1"
+
+
+def test_runtime_falls_back_to_the_default_device_when_unbound(monkeypatch, tmp_path):
+    """任务还没绑设备时用默认（第一台），保证单设备路径行为不变。"""
+    patch_observe(monkeypatch, tmp_path)
+    patch_planner(
+        monkeypatch,
+        goals=["做事"],
+        decisions=[Decision(action=Action(type=ActionType.DONE, reason="完成"))],
+    )
+    patch_verifier(monkeypatch)
+
+    first_device = FakeDevice()
+    pool = DevicePool(
+        [
+            DeviceSession(first_device, serial="emu-1"),
+            DeviceSession(FakeDevice(), serial="emu-2"),
+        ]
+    )
+    runtime = AgentRuntime(pool, artifact_dir=tmp_path)
+
+    task = Task(instruction="做事", budget=TaskBudget(max_action_steps=5))
+    pool.require("emu-1").acquire(task.id)
+    try:
+        assert runtime.run(task) is RunOutcome.DONE
+    finally:
+        pool.require("emu-1").release(task.id)
 
 
 def test_dangerous_approval_is_consumed_after_one_use(monkeypatch, tmp_path):

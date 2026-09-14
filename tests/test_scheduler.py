@@ -4,8 +4,11 @@ from __future__ import annotations
 import threading
 import time
 
+import pytest
+
 from agent.runtime import AgentRuntime, RunOutcome
 from agent.scheduler import TaskScheduler
+from device.pool import DevicePool
 from device.session import DeviceSession
 from fakes import FakeDevice
 from models.task import PAUSED_BY_PREEMPTION, PAUSED_BY_USER, Task, TaskPriority, TaskStatus
@@ -710,3 +713,169 @@ def test_recover_requeues_waiting_task_and_drops_approval(tmp_path):
     fresh = AgentRuntime(DeviceSession(FakeDevice()), artifact_dir=tmp_path)
     assert fresh.pending_confirmation(task.id) is None
     assert fresh.confirm(task.id, approved=True) is False, "重启后不该还认旧审批"
+
+
+# ---------------------------------------------------------------- 多设备（§十三）
+
+
+class ConcurrencyProbe:
+    """记录「同时有几个任务在跑」，用来证明多设备是真的并行而不是轮流跑。"""
+
+    def __init__(self, expected: int = 2, hold: float = 0.1) -> None:
+        self.peak = 0
+        self.order: list[str] = []
+        self.overlap = threading.Event()
+        self._active = 0
+        self._expected = expected
+        self._hold = hold
+        self._lock = threading.Lock()
+
+    def run(self, task: Task) -> RunOutcome:
+        with self._lock:
+            self._active += 1
+            self.peak = max(self.peak, self._active)
+            self.order.append(task.id)
+            if self._active >= self._expected:
+                self.overlap.set()
+        # 故意占住一会儿：只有另一条车道的 worker 真在并发执行，peak 才会到 2
+        time.sleep(self._hold)
+        with self._lock:
+            self._active -= 1
+        return RunOutcome.DONE
+
+
+def two_devices() -> DevicePool:
+    return DevicePool(
+        [DeviceSession(FakeDevice(), serial="emu-1"), DeviceSession(FakeDevice(), serial="emu-2")]
+    )
+
+
+def test_two_devices_run_different_tasks_in_parallel():
+    """两台设备各跑一个任务，**同时**在跑——这是多设备唯一真正的价值。"""
+    pool = two_devices()
+    runtime = ConcurrencyProbe(expected=2)
+    scheduler = TaskScheduler(runtime, pool, idle_poll_seconds=0.01)
+
+    task_a = Task(instruction="A", device_serial="emu-1")
+    task_b = Task(instruction="B", device_serial="emu-2")
+    scheduler.submit(task_a, allow_preempt=False)
+    scheduler.submit(task_b, allow_preempt=False)
+    scheduler.start()
+    try:
+        assert runtime.overlap.wait(3.0), "两个任务应该同时在跑"
+    finally:
+        scheduler.stop()
+
+    assert runtime.peak == 2, f"峰值并发应为 2，实际 {runtime.peak}（说明没并行）"
+    assert task_a.status is TaskStatus.DONE
+    assert task_b.status is TaskStatus.DONE
+    assert scheduler.lanes() == ["emu-1", "emu-2"]
+
+
+def test_unbound_task_gets_bound_to_a_device():
+    """未绑定设备的任务由调度器派发，并在派发时就**固定**下来。
+
+    绑定必须发生在入队时而不是执行时——否则任务可能今天在这台、明天在那台跑，
+    页面上下文完全对不上。
+    """
+    scheduler = TaskScheduler(DoneRuntime(), two_devices(), idle_poll_seconds=0.01)
+    task = Task(instruction="随便跑")
+
+    assert task.device_serial is None
+    scheduler.submit(task, allow_preempt=False)
+
+    assert task.device_serial in {"emu-1", "emu-2"}
+    assert task.id in scheduler.snapshot()["devices"][task.device_serial]["ready"]
+
+
+def test_unbound_tasks_are_spread_across_devices():
+    """一批未绑定任务不该全挤在同一台设备上排队。"""
+    scheduler = TaskScheduler(DoneRuntime(), two_devices(), idle_poll_seconds=0.01)
+    tasks = [Task(instruction=f"任务 {i}") for i in range(4)]
+    for task in tasks:
+        scheduler.submit(task, allow_preempt=False)
+
+    used = {task.device_serial for task in tasks}
+    assert used == {"emu-1", "emu-2"}, "两台设备都要被用上"
+
+
+def test_task_bound_to_one_device_does_not_leak_to_another():
+    scheduler = TaskScheduler(DoneRuntime(), two_devices(), idle_poll_seconds=0.01)
+    task = Task(instruction="只在 emu-2 上跑", device_serial="emu-2")
+    scheduler.submit(task, allow_preempt=False)
+
+    devices = scheduler.snapshot()["devices"]
+    assert task.id in devices["emu-2"]["ready"]
+    assert task.id not in devices["emu-1"]["ready"]
+
+
+def test_task_bound_to_a_missing_device_is_reassigned_on_recover(tmp_path):
+    """绑定的设备不在池里（拔线/换机）时必须改派，否则任务永远没人取走、变成僵尸。"""
+    store = TaskStore(tmp_path / "tasks")
+    task = Task(instruction="原本绑在 emu-9", device_serial="emu-9")
+    task.mark(TaskStatus.QUEUED)
+    store.save(task)
+
+    scheduler = TaskScheduler(DoneRuntime(), two_devices(), task_store=store)
+    assert scheduler.recover()["queued"] == 1
+
+    reloaded = store.load(task.id)
+    assert reloaded.device_serial in {"emu-1", "emu-2"}, "必须改派给现有设备"
+
+
+def test_snapshot_exposes_per_device_state():
+    scheduler = TaskScheduler(DoneRuntime(), two_devices(), idle_poll_seconds=0.01)
+    task = Task(instruction="A", device_serial="emu-1")
+    scheduler.submit(task, allow_preempt=False)
+
+    snap = scheduler.snapshot()
+
+    assert set(snap["devices"]) == {"emu-1", "emu-2"}
+    assert snap["devices"]["emu-1"]["serial"] == "emu-1"
+    # 兼容字段：单设备时平铺，多设备时给第一台
+    assert snap["device"]["serial"] == "emu-1"
+
+
+def test_pause_and_cancel_work_on_multi_device_lanes():
+    """暂停/取消要能在正确的那条车道上生效，不能只动第一台。"""
+    scheduler = TaskScheduler(DoneRuntime(), two_devices(), idle_poll_seconds=0.01)
+    task = Task(instruction="B", device_serial="emu-2")
+    scheduler.submit(task, allow_preempt=False)
+
+    assert scheduler.pause(task.id) is True
+    assert task.status is TaskStatus.PAUSED
+    assert task.id not in scheduler.snapshot()["devices"]["emu-2"]["ready"]
+
+    assert scheduler.resume(task.id) is True
+    assert task.id in scheduler.snapshot()["devices"]["emu-2"]["ready"]
+
+    assert scheduler.cancel(task.id) is True
+    assert task.status is TaskStatus.CANCELLED
+    assert task.id not in scheduler.snapshot()["devices"]["emu-2"]["ready"]
+
+
+def test_preemption_is_confined_to_the_task_own_device():
+    """抢占只影响该任务所在设备的运行任务，不能把别的设备的任务也打断。"""
+    pool = two_devices()
+    scheduler = TaskScheduler(DoneRuntime(), pool, idle_poll_seconds=0.01)
+
+    # 摆好场景：两台设备各有一个低优先级任务在跑
+    on_one = Task(instruction="低优", priority=TaskPriority.LOW, status=TaskStatus.RUNNING)
+    on_two = Task(instruction="低优", priority=TaskPriority.LOW, status=TaskStatus.RUNNING)
+    pool.require("emu-1").acquire(on_one.id)
+    pool.require("emu-2").acquire(on_two.id)
+    with scheduler._cond:  # noqa: SLF001 - 直接摆好场景，避免线程时序不确定
+        scheduler._lanes["emu-1"].running = on_one
+        scheduler._lanes["emu-2"].running = on_two
+
+    newcomer = Task(instruction="高优", priority=TaskPriority.HIGH, device_serial="emu-1")
+    scheduler.submit(newcomer)
+
+    assert pool.require("emu-1").should_yield(on_one.id), "emu-1 上的低优任务应让出"
+    assert not pool.require("emu-2").should_yield(on_two.id), "emu-2 不该被牵连"
+
+
+def test_pool_must_not_be_empty():
+    """一台设备都没有时应当直接报错，而不是让任务静默地永远拿不到设备。"""
+    with pytest.raises(ValueError, match="设备"):
+        TaskScheduler(DoneRuntime(), DevicePool())

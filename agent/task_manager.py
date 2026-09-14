@@ -80,6 +80,7 @@ class TaskManager:
         parent_task_id: str | None = None,
         submit: bool = True,
         relation_meta: dict | None = None,
+        device_serial: str | None = None,
     ) -> Task:
         task = Task(
             instruction=instruction,
@@ -89,6 +90,7 @@ class TaskManager:
             parent_task_id=parent_task_id,
             root_task_id=parent_task_id,
             relation_meta=dict(relation_meta or {}),
+            device_serial=device_serial,
         )
         task.mark(TaskStatus.CREATED)
         self._store.save(task)

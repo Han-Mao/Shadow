@@ -66,10 +66,11 @@ VLM 决定「下一步点哪里」，调度与检查点决定「多件事怎么�
 │   ├── retry.py            # ErrorClass + RetryPolicy：错误分类与重试的唯一真相源
 │   ├── verification.py     # ActionDispatch / ActionEffect / GoalVerification 三概念
 │   └── state.py            # Observation / StepOutcome
-├── storage/                # TaskStore / CheckpointStore / TrajectoryStore / EventLog
+├── storage/                # TaskStore / CheckpointStore / TrajectoryStore（落盘）/ EventLog
 ├── device/
 │   ├── adb.py screenshot.py accessibility.py emulator.py
 │   ├── session.py          # DeviceSession：设备所有权与抢占交接
+│   ├── pool.py             # DevicePool：serial → 会话的注册表（多设备）
 │   └── input.py            # InputProvider：ASCII 与中文输入通道
 ├── vision/                 # vlm / grounding / parser
 │   └── fingerprint.py      # UI 结构指纹：恢复校验的 L2（比 package 细、比 VLM 便宜）
@@ -77,7 +78,7 @@ VLM 决定「下一步点哪里」，调度与检查点决定「多件事怎么�
 ├── scripts/
 │   ├── demo_preemption.py  # 抢占恢复演示（离线可跑）
 │   └── replay_task.py      # 命令行回放一个任务的事件流
-└── tests/                  # 222 个离线用例
+└── tests/                  # 257 个离线用例
 ```
 
 ## 职责边界
@@ -355,6 +356,63 @@ $ python scripts/replay_task.py 20260914_093100_demo01
 而且重放前必须自己确保设备处在对应恢复点的状态，否则页面上下文对不上、结果没有参考价值——
 **生产环境要复现问题，用观测回放 + 恢复点，不要重放动作。**
 
+## V2.1 第六轮：轨迹落盘 + 多设备
+
+这两件事的共同点：都在拆掉 V2 里「单设备 + 内存态」的默认假设。
+
+| # | 审核项 | 改动 | 落点 |
+|---|---|---|---|
+| 20 | 轨迹落盘 | `TrajectoryStore` 支持 `root`：JSONL 追加 + 定期紧凑化，重启后轨迹还在 | `storage/trajectory_store.py` |
+| 21 | §十三 多设备 Lease | 新增 `device/pool.py`；`Task.device_serial`；**Scheduler 车道化**（每设备一条车道 + 一个 worker）；Runtime 按绑定取会话 | `device/pool.py`、`models/task.py`、`agent/scheduler.py`、`agent/runtime.py` |
+
+### 轨迹落盘：两个刻意取舍
+
+长跑任务重启后最难受的不是「恢复点丢了」，而是**恢复点在、模型却失忆了**——
+前面几步干了什么全没了，只能盯着当前一屏重新猜，跟从零开始差不多。
+
+1. **不存 `ui_tree`**。它是单条观察里最大的字段（几十 KB），而决策**根本不读它**
+   （进 prompt 的是 `to_prompt_dict()`，字段白名单里没有 ui_tree）。
+   存一条记录从几十 KB 降到几百字节。要看页面有截图路径，或 Checkpoint 里的快照。
+2. **JSONL 追加 + 定期紧凑化**。每步重写整个文件是 O(n²)，长跑任务越跑越慢；
+   纯追加又会无限增长，所以每追加 `max_entries` 条就重写成最后 `max_entries` 条。
+
+### 多设备：车道模型
+
+```
+Scheduler
+ ├── lane("emu-1")  ← DeviceSession(emu-1) + 就绪队列 + 挂起区 + running + worker 线程
+ └── lane("emu-2")  ← DeviceSession(emu-2) + 就绪队列 + 挂起区 + running + worker 线程
+```
+
+一台设备 = 一条车道，各自持有自己的队列和运行槽。把这三样从 Scheduler 的全局字段
+下沉下来，是多设备能成立的关键——否则两台设备会共用一个 `running`，互相覆盖状态。
+
+**任务一旦开始执行就绑定设备**（`task.device_serial`）：中途换设备会让页面上下文对不上，
+等于把任务丢到一台陌生手机上接着做。未绑定的任务由调度器派给最闲的一台；
+绑定的设备不在池里（拔线/换机）时改派，否则这条任务永远没人取走、悄悄变成僵尸。
+
+单设备时只有一条车道，与旧实现逐字等价——这一点由 257 个既有测试守着。
+
+### 多设备暴露出的两个正确性问题
+
+改这一轮时发现两处**不修就是 bug** 的地方：
+
+1. **Runtime 必须按任务绑定的设备取会话。** 它原来持有单个 `self._session`，
+   多设备下第二个设备的任务会被发到第一台上执行——「多设备」成了摆设，
+   真实场景下等于**去操作了错误的手机**。现在按 `task.device_serial` 现查（刻意不缓存：
+   缓存即共享可变状态，而共享状态正是并发 bug 的来源）。
+2. **Runtime 现在会被多个 worker 线程并发调用。** `_states` 是共享可变状态，
+   读写必须加锁。
+
+### 顺带修正的一处顺序
+
+`submit()` 原来先唤醒 worker、再落盘。多设备改造中把它改成**先落盘、再唤醒**——
+反过来的话 worker 可能在任务还没持久化时就开始跑，进程恰在此刻崩溃就会把任务整个丢掉
+（队列是内存的，磁盘上没记就等于没提交过）。
+
+**仍未做**：§24 目录重构（已确认不改）、真正的负载均衡（当前只是「挑最闲的一条」，没考虑设备异构性）、
+多设备的截图/产物分目录（`device.pool.storage_hint` 已备好，尚未接线）。
+
 ## 快速开始
 
 ```powershell
@@ -376,7 +434,7 @@ python -m api.server    # 监听 127.0.0.1:8010
 
 | 变量 | 说明 | 默认值 |
 |---|---|---|
-| `ADB_SERIAL` | 目标设备 serial | `emulator-5554` |
+| `ADB_SERIAL` | 目标设备 serial；**支持逗号分隔多台**（如 `emu-1,emu-2`） | `emulator-5554` |
 | `VLM_BASE_URL` | VLM 接口地址 | `https://api.openai.com/v1` |
 | `VLM_API_KEY` | VLM API Key；不设置则关系判定退化为纯规则 | 未设置 |
 | `VLM_MODEL` | VLM 模型名 | `gpt-4o` |
@@ -448,19 +506,21 @@ pip install -r requirements.txt
 python -m pytest -q
 ```
 
-**222 个用例，全部离线**：不需要 adb、模拟器或 API Key。
+**257 个用例，全部离线**：不需要 adb、模拟器或 API Key。
 
 | 文件 | 覆盖 |
 |---|---|
 | `test_models.py` | 任务状态机、步骤依赖、动作风险（策略下限）/指纹、Checkpoint、预算、版本号、**尝试历史** |
-| `test_device.py` | ADB 封装、输入通道（含中文）、设备会话所有权与并发、**命令超时分级与总预算** |
+| `test_device.py` | ADB 封装、输入通道（含中文）、设备会话所有权与并发、**命令超时分级与总预算**、**多设备 serial 解析** |
+| `test_device_pool.py` | **DevicePool**：注册/查找、未知设备报错、空闲筛选、产物按设备分目录 |
+| `test_trajectory_store.py` | **轨迹落盘**：重启可读、ui_tree 不落盘、窗口裁剪、紧凑化、坏行容错 |
 | `test_vision.py` | UI 树容错、坐标落点、VLM 重试、prompt 构造 |
 | `test_verifier.py` | **验证三概念**：发出 / 效果 / 目标，含「VLM 说成功但页面没变 → 效果存疑」 |
 | `test_event_log.py` | 事件日志：顺序、按任务隔离、limit、截断行容错、写失败不抛异常 |
 | `test_replay.py` | **回放**：时间轴顺序与偏移、异常帧挑选、Markdown 报告、动作计划、**重放的安全默认** |
 | `test_classifier.py` | 三层关系判定、相似度否决、**分关系阈值**、二次确认标记、**语义相似度** |
-| `test_scheduler.py` | 优先级、暂停/取消、**抢占与恢复**、组合式中断、**启动恢复**（含审批前重启）、**抢占延迟观测**、设备占用 |
-| `test_runtime.py` | 闭环执行、异常收敛、死循环、HITL、Checkpoint 恢复、**三预算门控**、**动作对账**（继续/重做）、批准一次性、**执行记录**、事件流、**事件自足性** |
+| `test_scheduler.py` | 优先级、暂停/取消、**抢占与恢复**、组合式中断、**启动恢复**（含审批前重启）、**抢占延迟观测**、设备占用、**多设备并行/绑定/改派** |
+| `test_runtime.py` | 闭环执行、异常收敛、死循环、HITL、Checkpoint 恢复、**三预算门控**、**动作对账**（继续/重做）、批准一次性、**执行记录**、事件流、**事件自足性**、**按绑定设备取会话** |
 | `test_api.py` | HTTP 契约、状态码语义、错误脱敏、危险动作拦截、SUPER_TASK 改写与二次确认、**依赖链迁移**、版本门控、**/events 审计流**、**/replay 回放** |
 
 ## 注意事项

@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
+from device.pool import DevicePool
 from device.session import DeviceBusyError, DeviceSession
 from models.action import Action, ActionType, ActionRisk, ActionEffectStatus, Decision
 from models.checkpoint import Checkpoint
@@ -99,7 +101,7 @@ class RuntimeState:
 class AgentRuntime:
     def __init__(
         self,
-        session: DeviceSession,
+        session: DeviceSession | DevicePool,
         *,
         artifact_dir: str | Path = ARTIFACT_DIR,
         trajectory: object | None = None,
@@ -107,13 +109,26 @@ class AgentRuntime:
         task_store: object | None = None,
         event_log: EventLog | None = None,
     ) -> None:
-        self._session = session
+        # 向后兼容：老调用方传单个 DeviceSession（单设备场景）
+        self._pool = session if isinstance(session, DevicePool) else DevicePool([session])
+        self._default_session = self._pool.first()
         self._artifact_dir = Path(artifact_dir)
         self._trajectory = trajectory
         self._checkpoints = checkpoints
         self._task_store = task_store
         self._event_log = event_log
         self._states: dict[str, RuntimeState] = {}
+        # 多设备 = 多个 worker 线程并发调用 runtime，运行时状态必须加锁
+        self._states_lock = threading.RLock()
+
+    def _session_for(self, task: Task) -> DeviceSession:
+        """按任务绑定的设备取会话（V2.1 §十三）。
+
+        刻意**不做缓存**：多设备下 runtime 会被多个 worker 线程并发调用，
+        缓存就是共享可变状态，而共享状态正是并发 bug 的来源。
+        从池里按 serial 查一下的成本可以忽略。
+        """
+        return self._pool.get(task.device_serial) or self._default_session
 
     # ---- 对外 ----
 
@@ -125,6 +140,9 @@ class AgentRuntime:
             return RunOutcome.CANCELLED
 
         state = self._state_for(task)
+        # 本任务跑在哪台设备上，由绑定决定——多设备时 worker 线程各跑各的，
+        # 所以这个 session 只作为**局部变量**贯穿本次 run，不进实例状态
+        session = self._session_for(task)
         task.mark(TaskStatus.RUNNING)
         self._persist(task)
         self._emit(task.id, STARTED, version=task.version, instruction=task.instruction)
@@ -141,7 +159,7 @@ class AgentRuntime:
             if task.status is TaskStatus.PAUSED:
                 self._save_checkpoint(task, state, last_observation)
                 return RunOutcome.SUSPENDED
-            if self._session.should_yield(task.id):
+            if session.should_yield(task.id):
                 self._save_checkpoint(task, state, last_observation)
                 logger.info("任务 %s 让出设备（被抢占），等待稍后恢复", task.id)
                 self._emit(task.id, SUSPENDED, reason="preemption", step=state.execution_step)
@@ -154,7 +172,7 @@ class AgentRuntime:
                 return self._fail(task, f"已达模型调用上限 {task.budget.max_model_calls}")
 
             # ---- Observe ----
-            observation = self._observe(task, state)
+            observation = self._observe(task, state, session)
             if observation is None:
                 # 观察失败基本都是设备/ADB 抖动，按瞬时错误处理
                 outcome = self._settle_failure(task, state, ErrorClass.TRANSIENT, "观察失败")
@@ -251,13 +269,13 @@ class AgentRuntime:
                 value=action.value,
                 reason=action.reason,
             )
-            result = self._execute(task, action, observation)
+            result = self._execute(task, action, observation, session)
             if state.approved_dangerous:
                 state.approved_dangerous = False
                 state.pending_confirmation = None
 
             # ---- Verify ----
-            post, verification = self._verify(task, state, observation, action, result)
+            post, verification = self._verify(task, state, observation, action, result, session)
             self._append_trajectory(task, post)
             self._emit(
                 task.id,
@@ -326,11 +344,16 @@ class AgentRuntime:
             continue
 
     def pending_confirmation(self, task_id: str) -> Action | None:
-        state = self._states.get(task_id)
-        return state.pending_confirmation if state else None
+        with self._states_lock:
+            state = self._states.get(task_id)
+            return state.pending_confirmation if state else None
 
     def confirm(self, task_id: str, approved: bool) -> bool:
         """人工确认危险动作。批准后该动作会被放行一次。"""
+        with self._states_lock:
+            return self._confirm_locked(task_id, approved)
+
+    def _confirm_locked(self, task_id: str, approved: bool) -> bool:
         state = self._states.get(task_id)
         if state is None or state.pending_confirmation is None:
             return False
@@ -362,7 +385,8 @@ class AgentRuntime:
         return True
 
     def forget(self, task_id: str) -> None:
-        self._states.pop(task_id, None)
+        with self._states_lock:
+            self._states.pop(task_id, None)
 
     def _emit(self, task_id: str, kind: str, **data) -> None:
         if self._event_log is not None:
@@ -371,11 +395,13 @@ class AgentRuntime:
     # ---- 阶段 ----
 
     def _state_for(self, task: Task) -> RuntimeState:
-        state = self._states.get(task.id)
-        if state is None:
-            state = RuntimeState()
-            self._states[task.id] = state
-        return state
+        # 多设备下每台设备的 worker 都会走这里，必须加锁
+        with self._states_lock:
+            state = self._states.get(task.id)
+            if state is None:
+                state = RuntimeState()
+                self._states[task.id] = state
+            return state
 
     def _prepare(
         self,
@@ -447,11 +473,17 @@ class AgentRuntime:
         self._persist(task)
         logger.info("任务 %s 计划：%s", task.id, task.plan_progress())
 
-    def _observe(self, task: Task, state: RuntimeState, suffix: str = "") -> Observation | None:
+    def _observe(
+        self,
+        task: Task,
+        state: RuntimeState,
+        session: DeviceSession,
+        suffix: str = "",
+    ) -> Observation | None:
         state.observation_count += 1
         try:
             return observer.observe(
-                self._session.controller, self._artifact_dir, state.observation_count, suffix=suffix
+                session.controller, self._artifact_dir, state.observation_count, suffix=suffix
             )
         except Exception as exc:  # noqa: BLE001 - 设备抖动不能穿透到 API
             logger.warning("任务 %s 第 %d 次观察失败: %s", task.id, state.observation_count, exc)
@@ -506,9 +538,11 @@ class AgentRuntime:
         state.failed_strategies.append(self._describe_action(decision.action))
         return decision
 
-    def _execute(self, task: Task, action: Action, observation: Observation) -> dict:
+    def _execute(
+        self, task: Task, action: Action, observation: Observation, session: DeviceSession
+    ) -> dict:
         try:
-            with self._session.owned(task.id) as device:
+            with session.owned(task.id) as device:
                 return executor.execute(device, action, observation.ui_tree)
         except DeviceBusyError as exc:
             return {"ok": False, "error": str(exc)}
@@ -522,8 +556,9 @@ class AgentRuntime:
         pre: Observation,
         action: Action,
         result: dict,
+        session: DeviceSession,
     ) -> tuple[Observation, verifier.Verification]:
-        post = self._observe(task, state, suffix="post")
+        post = self._observe(task, state, session, suffix="post")
         if post is None:
             # 动作已经发出去了，只是拿不到新截图：降级为「未验证的 OK」，
             # 否则一次设备抖动会被当成执行失败，触发无谓的重发。

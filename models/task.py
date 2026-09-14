@@ -69,6 +69,11 @@ class Task(BaseModel):
     parent_task_id: str | None = None
     root_task_id: str | None = None
 
+    # 任务绑定到哪台设备（V2.1 §十三）。None = 尚未绑定，调度器可以派给任意空闲设备；
+    # 一旦开始执行就固定下来——中途换设备会让页面上下文彻底对不上，
+    # 相当于把任务丢到一个陌生手机上接着做。
+    device_serial: str | None = None
+
     current_step: int = 0
 
     # 资源预算：动作 / 观察 / 模型调用三个独立上限（V2.1 §二），取代单一的 max_steps。
