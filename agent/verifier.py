@@ -133,7 +133,14 @@ def verify_action(
             should_replan=True,
             layer="vlm",
             message="VLM 判定页面未进入预期状态",
-            dispatch=dispatch,
+            # V2.7 P2-2：动作已经发出去、但页面没到预期——这是「被 App 拒绝 / 没达到效果」，
+            # 不是设备抖动。给结构化 error_class=action_rejected，让下游重试策略
+            # 直接判「换策略」而不是「把同一动作再发一遍」（那只会重复触发副作用）。
+            dispatch=ActionDispatch(
+                action=action,
+                status=DispatchStatus.SENT,
+                error_class="action_rejected",
+            ),
             effect=ActionEffect(
                 status=ActionEffectStatus.VERIFIED_FAILED,
                 evidence="vlm",

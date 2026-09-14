@@ -99,26 +99,39 @@ class RuntimeState:
 
 @dataclass
 class ApprovalGrant:
-    """一次人工放行：**只对这一个动作、这一版目标与这一版计划有效**（V2.7 P0-2）。
+    """一次人工放行：**只对这一个任务、这一个动作、这一版目标与这一版计划、
+    且批准后未执行过任何其它动作时有效**（V2.7 P0-2）。
 
     布尔开关表达不了「批准的是哪一个动作」，于是批准完 A 之后紧接着出现的 B 也会被
     静默放行。凭证化之后放行前必须逐项匹配，而且**匹配成功即消费**——人工批准是
     「这一次可以」，不是「这个任务以后都可以」。
+
+    绑定维度（V2.7 P0-2 补强，审查指出原实现漏了 task_id 与尝试身份）：
+    - `task_id`：防止 A 任务的放行凭证拿去放行 B 任务的同名动作（跨任务串号）；
+    - `attempt_seq`：批准那一刻的执行序号。放行时校验它没变——若批准后模型已经
+      执行过别的动作（attempt_seq 前进过），这张凭证就作废。这是「绑定具体动作尝试」
+      的等价物：真正的 attempt_id 要到 Act 阶段才分配（批准时还不存在），
+      用 attempt_seq 快照同样能锁住「批准的到底是哪一次」。
     """
 
+    task_id: str
     action_fingerprint: str
     task_version: int
     plan_version: int
+    attempt_seq: int
 
-    def matches(self, action: Action, task: Task) -> bool:
+    def matches(self, action: Action, task: Task, state) -> bool:
         return (
-            self.action_fingerprint == action.fingerprint
+            self.task_id == task.id
+            and self.action_fingerprint == action.fingerprint
             and self.task_version == task.version
             and self.plan_version == task.plan_version
+            and self.attempt_seq == state.attempt_seq
         )
 
     def describe(self) -> str:
         return (
-            f"fingerprint={self.action_fingerprint} "
-            f"task_version={self.task_version} plan_version={self.plan_version}"
+            f"task={self.task_id} fingerprint={self.action_fingerprint} "
+            f"task_version={self.task_version} plan_version={self.plan_version} "
+            f"attempt_seq={self.attempt_seq}"
         )

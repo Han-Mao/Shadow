@@ -73,11 +73,19 @@ class CheckpointStore:
         checkpoint: Checkpoint | None,
         observation: Observation,
         task_version: int | None = None,
+        plan_version: int | None = None,
     ) -> RestoreVerdict:
         """判断能否从恢复点继续（V2.1 §十八：版本是第一道闸门）。
 
-        顺序：版本 → 页面（package/activity）。版本不匹配直接 STALE，不比较页面——
-        旧计划对应的恢复点即使页面恰好没变，续跑也会用错的目标。
+        顺序：task 版本 → plan 版本 → 页面（package/activity）。任一版本不匹配直接
+        STALE / REPLAN，不比较页面——旧计划对应的恢复点即使页面恰好没变，
+        续跑也会用错的目标或步骤。
+
+        `plan_version` 门控（V2.7 P1-9）：计划被改（插入子任务 / Re-plan）之后，
+        恢复点里 `action_attempt_id` 对应的是旧计划的步骤编排；即使目标没变、页面没变，
+        沿用旧恢复点也会把「旧计划的第 N 步」接到「新计划的第 N 步」上。所以计划版本
+        不一致一律判 STALE，交给 `_prepare` 重新规划。之前是「只记录不门控」的取舍，
+        审查指出这会埋下「旧动作 + 新计划」的错配，这里改回门控。
         """
         if checkpoint is None:
             return RestoreVerdict.REPLAN
@@ -88,6 +96,15 @@ class CheckpointStore:
                 checkpoint.id,
                 checkpoint.task_version,
                 task_version,
+            )
+            return RestoreVerdict.STALE
+
+        if plan_version is not None and checkpoint.plan_version != plan_version:
+            logger.info(
+                "恢复点 %s 已失效（checkpoint 计划版本 %s != 任务计划版本 %s），转入 Re-plan",
+                checkpoint.id,
+                checkpoint.plan_version,
+                plan_version,
             )
             return RestoreVerdict.STALE
 

@@ -85,7 +85,7 @@ VLM 决定「下一步点哪里」，调度与检查点决定「多件事怎么�
 ├── scripts/
 │   ├── demo_preemption.py  # 抢占恢复演示（离线可跑）
 │   └── replay_task.py      # 命令行回放一个任务的事件流
-└── tests/                  # 445 个离线用例
+└── tests/                  # 447 个离线用例
 ```
 
 ## 职责边界
@@ -402,7 +402,7 @@ Scheduler
 等原设备回来（V2.3 起），改派等于把任务上下文悄悄丢到另一台手机上。
 
 单设备时只有一条车道，与旧实现逐字等价——这一点由当时的 257 个既有测试守着
-（V2.7 修复轮之后合计 445 个）。
+（V2.7 修复轮之后合计 447 个）。
 
 ### 多设备暴露出的两个正确性问题
 
@@ -833,7 +833,7 @@ runtime.run(): 有恢复点 → 走既有对账（validate + needs_reconciliatio
 拆解方法：**只做物理移动，不改任何行为**。方法之间通过 `self` 互相引用（`_emit` /
 `_persist` / `_save_checkpoint` / `_ask_human`），用 mixin 共享同一实例——所以
 `AgentRuntime` 的公共 API（`run` / `confirm` / `forget` / `is_goal_decision` /
-`last_goal_check` / `pending_confirmation` / `recovery_pending`）逐字不变，445 个用例
+`last_goal_check` / `pending_confirmation` / `recovery_pending`）逐字不变，447 个用例
 零回归就是证明。
 
 **P1-5（事件驱动状态迁移）本轮不做，如实说明**：文档建议把 Runtime / Scheduler 的
@@ -862,6 +862,20 @@ Runtime / Scheduler / TaskManager 三处全部写入点，回归风险远大于�
 `READ_ONLY_OPERATIONS` 集合。只读封装（`screenshot` / `dump_ui` / `screen_size` /
 `current_focus` / `state`）返回 True；`shell` / `read_shell` 是万能口、保守返回 False。
 「只读端点是否真的只读」从此可从代码查证，而不是靠人记住约定。
+
+### V2.7 补充（六）：8 项复核的逐条处置
+
+审查方复核 HEAD 后指出 8 项仍未达标，逐条核实处置如下：
+
+| 项 | 缺口 | 本轮处置 |
+|---|---|---|
+| P0-2 | `ApprovalGrant.matches` 只比 fingerprint/version/plan_version，未绑 task_id 与尝试身份 | **已修**：增加 `task_id` + `attempt_seq` 绑定。`attempt_id` 要到 Act 阶段才分配（批准时不存在），用 `attempt_seq` 快照等价锁住「批准的到底是哪一次尝试」——批准后 `attempt_seq` 前进过即作废 |
+| P1-1 | 无 cancellation_token、超时未细分、超时→EFFECT_UNKNOWN 衔接不显式 | **部分修**：超时细分已做（`_INPUT_TIMEOUT=5s` / `_LAUNCH_TIMEOUT=15s` / `read_timeout=6s`）。cancellation_token 需 `Popen`+`os.kill` 跨平台改造，侵入面大，未做；超时→EFFECT_UNKNOWN 衔接**已存在**（`_verify` 里动作发出但重新观察失败→EFFECT_UNKNOWN 的完整逻辑） |
+| P1-3 / P1-4 | 仍走 relevance=max + 加权融合，未分阶段判定 | **未做**：这是算法改版（同域→共享目标→共享步骤→改目标的分阶段 pipeline），上一轮已做 `shared_terms` + 三证据融合，进一步分阶段需重写 classify 流程，单独一轮 |
+| P1-6 | 已做「先落盘再唤醒」，但无 TaskLease/claim token/worker ownership | **未做**：TaskLease 是**跨进程**需求（防两个 worker 拥有同一任务），单进程内已闭环（每 lane 单 worker + `lane.running` 单一 + 事件驱动迁移）。与 V2.6 §8 同触发条件 |
+| P1-7 | is_read_only 只停在 docstring，未真正参与加锁决策 | **已修**：`device_access` 加 `operation` 参数，加锁前用 `is_read_only` 真正校验——只读操作误包进加锁路径会抛 500 暴露接线错误；`/tap`/`/text`/`/back` 显式传操作名 |
+| P1-9 | validate 只校验 task_version+页面，未校验 plan_version 与 action_attempt_id | **已修**：补 `plan_version` 门控（不匹配 STALE）。`action_attempt_id` 已通过 `needs_reconciliation` 参与「先对账、再继续」，无需重复门控 |
+| P2-2 | 结构化字段优先，但执行阶段依赖 dispatch.error_class 是否传入 | **已修**：VLM ERROR 分支（动作发出但页面未达预期）的 dispatch 补 `error_class=action_rejected`，不再回退文本匹配 |
 
 ### 对审核最后五条不变量的对照
 
@@ -994,7 +1008,7 @@ pip install -r requirements.txt
 python -m pytest -q
 ```
 
-**445 个用例，全部离线**：不需要 adb、模拟器或 API Key。
+**447 个用例，全部离线**：不需要 adb、模拟器或 API Key。
 
 | 文件 | 覆盖 |
 |---|---|

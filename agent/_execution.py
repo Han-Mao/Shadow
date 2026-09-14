@@ -254,7 +254,7 @@ class ExecutionMixin:
                 )
 
             if assessment.requires_confirmation:
-                if state.approval is not None and state.approval.matches(action, task):
+                if state.approval is not None and state.approval.matches(action, task, state):
                     # 一次性：放行即消费，绝不复用（V2.7 P0-2）
                     logger.info(
                         "任务 %s 的危险动作已获人工放行，本次放行即消费：%s",
@@ -425,7 +425,9 @@ class ExecutionMixin:
         有返回值时表示任务应当就此挂起（等人确认），调用方直接把它当作 run 的结论。
         """
         if task.plan and checkpoint is not None and self._checkpoints is not None:
-            verdict = self._checkpoints.validate(checkpoint, observation, task_version=task.version)
+            verdict = self._checkpoints.validate(
+                checkpoint, observation, task_version=task.version, plan_version=task.plan_version
+            )
             if verdict.value != "resume":
                 logger.info("恢复点已失效（%s），任务 %s 重新规划", verdict.value, task.id)
                 task.plan = []

@@ -23,7 +23,7 @@ from agent.runtime import AgentRuntime
 from agent.scheduler import DeviceNotAllowedError, TaskScheduler
 from agent.task_manager import TaskManager
 from device import screenshot as shots
-from device.adb import AdbController, AdbError
+from device.adb import AdbController, AdbError, is_read_only
 from device.emulator import resolve_serial, resolve_serials
 from device.input import build_default_input
 from device.pool import DevicePool, UnknownDeviceError, storage_hint
@@ -440,12 +440,22 @@ def _artifact_dir_for(session_item) -> Path:
 
 
 @contextmanager
-def device_access(session_item, *, timeout: float = 0.0):
+def device_access(session_item, *, timeout: float = 0.0, operation: str | None = None):
     """单步调试端点临时占用设备。
 
     只给会**改变设备状态**的操作加锁：只读端点（/devices、/screenshot、/observe）
     不加锁，否则任务一跑起来连设备信息都查不到。
+
+    `operation` 是被保护的设备操作名（V2.7 P1-7）：加锁前用 `device.adb.is_read_only`
+    **真正校验**这次操作是写操作。若传入的是只读操作（screenshot / dump_ui 等），
+    说明调用方把只读端点误包进了加锁路径，直接抛错暴露这个 bug——而不是靠 docstring
+    里的一句「只读端点不加锁」约定。省略 `operation` 时保守按写处理（宁可多锁，不漏锁）。
     """
+    if operation is not None and is_read_only(operation):
+        raise HTTPException(
+            status_code=500,
+            detail=f"只读操作 {operation!r} 不该占用设备锁——这是调用方的接线错误",
+        )
     if not session_item.acquire(_MANUAL_OWNER, timeout=timeout):
         raise HTTPException(
             status_code=409, detail=f"设备忙：{session_item.owner or '未知任务'} 正在执行"
@@ -459,7 +469,7 @@ def device_access(session_item, *, timeout: float = 0.0):
 @app.post("/tap")
 def tap(req: TapRequest, request: Request, device_serial: str | None = None):
     session_item = resolve_manual_device(req.device_serial or device_serial, request)
-    with device_access(session_item) as device:
+    with device_access(session_item, operation="tap") as device:
         device.tap(req.x, req.y)
     return {"ok": True, "device": session_item.serial, "generation": session_item.generation}
 
@@ -469,7 +479,7 @@ def text(req: TextRequest, request: Request, device_serial: str | None = None):
     session_item = resolve_manual_device(req.device_serial or device_serial, request)
     # 中文走 ADB Keyboard 广播，ASCII 走 input text —— 调用方不需要知道区别
     provider = build_default_input(session_item.controller)
-    with device_access(session_item):
+    with device_access(session_item, operation="type_text"):
         provider.input(req.value)
     return {
         "ok": True,
@@ -482,7 +492,7 @@ def text(req: TextRequest, request: Request, device_serial: str | None = None):
 @app.post("/back")
 def back(request: Request, device_serial: str | None = None):
     session_item = resolve_manual_device(device_serial, request)
-    with device_access(session_item) as device:
+    with device_access(session_item, operation="back") as device:
         device.back()
     return {"ok": True, "device": session_item.serial, "generation": session_item.generation}
 
@@ -566,6 +576,9 @@ def execute_action(req: ActionRequest, request: Request, device_serial: str | No
     controller = session_item.controller
     artifact_dir = _artifact_dir_for(session_item)
 
+    # /actions 是动态分发（wait / done 这类无设备副作用的 action 也会进来），
+    # 不传 operation：走保守加锁。is_read_only 的结构化校验只对明确的写端点
+    # （/tap、/text、/back）生效，那里操作名是确定的。
     with device_access(session_item) as device:
         # 统一风险门禁：危险动作不能绕过 HITL 直接执行（V2.1 §十）。
         # 之前这里在 execute 之后才回传 risk，等于外部调用能静默执行危险动作。

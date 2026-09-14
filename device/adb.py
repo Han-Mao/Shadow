@@ -96,6 +96,12 @@ class AdbController:
     # 写类不同：`am start` 拉冷启动的 App 确实可能慢，等一等是有意义的。
     read_timeout: float = 6.0
 
+    # 按操作类型细分的超时（V2.7 P1-1）：审查指出「写类 15s 一档」太粗——
+    # 点一下（tap）和拉冷启动（am start）根本不是一个量级，前者 2-5s 就该够。
+    # 细分之后，「让出设备」这个安全点的等待上界进一步收紧：tap 卡住不用干等 15s。
+    _INPUT_TIMEOUT = 5.0      # tap / swipe / long_press / back / home / keyevent
+    _LAUNCH_TIMEOUT = 15.0    # am start / monkey 冷启动
+
     def _base(self) -> list[str]:
         return ["adb", "-s", self.serial]
 
@@ -155,8 +161,8 @@ class AdbController:
             raise AdbError(stderr.strip() or f"adb {' '.join(args)} 失败")
         return proc
 
-    def shell(self, *args: str) -> str:
-        return self._run(["shell", *args]).stdout.strip()
+    def shell(self, *args: str, timeout: float | None = None) -> str:
+        return self._run(["shell", *args], timeout=timeout).stdout.strip()
 
     def read_shell(self, *args: str) -> str:
         """采集类 shell 命令（`dumpsys` / `wm size` 等），走更紧的 `read_timeout`。"""
@@ -168,20 +174,26 @@ class AdbController:
     # ---- 输入 ----
 
     def tap(self, x: int, y: int) -> None:
-        self.shell("input", "tap", str(x), str(y))
+        self.shell("input", "tap", str(x), str(y), timeout=self._INPUT_TIMEOUT)
 
     def long_press(self, x: int, y: int, duration_ms: int = 800) -> None:
-        self.shell("input", "swipe", str(x), str(y), str(x), str(y), str(duration_ms))
+        self.shell(
+            "input", "swipe", str(x), str(y), str(x), str(y), str(duration_ms),
+            timeout=self._INPUT_TIMEOUT,
+        )
 
     def swipe(self, x1: int, y1: int, x2: int, y2: int, duration_ms: int = 300) -> None:
-        self.shell("input", "swipe", str(x1), str(y1), str(x2), str(y2), str(duration_ms))
+        self.shell(
+            "input", "swipe", str(x1), str(y1), str(x2), str(y2), str(duration_ms),
+            timeout=self._INPUT_TIMEOUT,
+        )
 
     def type_text(self, value: str) -> None:
         """仅支持安全 ASCII；空格转义为 %s；中文需 ADB Keyboard 广播方案（§6.3，M4 处理）。"""
         self.shell("input", "text", escape_type_text(value))
 
     def keyevent(self, code: str) -> None:
-        self.shell("input", "keyevent", code)
+        self.shell("input", "keyevent", code, timeout=self._INPUT_TIMEOUT)
 
     def back(self) -> None:
         self.keyevent("KEYCODE_BACK")
@@ -191,9 +203,9 @@ class AdbController:
 
     def launch(self, package: str, activity: str | None = None) -> None:
         if activity:
-            self.shell("am", "start", "-n", f"{package}/{activity}")
+            self.shell("am", "start", "-n", f"{package}/{activity}", timeout=self._LAUNCH_TIMEOUT)
         else:
-            self.shell("monkey", "-p", package, "1")
+            self.shell("monkey", "-p", package, "1", timeout=self._LAUNCH_TIMEOUT)
 
     def wait(self, duration_ms: int = 1000) -> None:
         time.sleep(duration_ms / 1000.0)

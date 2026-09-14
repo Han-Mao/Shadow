@@ -73,12 +73,15 @@ class ConfirmationMixin:
         pending = state.pending_confirmation
         if pending is None:
             return False
-        # 记下「批准的到底是哪一个动作、哪一版目标与计划」（V2.7 P0-2）：
-        # 放行时逐项比对，动作 / 目标 / 计划任一变过就作废——绝不拿来放行别的危险动作。
+        # 记下「批准的到底是哪一个任务、哪一个动作、哪一版目标与计划、哪一次尝试」
+        # （V2.7 P0-2）：放行时逐项比对，任务 / 动作 / 目标 / 计划 / 执行序号任一变过
+        # 就作废——绝不拿来放行别的危险动作。
         state.approval = ApprovalGrant(
+            task_id=task_id,
             action_fingerprint=pending.fingerprint,
             task_version=state.pending_task_version,
             plan_version=state.pending_plan_version,
+            attempt_seq=state.attempt_seq,
         )
         self._emit(
             task_id,
