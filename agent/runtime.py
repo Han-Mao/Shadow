@@ -163,6 +163,9 @@ class AgentRuntime:
         self._states: dict[str, RuntimeState] = {}
         # 多设备 = 多个 worker 线程并发调用 runtime，运行时状态必须加锁
         self._states_lock = threading.RLock()
+        # 崩溃恢复门禁待处理的原因（V2.6 §七）：task_id -> 为什么必须人工确认。
+        # 它既不是「某个危险动作」也不是「完成裁定」，所以单独放一个容器。
+        self._recovery_notes: dict[str, str] = {}
 
     def _session_for(self, task: Task) -> DeviceSession:
         """按任务绑定的设备取会话（V2.1 §十三）。
@@ -174,6 +177,37 @@ class AgentRuntime:
         return self._pool.get(task.device_serial) or self._default_session
 
     # ---- 对外 ----
+
+    def _gate_crash_recovery(self, task: Task) -> RunOutcome | None:
+        """崩溃恢复门禁（V2.6 §七）：先回答「上次那个动作到底发出去没有」。
+
+        任务停在 RUNNING 就被掐断，说明上一次执行是半途消失的：
+
+        - **有恢复点** → 交给既有的恢复路径（它用 `validate` + `needs_reconciliation`
+          对账 checkpoint 里的 `action_effect` / `attempt_id`）。这是已经能工作的部分，
+          返回 None 让它照常继续。
+        - **没有恢复点** → 既不知道动作发没发出，也没有 attempt 记录可比对。这时候
+          重新规划再点一次手机，可能就是把同一条消息发第二遍、同一个订单下第二次。
+          唯一诚实的做法是停下来交给人，而不是替用户赌一把。
+
+        返回 None 表示「门禁放行，可以正常执行」。
+        """
+        checkpoint = self._load_checkpoint(task)
+        if checkpoint is not None:
+            return None
+
+        reason = (
+            "重启前任务停在执行中，且没有可用恢复点：无法判断上一个动作是否已经生效，"
+            "已暂停等待人工确认（不要盲目重跑）"
+        )
+        logger.warning("任务 %s 崩溃重启且无可信恢复点，转人工确认", task.id)
+        with self._states_lock:
+            self._recovery_notes[task.id] = reason
+        # 这次标记已经处理过了，人工放行后不该被同一个门禁拦第二次
+        task.recovery_required = False
+        task.mark(TaskStatus.WAITING, source="runtime")
+        self._emit(task.id, WAITING, reason="recovery_requires_human", detail=reason)
+        return RunOutcome.AWAITING_CONFIRMATION
 
     def run(self, task: Task) -> RunOutcome:
         """把一个任务跑到结束、失败或被挂起。"""
@@ -191,6 +225,14 @@ class AgentRuntime:
         # 本任务跑在哪台设备上，由绑定决定——多设备时 worker 线程各跑各的，
         # 所以这个 session 只作为**局部变量**贯穿本次 run，不进实例状态
         session = self._session_for(task)
+
+        # V2.6 §七：崩溃恢复门禁要在 mark(RUNNING) 之前——先确认「上次那个动作到底
+        # 发出去没有」。确认不了就不进入执行循环（返回 None 表示可以正常开跑）。
+        if task.recovery_required:
+            gate = self._gate_crash_recovery(task)
+            if gate is not None:
+                return gate
+
         task.mark(TaskStatus.RUNNING, source="runtime")
         try:
             self._persist(task)
@@ -503,6 +545,15 @@ class AgentRuntime:
             state = self._states.get(task_id)
             return state.pending_confirmation if state else None
 
+    def recovery_pending(self, task_id: str) -> str | None:
+        """这条任务是不是在等「崩溃后状态不可信」的人工处置（V2.6 §七）。
+
+        返回原因是给 API 与审计看的：它不是危险动作、也不是完成裁定，而是
+        「上次那个动作到底生效没有，我们判断不了，交给人决定」。
+        """
+        with self._states_lock:
+            return self._recovery_notes.get(task_id)
+
     def confirm(self, task_id: str, approved: bool) -> bool:
         """人工确认危险动作。批准后该动作会被放行一次。"""
         with self._states_lock:
@@ -514,6 +565,9 @@ class AgentRuntime:
             # 等人工裁定「任务是否完成」时，pending_confirmation 是空的（那不是某个动作）
             if state is not None and state.awaiting_goal_decision:
                 return self._confirm_goal_locked(task_id, state, approved)
+            # V2.6 §七：崩溃恢复门禁也在等人工，它同样不是某个动作
+            if task_id in self._recovery_notes:
+                return self._confirm_recovery_locked(task_id, approved)
             return False
 
         if state.awaiting_goal_decision:
@@ -576,9 +630,28 @@ class AgentRuntime:
         )
         return True
 
+    def _confirm_recovery_locked(self, task_id: str, approved: bool) -> bool:
+        """人工处理「崩溃后状态不可信」（V2.6 §七）。
+
+        与另外两种确认的区别：危险动作否决 = 放弃那个动作；完成裁定否决 = 接着做；
+        而这里的批准 / 否决都不改变「要做什么」，只回答一个问题——
+        **上次那个动作能不能当成没生效、放心重跑**。
+
+        批准 = 人确认过没有不可挽回的副作用（TaskManager 会顺手清掉旧计划重新规划）；
+        否决 = 不再自动重跑，落 DEGRADED 等人工处置。两边都不在这里改任务状态：
+        状态统一由 TaskManager 落，避免又出现「两处各写一半」。
+        """
+        self._recovery_notes.pop(task_id, None)
+        logger.info("任务 %s 的崩溃恢复待办已被人工处理（approved=%s）", task_id, approved)
+        self._emit(
+            task_id, CONFIRMED, approved=approved, action="recovery", risk="", reason="recovery"
+        )
+        return True
+
     def forget(self, task_id: str) -> None:
         with self._states_lock:
             self._states.pop(task_id, None)
+            self._recovery_notes.pop(task_id, None)
 
     def _emit(self, task_id: str, kind: str, **data) -> None:
         if self._event_log is not None:

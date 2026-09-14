@@ -85,7 +85,7 @@ VLM 决定「下一步点哪里」，调度与检查点决定「多件事怎么�
 ├── scripts/
 │   ├── demo_preemption.py  # 抢占恢复演示（离线可跑）
 │   └── replay_task.py      # 命令行回放一个任务的事件流
-└── tests/                  # 424 个离线用例
+└── tests/                  # 428 个离线用例
 ```
 
 ## 职责边界
@@ -402,7 +402,7 @@ Scheduler
 等原设备回来（V2.3 起），改派等于把任务上下文悄悄丢到另一台手机上。
 
 单设备时只有一条车道，与旧实现逐字等价——这一点由当时的 257 个既有测试守着
-（V2.5 修复轮之后合计 424 个）。
+（V2.6 修复轮之后合计 428 个）。
 
 ### 多设备暴露出的两个正确性问题
 
@@ -638,6 +638,72 @@ CREATED → QUEUED → RUNNING ─┬→ DONE / FAILED / CANCELLED   （终态�
 | `GET /tasks` 的 `corrupt` 字段 | 对受限令牌返回空列表（同上理由） |
 | `POST /tasks/{id}/cancel` | 运行中的任务状态变为 `cancel_requested`，安全点后（或重启时）落定 `cancelled` |
 
+## V2.6 修复轮（依据 `v2.6审查建议.md`）
+
+这轮审核是对上一轮的**反向验证**，专盯并发。9 条技术项里，**5 条已在 V2.5 修掉**
+（#1 / #2 / #3 / #5 / #6——文档引用的是 V2.4 时期的写法，那段代码在本轮开始前就已不存在），
+**2 条真实存在、本轮修掉**（#4 / #7），1 条架构建议本轮未做（#8），1 条是补测试（#9）。
+
+| # | 审查项 | 现状核对 | 结论 |
+|---|---|---|---|
+| 1 | P0 CAS 不是原子的 | `TaskStore.save` 已走 `JsonStore.update_atomic()`——读 - 比较 - 递增 - 原子替换在同一把锁里 | **V2.5 已修** |
+| 2 | P0 `expected_revision` + 记录不存在时反而允许写 | 现实现把「文件不存在」折算成 `actual = 0`，与 `expected=15` 不等即抛 `ConcurrentModificationError` | **V2.5 已修** |
+| 3 | P0 损坏文件能被 CAS 写入「救活」 | 损坏时 `_read_unlocked` 抛 `CorruptDataError`，写入根本不会发生 | **V2.5 已修** |
+| 4 | P1 运行中降级会提前清空 `lane.running` | **存在**：`_drop_from_queues` 无条件清运行槽 | **本轮修掉**（见下） |
+| 5 | P1 `_persist_or_degrade` 重复追加 `_completed` | 已改为 `_mark_completed()` 去重 | **V2.5 已修** |
+| 6 | P1 `get()` 与 `list_all()` 视图不一致 | `list_all()` 已合并 `Scheduler.tracked_tasks()`，live 优先 | **V2.5 已修** |
+| 7 | P1 RUNNING 恢复可能重复副作用 | **存在**：无恢复点时直接重新规划执行 | **本轮修掉**（见下） |
+| 8 | P2 Runtime/Scheduler 的 `save()` 不带 revision | 属架构演进建议 | 本轮未做（见文末） |
+| 9 | 该补的故障注入测试 | 本轮补齐删除竞态 / 损坏竞态 / 运行中降级 / 崩溃恢复四条 | **本轮补上** |
+
+### 「持久化失败」不等于「立即释放运行槽」
+
+`cancel` 与持久化降级都可能发生在 Runtime **仍在执行**的那一瞬间。以前
+`_drop_from_queues()` 会顺手把 `lane.running` 置空，于是调度器以为设备空了——
+`running_tasks()`、抢占判断、API 状态同时失真，而真实世界里那条任务还在点手机。
+
+```text
+cancel 或 persist 失败
+      ↓
+_drop_from_queues()
+      ↓
+lane.executing 为真？  ← 新增判断：正在执行就不动运行槽
+      ↓
+运行槽只由 worker 自己在 _execute 的 finally 里释放
+```
+
+### 崩溃恢复必须先回答「上次那个动作发出去没有」
+
+进程停在 `RUNNING` 就被掐断，说明上一次执行是半途消失的。以前 `recover()` 把它变回
+`QUEUED` 就直接重跑；而**没有恢复点**的任务意味着我们既不知道动作发没发出、也没有
+attempt 记录可比对——重跑可能就是第二条消息、第二笔订单。
+
+```text
+recover(): 磁盘上是 RUNNING  →  task.recovery_required = True
+      ↓
+runtime.run(): 有恢复点 → 走既有对账（validate + needs_reconciliation）
+               无恢复点 → 转人工：WAITING + 留下原因，不自动执行
+      ↓
+人工 /confirm: 批准 → 清恢复标记 + 丢弃旧计划重新规划
+               否决 → 落 DEGRADED 等人工处置
+```
+
+`confirmation_kind` 因此变成三种：**`dangerous_action` / `goal` / `recovery`**；
+确认令牌的指纹也相应区分为动作指纹 / `goal` / `recovery`，三类票据不能互换。
+
+### 这一轮没有做的事（如实说明）
+
+审核 §8 指出根因：**TaskManager 有 CAS，而 Runtime 与 Scheduler 仍直接 `save()`** ——
+三个模块各有一份写权限，CAS 只是「改写入口保护」。文档建议引入统一的
+`TaskMutationService`。本轮**没有做这个重构**，理由：
+
+- 单进程内三者持有的是**同一批内存 Task 实例**，`task.revision` 会随任一写者推进；
+  给 Runtime / Scheduler 的 `save` 硬加 `expected_revision` 并不增加保护，反而会把
+  「内存比磁盘新」这类正常情形误判成冲突；
+- 真正的跨进程保护需要文件锁 / 数据库事务——已在待办里标为「多进程部署前必须先做」。
+
+也就是说：**这一条适合等存储换成 SQLite 时一起做**，而不是现在加一层解决不了问题的封装。
+
 ## 快速开始
 
 ```powershell
@@ -758,7 +824,7 @@ pip install -r requirements.txt
 python -m pytest -q
 ```
 
-**424 个用例，全部离线**：不需要 adb、模拟器或 API Key。
+**428 个用例，全部离线**：不需要 adb、模拟器或 API Key。
 
 | 文件 | 覆盖 |
 |---|---|

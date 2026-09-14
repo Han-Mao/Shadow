@@ -213,18 +213,21 @@ class TaskManager:
     # ---- 人工处理待确认事项（V2.2 §三 / §十一）----
 
     def confirmation_kind(self, task_id: str) -> str:
-        """这条任务在等什么：「dangerous_action」/「goal」/「none」。"""
+        """这条任务在等什么：「dangerous_action」/「goal」/「recovery」/「none」。"""
         if self._runtime is None or not self.confirmation_pending(task_id):
             return "none"
+        if self._runtime.recovery_pending(task_id) is not None:
+            return "recovery"
         return "goal" if self._runtime.is_goal_decision(task_id) else "dangerous_action"
 
     def confirmation_pending(self, task_id: str) -> bool:
-        """有没有待人工处理的事项（危险动作或完成裁定）。"""
+        """有没有待人工处理的事项（危险动作 / 完成裁定 / 崩溃恢复）。"""
         if self._runtime is None:
             return False
         return (
             self._runtime.pending_confirmation(task_id) is not None
             or self._runtime.is_goal_decision(task_id)
+            or self._runtime.recovery_pending(task_id) is not None
         )
 
     def resolve_confirmation(self, task_id: str, *, approved: bool) -> Task | None:
@@ -254,14 +257,35 @@ class TaskManager:
             task = self.get(task_id)
             if task is None or not self.confirmation_pending(task_id):
                 return None
+            kind = self.confirmation_kind(task_id)
+
+            if kind == "recovery" and not approved:
+                # V2.6 §七：人判断「不要继续」——不再自动重跑，落在 DEGRADED 等人工处置
+                if not self._runtime.confirm(task_id, approved):
+                    return None
+                task.mark(TaskStatus.DEGRADED, source="task_manager")
+                self._store.save(task)
+                logger.warning("任务 %s 的崩溃恢复被否决，转入 degraded 等人工处置", task_id)
+                return task
+
             if not self._runtime.confirm(task_id, approved):
                 return None
 
+            if kind == "recovery":
+                # 人确认「可以继续」→ 重新规划：旧的 plan 是在崩溃前那份状态上排的，
+                # 沿用它等于假装那次中断没发生过（V2.6 §七）
+                task.recovery_required = False
+                task.plan = []
+                task.plan_version += 1
+                task.checkpoint_id = None
+
             # 无论批准还是否决，都要重新入队：
-            #  批准 → 放行那一次危险动作 / 认定完成
+            #  批准 → 放行那一次危险动作 / 认定完成 / 放行崩溃恢复
             #  否决 → 按 runtime 记下的黑名单或 Re-plan 理由，换一种做法继续
             self._scheduler.submit(task, allow_preempt=False)
-            logger.info("任务 %s 的待确认事项已处理（approved=%s）", task_id, approved)
+            logger.info(
+                "任务 %s 的待确认事项已处理（approved=%s, kind=%s）", task_id, approved, kind
+            )
             return task
 
     # ---- 注入 ----

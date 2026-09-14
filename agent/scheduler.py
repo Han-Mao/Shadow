@@ -303,9 +303,18 @@ class TaskScheduler:
                         self._mark_completed(task.id)
                         restored["cancelled"] += 1
                         restored_as = "cancelled"
+                    elif task.status is TaskStatus.RUNNING:
+                        # V2.6 §七：进程被杀时任务停在 RUNNING——上一个动作到底发出去
+                        # 没有是未知的。标上 recovery_required，让 runtime 在真正跑之前
+                        # 先处理（有恢复点就对账，没有就转人工），而不是当普通任务重跑。
+                        task.recovery_required = True
+                        task.mark(TaskStatus.QUEUED, source="scheduler")
+                        lane = self._lane_for(task)
+                        lane.push_ready(task, self._counter)
+                        restored["queued"] += 1
+                        restored_as = "queued(from running, recovery_required)"
                     else:
-                        # created / queued / running / waiting
-                        # running 说明上次是进程被杀、动作已中断 —— 交给 Checkpoint 校验后重跑；
+                        # created / queued / waiting
                         # waiting 说明在等人工确认，重启后重新决策一次比沿用旧确认更安全
                         previous = task.status.value
                         task.mark(TaskStatus.QUEUED, source="scheduler")
@@ -684,10 +693,20 @@ class TaskScheduler:
             return False
 
     def _drop_from_queues(self, task_id: str) -> None:
-        """把任务从所有车道的就绪队列、挂起区和全局暂停区移除。"""
+        """把任务从所有车道的就绪队列、挂起区、暂停区和等待设备区移除。
+
+        **但不释放正在执行的车道**（V2.6 §四）：cancel、持久化降级都可能发生在
+        Runtime 仍在跑的时候。`lane.running` 一旦被清掉，调度器就以为设备空了，
+        而真实世界里那条任务还在操作手机——`running_tasks()`、抢占判断、设备所有权
+        认知会同时失真。运行槽只由 worker 自己（`_execute` 的 finally）释放。
+        """
         for lane in self._lanes.values():
             lane.drop(task_id)
-            if lane.running is not None and lane.running.id == task_id:
+            if (
+                lane.running is not None
+                and lane.running.id == task_id
+                and not lane.executing
+            ):
                 lane.running = None
         self._paused.pop(task_id, None)
         # V2.5 §九：等待设备的容器也要清——否则 cancel 之后它还攥着一个 CANCELLED

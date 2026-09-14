@@ -764,7 +764,11 @@ def confirm_task(task_id: str, req: ConfirmRequest, request: Request):
 
     if auth.enabled():
         pending = runtime.pending_confirmation(task_id)
-        fingerprint = pending.fingerprint if pending is not None else "goal"
+        # 没有 pending 动作时，指纹取确认类型（goal / recovery）——它们同样要绑进令牌，
+        # 否则「完成裁定令牌」和「崩溃恢复放行令牌」可以互换（V2.6 §七）
+        fingerprint = (
+            pending.fingerprint if pending is not None else manager.confirmation_kind(task_id)
+        )
         ok, reason = auth.consume_confirmation_token(
             req.token, principal.name, task_id, fingerprint, task.version
         )

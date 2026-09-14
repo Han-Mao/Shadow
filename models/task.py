@@ -197,6 +197,12 @@ class Task(BaseModel):
     # 落盘变成 done + 新目标（见 ConcurrentModificationError）。
     revision: int = 0
 
+    # 崩溃 / 重启中断标记（V2.6 §七）：`recover()` 发现磁盘上停在 RUNNING 的任务时置位。
+    # 含义是「上一次执行是在半途消失的，动作可能已经真的发出去过」——所以进入执行循环
+    # 之前必须先把这件事处理掉（有恢复点就对账，没有就转人工），
+    # 严禁默认「从 QUEUED 重新规划然后接着点手机」。
+    recovery_required: bool = False
+
     # 当前聚焦的步骤（V2.1 §二十一）。由 next_pending_step 选出谁就记谁，
     # 便于 API / 日志直接回答「现在在干哪一步」，不用再从 plan 里推算一遍。
     active_step_id: str | None = None
