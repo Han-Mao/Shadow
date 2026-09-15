@@ -111,7 +111,7 @@ V3.3 起 `Vision / Device` 这一层的左边是 `DeviceController` **协议**�
 ├── scripts/
 │   ├── demo_preemption.py  # 抢占恢复演示（离线可跑）
 │   └── replay_task.py      # 命令行回放一个任务的事件流
-└── tests/                  # 737 个离线用例
+└── tests/                  # 744 个离线用例
 ```
 
 ## 职责边界
@@ -1786,6 +1786,66 @@ Android 静态契约 38 passed；`verify_kotlin_compile.py` 真编译 27 class +
 
 ---
 
+## V4.3–V4.5 智能层审查轮（依据三份「还可以更强」清单）
+
+这三份连续审查的结论高度一致：**可靠执行系统已经接近生产级，弱的不是执行、是
+「智能层」**（任务理解、长期规划、记忆、模型路由）。它们也从「缺陷审查」滑向了
+「产品化蓝图」（v5 Mobile Agent OS 那张图），所以本轮的诚实做法是——**只做真正
+有缺口、且能离线落地验证的项，其余逐条给理由与触发条件**。
+
+### 一、逐条核对（三份合在一起）
+
+| 条目 | 核对结果 | 处理 |
+|---|---|---|
+| v4.3 §1 / v4.4 §五：加 TaskPlan 层（goal + constraints + success_condition） | **成立**，v4.2 已补每步 `expected_state`，缺**任务级**三样 | ✅ `models/task_plan.py` |
+| v4.4 §2 P1：Checkpoint 缺 `device_state` | **前景 app 早已覆盖**（`package`/`activity` + `same_screen_as` 就是「当前是不是微信聊天页」）；电池/网络要新设备接口 | ⏸ 见「三、有理由延期」 |
+| v4.3 §5 / v4.5 §六：语义定位（embedding 匹配） | **部分已做**：v4.2 已把「目标不唯一」判成证据缺口；要 embedding 匹配是**新模型能力** | ⏸ 见延期 |
+| v4.3 §6 / v4.4 §3：任务依赖图 | **已覆盖**：`TaskRelation` 五种关系 + `parent_task_id`/`root_task_id` + `depends_on`；审核要的 PARENT_CHILD/DEPENDENCY 就是 SUBTASK | 无需新做 |
+| v4.4 §4 / §5：后台存活、一键安装、Event 聚合 | 需要真机 + Android 工程改动；Event 聚合**已有雏形**（`ShadowAccessibilityService` 只认 `TYPE_WINDOW_STATE_CHANGED`，`TYPE_WINDOW_CONTENT_CHANGED` 已刻意忽略） | ⏸ 真机验证 |
+| v4.5 §2：API/Runtime 队列化（Task Queue + Worker） | **单机成立**：`TaskScheduler` 已经是「队列 + 每设备一条 worker lane」；审核说的是**多机横向扩展**（Redis/RabbitMQ） | ⏸ 产品化蓝图 |
+| v4.5 §7 P1：Prompt 版本管理 | **成立**，且便宜、完全契合「可靠性」定位 | ✅ `PROMPT_VERSION_*` |
+| v4.5：Device Capability / Health Score / Model Router / UI State / Skill 体系 | 产品化蓝图，无一能在离线环境验证，也非当前定位 | ⏸ 触发条件见 §三 |
+
+### 二、本轮落地
+
+| 条目 | commit | 落点 |
+|---|---|---|
+| TaskPlan 层 | `feat(plan): 加一层 TaskPlan` | `models/task_plan.py` + `Task.plan_goal/plan_constraints/success_condition` + 计划/决策 prompt |
+| Prompt 版本 | `feat(obs): 每个 prompt 挂版本号` | `vision/vlm.py` 的 `PROMPT_VERSION_*` + `Decision.prompt_version` → `ACTION_DISPATCHED` 事件 |
+
+**TaskPlan 三要素的语义**（v4.3 §1 的核心，值得说清）：`goal`（这一趟干什么）/
+`constraints`（不许做什么）/`success_condition`（什么算完成）。它们与步骤**同生共死**
+（都在 `set_plan` 里写，重新规划整体替换），进决策 prompt 与 `/tasks/{id}`，
+但**不参与裁定**——裁决仍只认 `goal_verifier` 的独立证据（与 v4.2 的 `expected_state`
+同一条纪律）。
+
+### 三、有理由延期（触发条件都写在对应代码注释里）
+
+1. **语义 grounding 升级到 embedding 匹配**（v4.3 §5 / v4.5 §六）。现状：关键词/文本
+   匹配 + 「目标不唯一→证据缺口」。要升级需要引入 embedding 模型（HuggingFace/Ollama），
+   那是**新的模型依赖**，且必须同样受「只能抬不能降」约束。触发条件：`infer_role` 与
+   文本匹配的 `UNKNOWN`/歧义在真实轨迹里成为高频。
+2. **Checkpoint 的 `device_state`（电池/网络）**。前景 app 已覆盖（`package`/`activity`）。
+   电池/网络要 `DeviceController` 新增接口，横跨 ADB + Android + 桥 + 契约测试四方，
+   且收益只是「恢复时多一条环境信息」。触发条件：真机任务频繁因「低电量/网络切换」
+   而非「页面不对」失败时再做。
+3. **API 队列化 / Device Capability / Health Score / Model Router / Skill 体系**——这些是
+   「多机产品化」的事，单机 demo 不需要，且无一能在无真机/无 embedding 的环境里验证。
+   触发条件：决定做「多设备云端平台」时（那时 Skill 体系优先于 Model Router，
+   因为它是「会使用手机技能」而不是「会点手机」的质变）。
+
+### 四、验证
+
+`python -m pytest -q` → **744 passed**（上轮 737 → +7，零回归）。
+
+| 新增用例 | 覆盖 |
+|---|---|
+| `test_models.py`（+4） | `TaskPlan` 四种形状归一 / 空约束剥除与空行不渲染 / 三要素过序列化 / 重新规划整体替换不合并 |
+| `test_vision.py`（+1 改 1） | Decision 带 prompt 版本 / AST 保证 5 个 prompt 都有版本号；混合返回用例断言升级成 TaskPlan 形状 |
+| `test_runtime.py`（+1 改 2） | `ACTION_DISPATCHED` 事件带上 prompt_version；两个固定参数替身补 `plan_context` 形参 |
+
+---
+
 ## 快速开始
 
 ```powershell
@@ -1915,7 +1975,7 @@ pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 
-**737 个用例，全部离线**：不需要 adb、模拟器或 API Key。
+**744 个用例，全部离线**：不需要 adb、模拟器或 API Key。
 
 | 文件 | 覆盖 |
 |---|---|
