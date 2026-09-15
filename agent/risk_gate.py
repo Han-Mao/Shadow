@@ -235,6 +235,14 @@ class ActionRiskGate:
         evidence_risk = ActionRisk.SAFE
         if action.is_mutating and resolved.resolution.is_evidence_gap:
             screen_hint = _screen_sensitivity_hint(context)
+            # 「多个候选」与「一个都没找到」的处置等级一样（都是证据缺口），但**理由
+            # 必须分开写**：前者是我们知道好几个候选却不知道模型指哪个，后者是根本
+            # 没看到那个控件。混成一句「点在哪、点的是什么都不知道」，审计就分不清
+            # 「页面变了」和「目标不唯一」——而这两种情况的下一步完全不同。
+            #
+            # v4.2 §三 P1 补上的正是这一格：手机 Agent 最容易犯的错不是点不到按钮，
+            # 而是**点错了那个同名按钮**。
+            ambiguous = resolved.resolution is target_evidence.TargetResolution.AMBIGUOUS
             if _is_sensitive_package(context) or screen_hint:
                 evidence_risk = ActionRisk.DANGEROUS
                 scope = (
@@ -242,16 +250,28 @@ class ActionRiskGate:
                     if _is_sensitive_package(context)
                     else f"敏感屏（命中特征「{screen_hint}」）"
                 )
-                reasons.append(
-                    f"{scope}里目标解析失败（{resolved.resolution.value}）："
-                    "点在哪、点的是什么都不知道，不能自动执行"
-                )
+                if ambiguous:
+                    reasons.append(
+                        f"{scope}里有多个候选元素（{resolved.resolution.value}）："
+                        "点错一个可能就是一次不可逆操作，不能自动执行"
+                    )
+                else:
+                    reasons.append(
+                        f"{scope}里目标解析失败（{resolved.resolution.value}）："
+                        "点在哪、点的是什么都不知道，不能自动执行"
+                    )
             else:
                 evidence_risk = ActionRisk.CAUTION
-                reasons.append(
-                    f"目标解析失败（{resolved.resolution.value}）："
-                    f"{_TARGET_GAP_HINTS[resolved.resolution]}，按最坏情况对待"
-                )
+                if ambiguous:
+                    reasons.append(
+                        f"目标不唯一（{resolved.resolution.value}）："
+                        f"{_TARGET_GAP_HINTS[resolved.resolution]}，按最坏情况对待"
+                    )
+                else:
+                    reasons.append(
+                        f"目标解析失败（{resolved.resolution.value}）："
+                        f"{_TARGET_GAP_HINTS[resolved.resolution]}，按最坏情况对待"
+                    )
 
         # 说清楚这两档实际拦住了什么，别把功劳记错地方：
         # TAP / LONG_PRESS / TYPE / SWIPE / LAUNCH 的动作类型下限本来就是 CAUTION，
@@ -348,6 +368,7 @@ _TARGET_GAP_HINTS = {
     target_evidence.TargetResolution.NO_TREE: "本次没有 UI 树，看不到点击落在哪个控件上",
     target_evidence.TargetResolution.PARSE_ERROR: "UI 树存在但解析失败，目标元素无法确认",
     target_evidence.TargetResolution.NOT_FOUND: "UI 树里找不到该目标（页面可能已变）",
+    target_evidence.TargetResolution.AMBIGUOUS: "UI 树里有多个同样匹配的元素，无法确定点的是哪一个",
 }
 
 

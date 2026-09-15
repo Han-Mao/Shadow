@@ -73,14 +73,30 @@ class TargetResolution(str, Enum):
     NOT_FOUND = "not_found"
     """树可以解析，但目标既匹配不到文本节点、坐标下也没有节点。"""
 
+    AMBIGUOUS = "ambiguous"
+    """解析到了**多个并列的候选**，无法确定模型指的是哪一个（v4.2 §三 P1）。
+
+    它既不是「没找到」也不是「找到了」：找到了好几个。手机 Agent 最容易犯的错
+    不是点不到按钮，而是**点错了那个同名按钮**——「确认删除」与「确认」、
+    列表里两个「发送」、两个「立即购买」。
+
+    它同样算**证据缺口**：我们无法证明这一下点在模型想点的那个元素上，
+    而没证据就不该在敏感操作上自动执行。`node` 仍然会给出来（文档顺序的第一个），
+    因为验证层要拿它去比对「动作后这个元素还在不在」。
+    """
+
     NO_TARGET = "no_target"
     """动作本来就没有目标元素（LAUNCH / WAIT / BACK / HOME / DONE）。正常，不是缺口。"""
 
     @property
     def is_evidence_gap(self) -> bool:
-        """是不是「本该有目标证据、但没拿到」。"""
-        return self in (TargetResolution.NO_TREE, TargetResolution.PARSE_ERROR,
-                        TargetResolution.NOT_FOUND)
+        """是不是「本该有目标证据、但没拿到（或拿不准）」。"""
+        return self in (
+            TargetResolution.NO_TREE,
+            TargetResolution.PARSE_ERROR,
+            TargetResolution.NOT_FOUND,
+            TargetResolution.AMBIGUOUS,
+        )
 
 
 @dataclass(frozen=True)
@@ -148,7 +164,18 @@ def resolve_target(
         x, y = to_pixel(target, screen_size)
         node = parser.node_at(root, x, y)
     elif isinstance(target, str):
-        node = parser.match_by_text(parser.find_clickable(root), target)
+        # 文本目标：拿到**全部并列候选**，多于一个就是「不确定点哪一个」
+        # （`node` 仍取文档顺序的第一个——它与执行侧 `vision.grounding` 用的是
+        #  同一个匹配函数，所以「被判风险的那个元素」== 「真正被点的那个元素」）。
+        candidates = parser.rank_by_text(parser.find_clickable(root), target)
+        node = candidates[0] if candidates else None
+        if len(candidates) > 1:
+            return ResolvedTarget(
+                node=node,
+                key=parser.node_identity(node),
+                label=parser.node_label(node),
+                resolution=TargetResolution.AMBIGUOUS,
+            )
     else:
         node = None
 

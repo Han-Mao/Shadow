@@ -133,30 +133,47 @@ def node_identity(node: UiNode) -> str:
     )
 
 
+def _text_score(node: UiNode, desc: str) -> int:
+    """单个节点对描述的匹配分：3 = 精确相等，2 = 包含，0 = 不相关。"""
+    score = 0
+    for field_value in (node.text, node.content_desc, node.resource_id):
+        candidate = (field_value or "").strip().lower()
+        if not candidate:
+            continue
+        if candidate == desc:
+            score = max(score, 3)
+        elif desc in candidate:
+            score = max(score, 2)
+    return score
+
+
+def rank_by_text(nodes: list[UiNode], description: str) -> list[UiNode]:
+    """按描述匹配，返回**所有并列最高分**的候选（按文档顺序）。
+
+    v4.2 §三 P1：`match_by_text` 只返回一个赢家，于是「这一屏里有两个『确认』」
+    在调用方看来与「只有一个」完全一样——而「当前这个按钮是不是我要点的」
+    恰恰是手机 Agent 最容易点错的地方。要判「目标唯一吗」，就必须能看到全部候选。
+
+    评分规则与 `match_by_text` 同源（精确 3 / 包含 2），所以两条路径不会各判各的。
+    """
+    desc = (description or "").strip().lower()
+    if not desc:
+        return []
+    scored = [(node, _text_score(node, desc)) for node in nodes]
+    best = max((score for _, score in scored), default=0)
+    if best == 0:
+        return []
+    return [node for node, score in scored if score == best]
+
+
 def match_by_text(nodes: list[UiNode], description: str) -> UiNode | None:
     """按描述匹配可点击节点。精确匹配优先，其次包含匹配。
 
     按分数取最优而不是「首个命中」：否则通用父容器（如空的 FrameLayout）
     会先于真正带文字的按钮被选中，落点偏到容器中心。
-    """
-    desc = (description or "").strip().lower()
-    if not desc:
-        return None
 
-    best: UiNode | None = None
-    best_score = 0
-    for node in nodes:
-        score = 0
-        for field_value in (node.text, node.content_desc, node.resource_id):
-            candidate = (field_value or "").strip().lower()
-            if not candidate:
-                continue
-            if candidate == desc:
-                score = max(score, 3)
-            elif desc in candidate:
-                score = max(score, 2)
-        if score > best_score:
-            best, best_score = node, score
-            if score == 3:
-                break
-    return best
+    多个并列最高分时取**文档顺序的第一个**（`rank_by_text` 的第一项）——
+    这与升级前「遇到精确匹配就 break」的结果完全一致，所以它是纯重构。
+    """
+    candidates = rank_by_text(nodes, description)
+    return candidates[0] if candidates else None
