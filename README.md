@@ -104,7 +104,7 @@ V3.3 起 `Vision / Device` 这一层的左边是 `DeviceController` **协议**�
 ├── scripts/
 │   ├── demo_preemption.py  # 抢占恢复演示（离线可跑）
 │   └── replay_task.py      # 命令行回放一个任务的事件流
-└── tests/                  # 654 个离线用例
+└── tests/                  # 669 个离线用例
 ```
 
 ## 职责边界
@@ -1440,11 +1440,11 @@ commit(jti)        # 成功才把票据永久作废；业务失败（返回 None
 |---|---|---|
 | Commit 1 `refactor: introduce Execution model` | `models/execution.py` + `storage/execution_store.py` + 手工端点接线 + `GET /executions/{id}` | ✅ |
 | Commit 4 `refactor: replace JSONL EventLog with SQLite EventStore` | `storage/database.py` + `storage/migrations/` + `storage/event_store.py`；`EventLog` 变成兼容层，旧 `.jsonl` 一次性导入 | ✅ |
+| Commit 2 `refactor: unify task/checkpoint/event storage` | 任务、恢复点、事件、票据在**同一个 `shadow.db`**，旧的 `*.json` / `*.jsonl` 一次性导入 | ✅ |
+| Commit 3 `fix: transactional confirmation` | `/confirm` 的「预占票据 → 改 Task 状态 → 写事件 → 作废票据」在**一个事务**里 | ✅（见「五」的内存边界） |
 | Commit 7 `chore: lock dependencies` | `pyproject.toml` / `requirements.txt` 钉死版本、`requirements-dev.txt`、`uv.lock`（29 包） | ✅ |
-| Commit 8 `test: crash/concurrency regression suite` | 并发确认、并发手工动作、设备忙落定、旧库导入、序号唯一……（见「验证」） | ◑ 部分（崩溃恢复那几条上一轮已在） |
-| Commit 2 `refactor: unify task/checkpoint/event storage` | events 已进 SQLite；tasks / checkpoints 还在 JSON | ⏸ 见「三」 |
-| Commit 3 `fix: transactional confirmation` | 需要 Task 与 Confirmation 同库才可能真正成立 | ⏸ 依赖 Commit 2 |
-| Commit 5 `refactor: single-writer task mutation` | 出口路径与触发条件已写在 `agent/task_manager.py` | ⏸ 见「三」 |
+| Commit 8 `test: crash/concurrency regression suite` | 并发确认、并发手工动作、设备忙落定、旧库导入、序号唯一、事务回滚…… | ◑ 崩溃恢复那几条上一轮已在 |
+| Commit 5 `refactor: single-writer task mutation` | 出口路径与触发条件已写在 `agent/task_manager.py` | ⏸ 见「六」 |
 
 ### 一、Commit 1：手工操作有了自己的身份（§1 / §5）
 
@@ -1518,42 +1518,58 @@ CREATE TABLE events (
 | 两个写者写事件 | `test_two_writers_do_not_lose_events_or_duplicate_sequences` | 一条不丢、序号 1..10 连续不重复 |
 | `ACTION_DISPATCHED` 后崩溃 | `test_dangerous_effect_unknown_never_auto_retries`（上一轮已有） | 效果未知 → **绝不自动重复点击** |
 
-### 五、还没做的（按审核的 commit 顺序，附触发条件）
+### 五、Commit 2 + 3：存储统一与事务化确认
 
-- **Commit 2（Task / Checkpoint 进 SQLite）**：`storage/database.py` + `storage/migrations/`
-  已经在位，events 是第一个搬过去的存储；下一步是把 `tasks` / `checkpoints` 也搬过去，
-  之后 **Commit 3（确认票据 + Task 状态 + 事件同一事务）** 才可能真正成立——
-  现在那三步仍然是「两库两写」，靠 `reserve → commit` 把窗口缩到很小，但不是事务。
-  **触发条件：多进程部署，或需要跨文件事务**（与 MEMORY [59] 同一个触发条件）。
-- **Commit 5（single-writer state machine）**：出口路径与触发条件写在
-  `agent/task_manager.py` 的 `_mutation_lock` 注释里（多路注入成为常态、CAS conflict 成规模时做）。
+上一节落地的 Commit 4 只搬了 events；这一轮把 `tasks` / `checkpoints` 也搬进**同一个
+`shadow.db`**（迁移 v2），确认票据表搬进同一库（迁移 v3），于是审核 §3 的「同一事务」成立：
+
+- **Commit 2**：`TaskStore` / `CheckpointStore` 从「一个实体一个 JSON 文件」换成 `tasks` /
+  `checkpoints` 表。四条契约没动（损坏隔离 + 记账 + 留痕、CAS 原子、损坏不可覆盖、索引跨重启重建），
+  旧的 `tasks/*.json` / `checkpoints/*.json` 一次性导入且**保留 revision / 时间戳**。
+- **Commit 3**：`/confirm` 的「预占票据 → 改 Task 状态 → 写 CONFIRMED 事件 → 作废票据」放进
+  **一个数据库事务**（`Database.transaction()` 可重入，内层的 `TaskStore.save` 会加入而不是各开一个）。
+  于是审核点名的两种跨存储状态——「Task 已确认 / Token 未消费」「Token 已消费 / Task 没确认」——
+  在**存储层**都不再可能：中途失败时三者一起回滚（测试里用「CONFIRMED 事件写失败」验证）。
+
+  **诚实的边界**：数据库事务回滚的是**存储**。`Runtime` / `Scheduler` 手里的**内存对象**不受它
+  管辖——那正是审核 §7「single-writer state machine」要根治的问题（见下）。所以这里的保证
+  表述为「磁盘上三样东西要么一起落下、要么一起没有」，而不是「内存也一致」。
+
+### 六、还没做的（按审核的 commit 顺序，附触发条件）
+
+- **Commit 5（single-writer task mutation）**：这是「同一事务」补不上的那一半——内存对象
+  与磁盘的一致性。出口路径与触发条件写在 `agent/task_manager.py` 的 `_mutation_lock` 注释里
+  （多路注入成为常态、CAS conflict 成规模时做）。
 - **Commit 8 的事件驱动 `/wait`**：现在是「按 `revision` 取最新事实 + 轮询」，
   多 worker 常态时要换成条件变量 / Redis pub-sub。
 - **Policy Engine（v3.3 §八 的延期项）**：缺的是「App 敏感状态」（现在只有包名静态词表）
   与「风险历史回路」（完全没有），补记在 `models/semantic.py`。
 
-### 六、行为变化提醒
+### 七、行为变化提醒
 
 1. 手工端点（`/tap` `/text` `/back` `/actions`）的响应**新增** `execution_id` / `execution_status`
    （只加字段，不删不改名）。
 2. 手工操作的事件流**所有者**从 `__manual__` 换成每次请求的 `execution_id`。
    `MANUAL_ACTION_TASK_ID` 仍保留，但已标注废弃——只为兼容旧引用。
 3. 新增 `GET /executions`、`GET /executions/{id}`（都需要鉴权，受设备范围约束）。
-4. 事件存储从 `<root>/<task_id>.jsonl` 换成 `<root>/events.db`；旧文件首次打开时自动导入。
-   `scripts/replay_task.py --list` 改为问存储（不再 glob 文件）。
+4. **存储布局统一到 `<存储目录>/shadow.db`**：任务、恢复点、事件、确认票据都在里面。
+   旧的 `tasks/*.json` / `checkpoints/*.json` / `events/*.jsonl` / `confirmations.db`
+   首次打开时一次性导入；`scripts/replay_task.py --list` 改为问存储。
+   `SHADOW_CONFIRM_DB` 仍可覆盖，但指向别的文件时 §3 的跨表事务不成立。
 5. 依赖钉死版本：`pip install -r requirements.txt` 装运行依赖，测试用 `requirements-dev.txt`。
 
-### 七、验证
+### 八、验证
 
-`python -m pytest -q` → **654 passed**（上轮 632 → +22，零回归）。
+`python -m pytest -q` → **669 passed**（上轮 654 → +15，零回归）。
 
 | 新增用例 | 覆盖 |
 |---|---|
 | `test_execution.py`（13 条） | 执行 id 唯一、落定不改身份字段、拒绝保留依据、落定走原子读改写、跨实例可见、坏记录读成缺失、未来字段可读、写失败抛 `PersistenceError` |
 | `test_api.py`（+4 条） | 一次执行的完整链条（记录 + 事件）、被拒也留痕且 `REFUSED`、并发手工动作各自成记录、设备忙落定 `FAILED` |
-| `test_api_auth.py`（+3 条） | 执行记录带调用方身份、`/executions` 需鉴权且未知 id 一律 404、**并发确认只有一个成功** |
+| `test_api_auth.py`（+6 条） | 执行记录带调用方身份、`/executions` 需鉴权且未知 id 一律 404、**并发确认只有一个成功**、**确认中途失败三者一起回滚**、成功三者一起落下、票据表与 tasks/events 同库 |
 | `test_api_authz.py`（+1 条） | 执行记录也受设备范围约束 |
-| `test_event_log.py`（净 +1 条） | 序号每任务连续、两个写者不丢不重、重启后仍可读且连接确为 `synchronous=FULL`、按 `execution_id` 查、旧 JSONL 导入保留原时间戳、坏 payload 不影响读 |
+| `test_database.py`（9 条） | 持久化 PRAGMA 真的生效、迁移版本可查、事务回滚一切/提交一切、**事务可重入**、共享库、两种旧目录传法、坏行隔离、写失败可见 |
+| `test_task_store.py` / `test_checkpoint_store.py` / `test_event_log.py` | 旧 JSON/JSONL 迁移保留 revision 与时间戳、坏文件迁移后仍隔离、序号连续、两写者不丢不重、重启可读 |
 
 ---
 
@@ -1686,7 +1702,7 @@ pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 
-**654 个用例，全部离线**：不需要 adb、模拟器或 API Key。
+**669 个用例，全部离线**：不需要 adb、模拟器或 API Key。
 
 | 文件 | 覆盖 |
 |---|---|
