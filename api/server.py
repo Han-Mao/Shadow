@@ -6,9 +6,11 @@
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import time
+import uuid
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 
@@ -39,15 +41,23 @@ from device.factory import (
 )
 from device.pool import DevicePool, UnknownDeviceError, storage_hint
 from device.session import DeviceSession
-from models.action import Action, ActionRisk, ActionType, Point
+from models.action import Action, ActionEffectStatus, ActionRisk, ActionType, Point
 from models.budget import TaskBudget
 from models.exceptions import PersistenceError
+from models.execution import (
+    ActionExecution,
+    EXECUTION_FAILED,
+    EXECUTION_REFUSED,
+    EXECUTION_SUCCEEDED,
+    EXECUTION_UNVERIFIED,
+)
 from models.state import Observation
 from models.task import RECOVERY_ERROR, TaskPriority, TaskStatus
 from storage import (
     CheckpointStore,
     ConfirmationConsumptionStore,
     EventLog,
+    ExecutionStore,
     TaskStore,
     TrajectoryStore,
 )
@@ -148,6 +158,9 @@ logger.info("设备后端：%s", describe_backend(resolve_device_serial()))
 # V2.4 起它还要接一件更早的事——TaskStore 发现损坏任务时在这里留一条 TASK_CORRUPTED，
 # 所以必须先于 task_store 构造。
 event_log = EventLog(STORAGE_DIR / "events")
+# 执行记录（V4 §一）：手工端点每次调用一条，`execution_id` 同时是它的事件流所有者。
+# 与事件日志分开存——事件记「过程」，执行记录记「身份与结果」，两者按 id 关联。
+execution_store = ExecutionStore(STORAGE_DIR / "executions")
 # 损坏任务的隔离与留痕都挂在同一个日志上（V2.4 §十）
 task_store = TaskStore(STORAGE_DIR / "tasks", event_log=event_log)
 checkpoint_store = CheckpointStore(STORAGE_DIR / "checkpoints")
@@ -639,7 +652,16 @@ def device_access(session_item, *, timeout: float = 0.0, operation: str | None =
 #           见 README「V3.2 修复轮」里的延期说明与触发条件。
 
 MANUAL_ACTION_TASK_ID = _MANUAL_OWNER
-"""手工动作的事件流记在这个 id 下（V3.2 §五）。
+"""**已废弃：不要再用它当执行归属**（V4 §一）。
+
+V3.2 起手工动作的事件流记在这个固定 id 下。好处是「有记录」，代价是所有请求的记录
+混在同一条流里：两个同时进来的 `/tap` 与 `/text` 事后只能靠逐条字段去拼。
+现在改用每次调用独立的 `ActionExecution.execution_id`，这个常量只为兼容旧引用而保留。
+
+（注意 `_MANUAL_OWNER` 本身仍是**设备锁**的 owner——那是「手工路径整体占用设备」的
+身份，不随请求变化，两者是不同的东西，别一起改掉。）
+
+原说明：手工动作的事件流记在这个 id 下（V3.2 §五）。
 
 它们不属于任何 Task，但「谁在什么时候点了哪、判成什么风险、验证结果如何」同样是
 必须可追溯的事实——否则 `/history` 与 `/replay` 里的设备操作历史是残缺的。
@@ -656,6 +678,8 @@ class ManualActionOutcome:
     pre: Observation
     post: Observation
     verdict: Verification
+    execution: ActionExecution
+    """这次执行的身份与落定状态（V4 §一）：`execution_id` 在动作发出前就已落盘。"""
 
 
 def _dangerous_refusal(assessment: RiskAssessment) -> str:
@@ -666,11 +690,31 @@ def _dangerous_refusal(assessment: RiskAssessment) -> str:
     )
 
 
+@contextlib.contextmanager
+def _execution_guard(execution: ActionExecution, settle):
+    """异常路径统一补记执行记录（V4 §一）。
+
+    为什么需要它：`device_access` 在设备被占用时直接 409、`observer.observe` 也可能抛
+    `DeviceUnavailableError`——如果没有这层，那条执行记录会**永远停在 RUNNING**，
+    于是 `/executions` 里出现「看起来还在执行、其实早就失败了」的幽灵记录。
+
+    门禁拒绝不走这里：它自己先 `settle(REFUSED, ...)`，被 `is_finished` 挡掉，
+    不会被这层覆盖成 FAILED（「被拒绝」和「执行失败」是两种事实，不能混）。
+    """
+    try:
+        yield
+    except Exception as exc:  # noqa: BLE001 - 一律补记后原样抛出
+        if not execution.is_finished:
+            settle(EXECUTION_FAILED, note=f"未完成：{type(exc).__name__}")
+        raise
+
+
 def run_manual_action(
     action: Action,
     session_item,
     *,
     operation: str | None = None,
+    request: Request | None = None,
 ) -> ManualActionOutcome:
     """手工端点**唯一**的执行内核（V3.2 §一）。
 
@@ -681,11 +725,51 @@ def run_manual_action(
     controller = session_item.controller
     artifact_dir = _artifact_dir_for(session_item)
 
-    with device_access(session_item, operation=operation) as device:
+    # ---- V4 §一：先落一条执行记录，再做任何事 ----
+    #
+    # 顺序刻意的：记录先落盘，动作才有可能发出。反过来（先做后记）就是那种
+    # 「手机真的点了付款、但查不到是谁点的」的状态。
+    execution = ActionExecution(
+        principal=current_principal(request).name if request is not None else "",
+        device_id=session_item.serial,
+        action={
+            "type": action.type.value,
+            "target": str(action.target or ""),
+            "value": action.value,
+        },
+        request_id=_request_id(request),
+    )
+    _save_execution_or_refuse(execution)
+
+    def settle(status: str, *, result: dict | None = None, note: str = "", risk: str = "") -> None:
+        """落定这次执行（内存对象与磁盘一次改完）。
+
+        落定失败**不改这次调用的结果**：动作已经做完（或没做），把一次成功的点击
+        报成 503 是更严重的失真。记录会停在 RUNNING——`GET /executions` 里看得见，
+        这比悄悄丢掉它好。
+        """
+        execution.finish(status, result=result, note=note, risk=risk)
+        try:
+            execution_store.finish(
+                execution.execution_id, status, result=result, note=note, risk=risk
+            )
+        except PersistenceError as exc:
+            logger.warning(
+                "执行记录落定失败（%s → %s）：%s", execution.execution_id, status, exc
+            )
+
+    with _execution_guard(execution, settle), device_access(
+        session_item, operation=operation
+    ) as device:
         # 第一轮：不带上下文。零成本，而且**不碰设备**——设备不可用时该给 403，
         # 而不是先观察失败、再给一个把责任推给设备的误导性 502。
         assessment = ActionRiskGate.assess(action)
         if assessment.requires_confirmation:
+            settle(
+                EXECUTION_REFUSED,
+                risk=assessment.effective.value,
+                note=assessment.describe(),
+            )
             raise HTTPException(status_code=403, detail=_dangerous_refusal(assessment))
 
         pre = observer.observe(controller, artifact_dir, step=0)
@@ -697,6 +781,11 @@ def run_manual_action(
             context=RiskContext.from_observation(pre, instruction=MANUAL_ACTION_TASK_ID),
         )
         if assessment.requires_confirmation:
+            settle(
+                EXECUTION_REFUSED,
+                risk=assessment.effective.value,
+                note=assessment.describe(),
+            )
             raise HTTPException(status_code=403, detail=_dangerous_refusal(assessment))
 
         # 设备侧事实必须落盘（V3.2 §五）。这两条都是安全关键事件（会 fail-closed），
@@ -704,9 +793,12 @@ def run_manual_action(
         # 但审计里查不到是谁点的」。手工路径以前一条事件都不留。
         try:
             event_log.emit(
-                MANUAL_ACTION_TASK_ID,
+                execution.execution_id,
                 RISK_ASSESSED,
                 channel="manual",
+                execution_id=execution.execution_id,
+                principal=execution.principal,
+                request_id=execution.request_id,
                 action=action.type.value,
                 effective=assessment.effective.value,
                 policy=assessment.policy.value,
@@ -718,9 +810,12 @@ def run_manual_action(
                 device=session_item.serial,
             )
             event_log.emit(
-                MANUAL_ACTION_TASK_ID,
+                execution.execution_id,
                 ACTION_DISPATCHED,
                 channel="manual",
+                execution_id=execution.execution_id,
+                principal=execution.principal,
+                request_id=execution.request_id,
                 action=action.type.value,
                 risk=assessment.effective.value,
                 fingerprint=action.fingerprint,
@@ -729,6 +824,7 @@ def run_manual_action(
                 device=session_item.serial,
             )
         except PersistenceError as exc:
+            settle(EXECUTION_FAILED, note=f"事件落盘失败，未执行：{exc.reason}")
             raise HTTPException(
                 status_code=503,
                 detail=f"设备操作记录无法落盘，已拒绝执行：{exc.reason}",
@@ -742,14 +838,15 @@ def run_manual_action(
         )
         post.action = action
         post.result = result
-        verdict = verifier.verify_action(MANUAL_ACTION_TASK_ID, pre, action, post, result)
+        verdict = verifier.verify_action(execution.execution_id, pre, action, post, result)
         post.status = verdict.outcome
         post.message = verdict.message
 
         event_log.emit(
-            MANUAL_ACTION_TASK_ID,
+            execution.execution_id,
             ACTION_VERIFIED,
             channel="manual",
+            execution_id=execution.execution_id,
             outcome=verdict.outcome.value,
             dispatch=verdict.dispatch.status.value,
             effect=verdict.effect.status.value,
@@ -758,6 +855,18 @@ def run_manual_action(
             device=session_item.serial,
         )
 
+        # 落定状态（V4 §一）。三档而不是两档：
+        #   FAILED     —— 设备层就没成（参数错、被设备拒绝……）
+        #   SUCCEEDED  —— 验证层确认生效
+        #   UNVERIFIED —— 发出去了但效果没被确认（含 dispatched / navigated / ui_changed）
+        # 中间那一档是审核最关心的「已经点了但不知道成没成」——它绝不能被记成成功。
+        if not result.get("ok"):
+            settle(EXECUTION_FAILED, result=result, note=verdict.message)
+        elif verdict.effect.status is ActionEffectStatus.VERIFIED_SUCCESS:
+            settle(EXECUTION_SUCCEEDED, result=result, note=verdict.message)
+        else:
+            settle(EXECUTION_UNVERIFIED, result=result, note=verdict.message)
+
     return ManualActionOutcome(
         action=action,
         assessment=assessment,
@@ -765,7 +874,36 @@ def run_manual_action(
         pre=pre,
         post=post,
         verdict=verdict,
+        execution=execution,
     )
+
+
+def _request_id(request: Request | None) -> str:
+    """这次 HTTP 请求的 id：优先用调用方给的 `X-Request-Id`，没有就生成一个。
+
+    为什么值得带上它：一次操作要能被**串起来**——审计日志（HTTP 层）、执行记录（动作层）、
+    事件流（过程）三者用同一个 request_id / execution_id 就能对上。调用方自带
+    `X-Request-Id` 时，还能把「上游一次操作触发的多个动作」串进同一条链。
+    """
+    if request is None:
+        return ""
+    header = (request.headers.get("x-request-id") or "").strip()
+    return header or f"req_{uuid.uuid4().hex[:12]}"
+
+
+def _save_execution_or_refuse(execution: ActionExecution) -> None:
+    """执行记录落盘；写不进去就**拒绝执行**（V4 §一）。
+
+    与安全关键事件同一个口径：这条记录是「手机被操作过」的唯一凭据。
+    写不进去还继续执行，就会造出「真的点了、但查不到是谁点的」。
+    """
+    try:
+        execution_store.save(execution)
+    except PersistenceError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"执行记录无法落盘，已拒绝执行：{exc.reason}",
+        ) from exc
 
 
 def _manual_ok_payload(outcome: ManualActionOutcome, session_item, extra: dict | None = None) -> dict:
@@ -780,6 +918,10 @@ def _manual_ok_payload(outcome: ManualActionOutcome, session_item, extra: dict |
         "risk": outcome.assessment.effective.value,
         "risk_detail": outcome.assessment.describe(),
         "verification": outcome.verdict.model_dump(),
+        # V4 §一/§五：这次执行的身份。拿它去 `GET /executions/{id}` 能取回
+        # 「谁 → 什么时候 → 哪台手机 → 什么动作 → 什么风险 → 结果如何」整条链。
+        "execution_id": outcome.execution.execution_id,
+        "execution_status": outcome.execution.status,
     }
     payload.update(extra or {})
     return payload
@@ -789,7 +931,12 @@ def _manual_failure_response(outcome: ManualActionOutcome) -> JSONResponse:
     """执行失败 → 502，形状与升级前 `AdbError` 的处理器一致。"""
     return JSONResponse(
         status_code=502,
-        content={"ok": False, "error": outcome.result.get("error", "设备操作失败")},
+        content={
+            "ok": False,
+            "error": outcome.result.get("error", "设备操作失败"),
+            "execution_id": outcome.execution.execution_id,
+            "execution_status": outcome.execution.status,
+        },
     )
 
 
@@ -806,6 +953,7 @@ def tap(req: TapRequest, request: Request, device_serial: str | None = None):
         Action(type=ActionType.TAP, target=Point(x=req.x, y=req.y)),
         session_item,
         operation="tap",
+        request=request,
     )
     if not outcome.result.get("ok"):
         return _manual_failure_response(outcome)
@@ -824,6 +972,7 @@ def text(req: TextRequest, request: Request, device_serial: str | None = None):
         Action(type=ActionType.TYPE, value=req.value),
         session_item,
         operation="type_text",
+        request=request,
     )
     if not outcome.result.get("ok"):
         return _manual_failure_response(outcome)
@@ -841,7 +990,12 @@ def text(req: TextRequest, request: Request, device_serial: str | None = None):
 def back(request: Request, device_serial: str | None = None):
     """单步返回。走统一内核（V3.2 §一）。"""
     session_item = resolve_manual_device(device_serial, request)
-    outcome = run_manual_action(Action(type=ActionType.BACK), session_item, operation="back")
+    outcome = run_manual_action(
+        Action(type=ActionType.BACK),
+        session_item,
+        operation="back",
+        request=request,
+    )
     if not outcome.result.get("ok"):
         return _manual_failure_response(outcome)
     return _manual_ok_payload(outcome, session_item)
@@ -944,7 +1098,7 @@ def execute_action(req: ActionRequest, request: Request, device_serial: str | No
     # 动态分发（wait / done 这类无设备副作用的 action 也会进来）→ 不传 operation，
     # 走保守加锁。is_read_only 的结构化校验只对操作名确定的端点
     # （/tap、/text、/back）生效。
-    outcome = run_manual_action(action, session_item)
+    outcome = run_manual_action(action, session_item, request=request)
 
     payload = outcome.post.model_dump(exclude={"ui_tree"})
     payload["verification"] = outcome.verdict.model_dump()
@@ -953,7 +1107,52 @@ def execute_action(req: ActionRequest, request: Request, device_serial: str | No
     payload["device"] = session_item.serial
     payload["generation"] = session_item.generation
     payload["generation_meaning"] = GENERATION_MEANING
+    payload["execution_id"] = outcome.execution.execution_id
+    payload["execution_status"] = outcome.execution.status
     return payload
+
+
+@app.get("/executions")
+def list_executions(request: Request, limit: int = 50):
+    """最近的执行记录，新的在前（V4 §一/§五）。
+
+    手工端点每次调用都有一条——**被拒绝的也有一条**（`REFUSED`），
+    因为「谁想点付款、被判成危险、被拒」正是要能回答的问题。
+
+    设备范围会裁剪：受限令牌只能看到自己被授权设备上的执行（与 `/tasks` 同口径）。
+    """
+    principal = current_principal(request)
+    window = max(1, min(limit, 200))
+    records = [
+        record
+        for record in execution_store.recent(limit=window)
+        if principal.may_use_device(record.device_id)
+    ]
+    return {"ok": True, "executions": [record.to_dict() for record in records]}
+
+
+@app.get("/executions/{execution_id}")
+def get_execution(execution_id: str, request: Request):
+    """一次执行的完整链条：身份与结果 + 它的事件流（V4 §五）。
+
+    审核要的那条链——**谁 → 什么时候 → 哪台手机 → 执行了什么 → 什么风险 → 为什么允许 →
+    结果如何**——由三份事实拼成：
+
+    - 执行记录（`ExecutionStore`）：身份、风险、结果；
+    - 事件流（`EventLog`，按 `execution_id` 存）：过程中每一步的判定与留痕；
+    - 审计日志（HTTP 层，按 `request_id` 关联）：谁调了哪个接口、被拒的请求也留痕。
+
+    设备范围外的执行统一 404——与损坏任务同口径，不泄露存在性。
+    """
+    principal = current_principal(request)
+    record = execution_store.load(execution_id)
+    if record is None or not principal.may_use_device(record.device_id):
+        raise HTTPException(status_code=404, detail="执行记录不存在")
+    return {
+        "ok": True,
+        "execution": record.to_dict(),
+        "events": [event.to_dict() for event in event_log.read(execution_id, limit=200)],
+    }
 
 
 # ---- 任务端点 ----
