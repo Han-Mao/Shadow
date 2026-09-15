@@ -44,6 +44,7 @@ class MainActivity : Activity() {
 
     private lateinit var accessibilityState: TextView
     private lateinit var projectionState: TextView
+    private lateinit var readinessState: TextView
     private lateinit var endpointState: TextView
     private lateinit var endpointAddress: TextView
     private lateinit var endpointUsage: TextView
@@ -55,6 +56,7 @@ class MainActivity : Activity() {
 
         accessibilityState = findViewById(R.id.accessibility_state)
         projectionState = findViewById(R.id.projection_state)
+        readinessState = findViewById(R.id.readiness_state)
         endpointState = findViewById(R.id.endpoint_state)
         endpointAddress = findViewById(R.id.endpoint_address)
         endpointUsage = findViewById(R.id.endpoint_usage)
@@ -153,7 +155,35 @@ class MainActivity : Activity() {
 
     // ---- 界面刷新 ----
 
+    /**
+     * 一站式结论（v4.2 §三 P1 的 SetupWizard）。
+     *
+     * 逐项状态是给排查用的，这一行是给「能不能开始用」用的——两者都要有：
+     * 演示时最怕的是对着两行「未开启 / 已就绪」自己判断，还判断错。
+     *
+     * 查**三项**，刻意**不查悬浮窗**（审核的建议里列了 Overlay）：
+     * 这个应用从不申请 `SYSTEM_ALERT_WINDOW`——设备层只走 AccessibilityService 与
+     * MediaProjection（见 `AndroidManifest.xml` 顶部那段「刻意不申请的权限」）。
+     * 列一项自己根本不需要的权限，只会让用户去开一个对本应用毫无作用的东西。
+     *
+     * 「Core 连得上吗」在这里**无法自检**：连接是 Core 主动发起的（手机只是监听）。
+     * 能自检的是「端点有没有在监听」——端口被占等原因由
+     * `DeviceEndpointService.server?.lastError` 带出来（见 `refresh` 末尾）。
+     */
+    private fun readinessText(): String {
+        val missing = buildList {
+            if (!ShadowAccessibilityService.isConnected()) add(getString(R.string.label_accessibility_state))
+            if (!ScreenCapture.isReady()) add(getString(R.string.label_projection_state))
+        }
+        return when {
+            missing.isNotEmpty() -> getString(R.string.state_missing_permissions, missing.joinToString("、"))
+            !DeviceEndpointService.isRunning -> getString(R.string.state_ready_endpoint_stopped)
+            else -> getString(R.string.state_all_ready)
+        }
+    }
+
     private fun refresh() {
+        readinessState.text = readinessText()
         accessibilityState.text = getString(R.string.label_accessibility_state) + "：" +
             if (ShadowAccessibilityService.isConnected()) getString(R.string.state_ready) else getString(R.string.state_missing)
         projectionState.text = getString(R.string.label_projection_state) + "：" +

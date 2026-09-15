@@ -9,6 +9,10 @@
     <string name="title_activity_main">Shadow</string>
 
     <string name="section_permissions">权限</string>
+    <string name="label_readiness">就绪状态</string>
+    <string name="state_all_ready">就绪：权限齐、端点在跑，Core 现在可以连过来</string>
+    <string name="state_missing_permissions">还不能工作：缺 %1$s</string>
+    <string name="state_ready_endpoint_stopped">权限已就绪，但端点没启动（点下面的按钮）</string>
     <string name="label_accessibility_state">辅助功能服务</string>
     <string name="label_projection_state">屏幕捕获（投屏授权）</string>
     <string name="label_endpoint_state">设备端点</string>

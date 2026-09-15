@@ -15,9 +15,36 @@
         android:orientation="vertical"
         android:padding="20dp">
 
+        <!--
+          一站式结论（v4.2 §三 P1 的 SetupWizard）：把「能不能用了」压成一行。
+          下面那些逐项状态是给排查用的，演示现场需要的是抬头就能读出结论——
+          「还不能工作：缺 辅助功能服务、屏幕捕获」比两行「未开启」有用得多。
+        -->
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
+            android:text="@string/label_readiness"
+            android:textSize="18sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/readiness_state"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:textSize="16sp"
+            android:textStyle="bold" />
+
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:layout_marginTop="20dp"
+            android:background="#33FFFFFF" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="20dp"
             android:text="@string/section_permissions"
             android:textSize="18sp"
             android:textStyle="bold" />
