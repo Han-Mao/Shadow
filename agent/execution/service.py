@@ -234,31 +234,80 @@ class ExecutionService:
         note: str = "",
         risk: str = "",
     ) -> bool:
-        """落定为终态。返回 `False` 表示**守卫落空**（记录不存在 / 已被并发落定）。
+        """落定为终态。返回 `True` 表示**你要的那个状态**落上了。
 
-        两种「没落成」的处理刻意不同，别把它们混成一种：
+        三种「没落成」，返回值的含义只有一个：你要的那个状态没落上。
 
-        - **守卫落空**（合法但输了竞争）→ 返回 `False`。这是预期内的，
-          调用方重读一次再决定即可。
+        - **守卫落空**（合法但输了竞争）→ `False`。预期内的，调用方重读一次再决定。
         - **已经是终态再落定** → 抛 `InvalidExecutionTransition`（调用方写错了）。
           `settle(UNKNOWN → FAILED)` 正是 §七 要防的那种「顺手补记」，
           静默返回 `False` 会让它看起来像一次无害的失败调用。终态是事实，事实不改写。
+        - **写不进去**（SQLite 报错）→ 先按真实状态重试一次，再退到状态机规定的那个
+          终态（见 `_settle_degraded`）。这种情况返回 `False`：你请求的状态确实没落上，
+          但**记录不会停在「还在飞」**。
 
         注意与 `ExecutionStore.finish()` 的分工：那一层是**宽松**的（告警 + 返回现状），
         它保护的是「事实不被覆盖」；这一层是**严格**的，它执行的是状态机。
         宽松的那层留给旧调用点，新代码走这里。
 
         **没落成不代表动作没发生**——调用方要照旧把这次调用的真实结果返回给使用者。
-        `PersistenceError` 仍然抛出去，让上层能区分「动作失败」与「记录失败」。
         """
-        return self._advance(
-            execution,
-            expect=set(NON_TERMINAL_EXECUTION_STATUSES),
-            to=status,
-            result=result,
-            note=note,
-            risk=risk,
+        try:
+            return self._advance(
+                execution,
+                expect=set(NON_TERMINAL_EXECUTION_STATUSES),
+                to=status,
+                result=result,
+                note=note,
+                risk=risk,
+            )
+        except PersistenceError as exc:
+            return self._settle_degraded(execution, status, note=note, cause=exc)
+
+    def _settle_degraded(
+        self, execution: ActionExecution, status: str, *, note: str, cause: PersistenceError
+    ) -> bool:
+        """落定写不进去时的降级（v4.1 §十 测试2）。
+
+        设备调用**已经结束**了（成功或失败都结束了，那是它自己的事实），所以
+        「记录停在 `RUNNING`」是三个选项里**最不真**的那个：它会让
+        `GET /executions` 显示一条看起来还在飞的幽灵，而启动恢复之后又会把它收成
+        `UNKNOWN`——同一个动作在两次读取里长得不一样。
+
+        做法是两次尝试：
+
+        1. 按**真实状态**重试一次。写入失败常常是一次性故障（`database is locked`、
+           一次瞬时 IO 错误），重试就能把真实结论留下——那比 `UNKNOWN` 信息量大得多。
+        2. 还不行就退到 `state.recovery_target(execution.status)`：`RUNNING → UNKNOWN`，
+           「没碰过设备」的那些 → `FAILED`。这不是「更保守」，而是**当时最贴近事实的
+           那个**：我们确实没能把结论写下来，而「结果没记下来」本身就是这条记录要表达的
+           内容。
+
+        两次都失败（数据库真的写不动了）就把原始异常抛出去——记录停在非终态，
+        下次启动的恢复扫描会接管它。降级尝试**不带 `result`**：它的任务是「留下一个
+        终态而不是幽灵」，为此再赌一次同样的 payload 不值得；原因写在 `note` 里。
+        """
+        fallback = state.recovery_target(execution.status)
+        if fallback is None or fallback == status:
+            raise cause
+        logger.warning(
+            "执行 %s 落定 %s 失败（%s），尝试降级为 %s",
+            execution.execution_id,
+            status,
+            cause.reason,
+            fallback,
         )
+        try:
+            self._advance(
+                execution,
+                expect=set(NON_TERMINAL_EXECUTION_STATUSES),
+                to=fallback,
+                # 不带 result：见上。note 必须说清「为什么不是真实结论」。
+                note=f"{note}（落定 {status} 写盘失败，降级为 {fallback}：{cause.reason}）",
+            )
+        except PersistenceError:
+            raise cause from None
+        return False
 
     # ---- 启动恢复（v4.1 §六） ----
 
