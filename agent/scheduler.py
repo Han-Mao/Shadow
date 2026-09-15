@@ -160,6 +160,9 @@ class TaskScheduler:
         # 出现 [A, A, A] 这种假数据，而且会无限增长。deque 限长 + `_mark_completed`
         # 去重，两者都要。
         self._completed: deque[str] = deque(maxlen=200)
+        # V4 §8：终态任务的**对象**留档（等 `wait_terminal` 返回它）。deque 只存 id、
+        # 会丢对象；这里存一份终态对象，同样限长避免无限增长。
+        self._terminal: dict[str, Task] = {}
         self._counter = itertools.count()
         self._stopping = False
 
@@ -580,6 +583,39 @@ class TaskScheduler:
         with self._cond:
             return self._find_locked(task_id)
 
+    def wait_terminal(self, task_id: str, timeout: float) -> Task | None:
+        """**事件驱动地**等一个任务到终态（V4 §8）。
+
+        取代 `time.sleep` 轮询：`/wait` 以前每 100ms 起来查一次，绝大多数查询都空手而归。
+        现在用 `_cond.wait` 阻塞——任务到终态（`_mark_completed` 之后）worker 会
+        `notify_all`，等待者被唤醒时**先查一遍**，还没到就继续等，直到超时。
+
+        返回终态任务；超时返回 None（调用方据此回 504）。
+
+        **为什么还是要查而不是只靠通知**（与 `freshest` 的分工）：
+        - `_cond` 是**进程内**的，只能收到本进程 worker 的通知；
+        - 多进程部署（TaskLease）下任务可能被**别的进程**推进，本进程收不到通知，
+          所以 `wait` 里带着一个「兜底重查」——超时参数同时是「多久回查一次磁盘」
+          的节拍。进程内用事件、跨进程用 `freshest`，两条腿都在（V3.3 §四）。
+        """
+        deadline = time.monotonic() + timeout
+        with self._cond:
+            while True:
+                task = self._find_locked(task_id)
+                if task is not None and task.is_terminal:
+                    return task
+                # 终态任务已从 lane 移出（_execute 的 finally 清 running），
+                # 但要等它终态的等待者得能拿到「那个已经结束的对象」——查终态留档
+                finished = self._terminal.get(task_id)
+                if finished is not None and finished.is_terminal:
+                    return finished
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                # 兜底重查间隔取 `remaining` 与一个上界的小者：进程内通知会提前打断
+                # 这次 wait；跨进程（收不到通知）时最多每 0.5s 起来重查一次磁盘。
+                self._cond.wait(timeout=min(remaining, 0.5))
+
     # ---- 内部：定位与分派 ----
 
     def _find_locked(self, task_id: str) -> Task | None:
@@ -749,11 +785,23 @@ class TaskScheduler:
         # 的旧对象，将来设备恢复时会被当成「待恢复任务」捞出来，容器本身就脏了。
         self._device_unavailable.pop(task_id, None)
 
-    def _mark_completed(self, task_id: str) -> None:
-        """把任务记进「最近结束」列表（去重，V2.5 §十）。调用方需持有 `self._cond`。"""
-        if task_id in self._completed:
-            return
-        self._completed.append(task_id)
+    def _mark_completed(self, task_id: str, task: Task | None = None) -> None:
+        """把任务记进「最近结束」列表（去重，V2.5 §十）。调用方需持有 `self._cond`。
+
+        `task` 可选：给了就把**终态对象**也留一份（`_terminal`，V4 §8）。终态任务会从
+        lane 里移出（`_execute` 的 finally 清 `lane.running`），所以「等它终态」的
+        等待者不能再靠 `_find_locked` 找到它；留下终态对象，`wait_terminal` 才能返回
+        「那个已经结束的任务」而不是返回 None 让调用方再去查磁盘。
+        """
+        if task_id not in self._completed:
+            self._completed.append(task_id)
+        if task is not None:
+            self._terminal[task_id] = task
+            # 与 `_completed` 的 deque 限长对齐：终态对象只留最近 200 条，
+            # 更早的被等待者早该走了（它们要么已返回、要么已超时）。
+            if len(self._terminal) > 200:
+                oldest = next(iter(self._terminal))
+                del self._terminal[oldest]
 
     def on_device_available(self, serial: str) -> list[str]:
         """设备重新可用：把它名下等待的任务放回对应车道（V2.5 §八）。
@@ -988,9 +1036,11 @@ class TaskScheduler:
                 task.status.value,
                 name,
             )
-            with self._cond:
-                self._mark_completed(task.id)
+            # 先落盘、再通知（与下面终态分支同一条纪律，V4 §8）
             self._persist_or_degrade(task)
+            with self._cond:
+                self._mark_completed(task.id, task)
+                self._cond.notify_all()
             return
 
         if name == "done":
@@ -1012,9 +1062,14 @@ class TaskScheduler:
             task.apply_event(TaskEvent.FAILED, source="scheduler")
 
         if task.is_terminal:
+            # V4 §8：**先落盘、再通知**。`/wait` 的事件驱动等待者会在被唤醒后立刻
+            # 查 `freshest`（磁盘）——若落盘晚于 notify，等待者会看到「还在跑」而空转。
+            # 与 submit / resume / recover 的「先落盘、再 notify_all」是同一条纪律
+            # （V2.7 P1-6）。
+            self._persist_or_degrade(task)
             with self._cond:
-                self._mark_completed(task.id)
-        self._persist_or_degrade(task)
+                self._mark_completed(task.id, task)
+                self._cond.notify_all()
 
     def _record_preemption_latency(self, task_id: str) -> None:
         """结算一次抢占的真实延迟：从「请求让出」到「真的挂起」（V2.1 §十四）。"""

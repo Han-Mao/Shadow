@@ -1170,22 +1170,31 @@ def get_execution(execution_id: str, request: Request):
 def _wait_for(task_id: str, timeout: float) -> dict:
     """`wait=true` 时的同步等待。
 
-    用 `time.sleep` 轮询而不是事件通知：任务可能被另一个进程的 worker 推进
-    （TaskLease 允许多进程部署），进程内的 Event 收不到那种进度。
+    V4 §8：从「`time.sleep` 轮询」改成**事件驱动**——进程内用调度器的条件变量阻塞，
+    任务到终态时 worker `notify_all`，等待者被唤醒，不再每 100ms 空转一次。
 
-    V3.3 §四：查的必须是**最新事实**（`manager.freshest`）而不是 `manager.get`。
-    `get()` 优先返回本进程内存里的对象，而多进程下磁盘可能更新——「Worker B 完成并
-    落盘、Worker A 内存还停在 RUNNING」时，用 `get()` 会一直等到 504，
-    明明任务早就完成了。`freshest` 按 `revision` 取较新的那份，两个方向都成立。
+    **跨进程仍然要兜底**（与 V3.3 §四 同一件事）：任务可能被另一个进程的 worker 推进，
+    进程内的条件变量收不到那种进度。所以这里在「进程内事件等待」之外，保留一个
+    较慢的「回查磁盘」节拍——`scheduler.wait_terminal` 返回 None（超时或进程内没找到）
+    时，用 `manager.freshest` 再确认一次；只要磁盘已经终态就返回，不空等到超时。
+
+    两条腿的分工：进程内靠事件（快、省 CPU）、跨进程靠 `freshest`（正确、可兜底）。
     """
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
+    while True:
+        # 事件驱动：进程内等通知（最省事的那条腿）
+        terminal = scheduler.wait_terminal(task_id, timeout=min(0.5, max(0.01, deadline - time.monotonic())))
+        if terminal is not None:
+            return terminal.model_dump(mode="json")
+
+        # 跨进程兜底：查最新事实（V3.3 §四）
         task = manager.freshest(task_id)
         if task is None:
             raise HTTPException(status_code=404, detail="任务不存在")
         if task.is_terminal:
             return task.model_dump(mode="json")
-        time.sleep(0.1)
+        if time.monotonic() >= deadline:
+            break
 
     raise HTTPException(
         status_code=504,
