@@ -47,6 +47,29 @@ class PersistenceError(ShadowError):
         super().__init__(f"任务 {task_id} 持久化失败：{reason}")
 
 
+class InvalidExecutionTransition(ShadowError):
+    """一条**执行**（`ActionExecution`）的状态迁移被状态机拒绝（v4.1 §五）。
+
+    与 `InvalidTransitionError`（任务状态机）刻意分开，理由不是洁癖：
+    两者的状态集、守卫与「谁有资格迁移」完全不同，混成一个类型之后，
+    「日志里看到 InvalidTransitionError」不再能说明出问题的是一条任务还是一次动作。
+
+    它表示的是**调用方写错了**（例如想从 `SUCCEEDED` 回到 `RUNNING`），
+    而不是并发竞争——并发导致的守卫落空由 `ExecutionStore.transition()` 返回 `None`
+    表达（那是预期内的、可以重读一次再决定的情形）。所以 `error_class = fatal`。
+    """
+
+    error_class = "fatal"
+
+    def __init__(self, execution_id: str, from_status: str, to_status: str) -> None:
+        self.execution_id = execution_id
+        self.from_status = from_status
+        self.to_status = to_status
+        super().__init__(
+            f"执行 {execution_id} 不允许从 {from_status} 迁移到 {to_status}"
+        )
+
+
 class DeviceUnavailableError(ShadowError):
     """任务绑定的设备当前不在池中。"""
 

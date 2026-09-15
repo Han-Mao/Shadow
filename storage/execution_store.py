@@ -170,6 +170,15 @@ class ExecutionStore:
 
     # ---- 写 ----
 
+    def transaction(self):
+        """一个跨「执行记录 + 事件」的事务（v4.1 §四/§九）。
+
+        `ExecutionService` 用它把「状态迁移」与「它的事件」绑在一起：事件写失败时
+        状态也回滚到迁移前那一格——于是「读状态」就足以判断事件有没有留下。
+        可重入由 `Database.transaction()` 保证（内层加入外层）。
+        """
+        return self._db.transaction()
+
     def create(self, execution: ActionExecution) -> ActionExecution:
         """**准备**阶段：插入一条新执行记录（v4.1 §三/§四）。
 
