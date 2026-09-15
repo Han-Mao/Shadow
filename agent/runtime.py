@@ -27,7 +27,7 @@ from models.retry import (
     classify_result,
 )
 from models.state import Observation, StepOutcome
-from models.task import TERMINAL_STATUSES, Task, TaskEvent, TaskStatus
+from models.task import TERMINAL_STATUSES, Task, TaskStatus
 from models.task_step import StepStatus, TaskStep
 from models.verification import ActionDispatch, ActionEffect, DispatchStatus, GoalVerification
 from storage.event_log import (
@@ -45,7 +45,6 @@ from storage.event_log import (
     RISK_ASSESSED,
     STARTED,
     SUSPENDED,
-    WAITING,
     EventLog,
 )
 
@@ -76,6 +75,7 @@ from ._confirm import ConfirmationMixin
 from ._execution import ExecutionMixin
 from ._goal import GoalControllerMixin
 from ._reconcile import ReconcilerMixin
+from ._recovery import RecoveryMixin
 from ._runtime_types import ApprovalGrant, RunOutcome, RuntimeState
 
 
@@ -85,6 +85,7 @@ class AgentRuntime(
     ConfirmationMixin,
     GoalControllerMixin,
     ReconcilerMixin,
+    RecoveryMixin,
 ):
     def __init__(
         self,
@@ -113,9 +114,9 @@ class AgentRuntime(
         self._states: dict[str, RuntimeState] = {}
         # 多设备 = 多个 worker 线程并发调用 runtime，运行时状态必须加锁
         self._states_lock = threading.RLock()
-        # 崩溃恢复门禁待处理的原因（V2.6 §七）：task_id -> 为什么必须人工确认。
-        # 它既不是「某个危险动作」也不是「完成裁定」，所以单独放一个容器。
-        self._recovery_notes: dict[str, str] = {}
+        # 崩溃恢复的备注容器（V2.6 §七）。职责与实现都在 `_recovery.py`
+        # ——那是唯一一条会把任务交给人的路，单独一个文件讲清楚。
+        self._init_recovery()
 
 
     def _session_for(self, task: Task) -> DeviceSession:
@@ -144,61 +145,6 @@ class AgentRuntime(
         return self._default_session
 
     # ---- 对外 ----
-
-
-    @staticmethod
-    def _sync_durable_state(task: Task, state: RuntimeState) -> None:
-        """把该跨重启存活的运行时状态同步到 Task 上（V2.7 P0-1）。
-
-        「哪些运行时状态必须落盘」是有判断的，不是越多越好：
-
-        - **`denied_fingerprints` 必须持久化**：它记的是「用户明确拒绝过这个动作」。
-          只放内存的话，重启后系统会重新请求同一个动作——骚扰，而且让人以为系统没记住。
-        - **`approval`（放行凭据）刻意不落盘**：批准是针对**当时那一屏**给的，重启后
-          页面可能已经变了；把批准带过重启，等于执行一个用户从没真正看过的东西。
-          恢复后重新请人确认是**正确行为**，不是缺陷。
-        - `pending_confirmation` / `goal_approved_by_human` 同理：都是「此刻这一屏」的
-          上下文，重启即失效（`recover()` 会留下 `confirmation_reset` 的记录）。
-        """
-        for fingerprint in state.denied_fingerprints:
-            if fingerprint not in task.denied_fingerprints:
-                task.denied_fingerprints.append(fingerprint)
-
-
-    def _gate_crash_recovery(self, task: Task) -> RunOutcome | None:
-        """崩溃恢复门禁（V2.6 §七）：先回答「上次那个动作到底发出去没有」。
-
-        任务停在 RUNNING 就被掐断，说明上一次执行是半途消失的：
-
-        - **有恢复点** → 交给既有的恢复路径（它用 `validate` + `needs_reconciliation`
-          对账 checkpoint 里的 `action_effect` / `attempt_id`）。这是已经能工作的部分，
-          返回 None 让它照常继续。
-        - **没有恢复点** → 既不知道动作发没发出，也没有 attempt 记录可比对。这时候
-          重新规划再点一次手机，可能就是把同一条消息发第二遍、同一个订单下第二次。
-          唯一诚实的做法是停下来交给人，而不是替用户赌一把。
-
-        返回 None 表示「门禁放行，可以正常执行」。
-        """
-        checkpoint = self._load_checkpoint(task)
-        if checkpoint is not None:
-            return None
-
-        reason = (
-            "重启前任务停在执行中，且没有可用恢复点：无法判断上一个动作是否已经生效，"
-            "已暂停等待人工确认（不要盲目重跑）"
-        )
-        logger.warning("任务 %s 崩溃重启且无可信恢复点，转人工确认", task.id)
-        with self._states_lock:
-            self._recovery_notes[task.id] = reason
-        # 把「上次动作效果未知」这件事落到 Task 上（V2.8 §八）：人工批准继续后它不能丢，
-        # 否则重新规划时模型不知道崩溃前可能有未决副作用，可能把同一条消息发第二遍。
-        task.recovery_note = reason
-        # 这次标记已经处理过了，人工放行后不该被同一个门禁拦第二次
-        task.recovery_required = False
-        task.apply_event(TaskEvent.AWAITING_CONFIRMATION, source="runtime")
-        self._emit(task.id, WAITING, reason="recovery_requires_human", detail=reason)
-        return RunOutcome.AWAITING_CONFIRMATION
-
 
     def _emit(self, task_id: str, kind: str, **data) -> None:
         """写一条事件。**按 kind 自动分级**（V3.1 P0）。

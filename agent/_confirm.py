@@ -32,8 +32,7 @@ class ConfirmationMixin:
         返回原因是给 API 与审计看的：它不是危险动作、也不是完成裁定，而是
         「上次那个动作到底生效没有，我们判断不了，交给人决定」。
         """
-        with self._states_lock:
-            return self._recovery_notes.get(task_id)
+        return self._recovery_reason(task_id)
 
     def confirm(self, task_id: str, approved: bool) -> bool:
         """人工确认危险动作。批准后该动作会被放行一次。"""
@@ -47,7 +46,7 @@ class ConfirmationMixin:
             if state is not None and state.awaiting_goal_decision:
                 return self._confirm_goal_locked(task_id, state, approved)
             # V2.6 §七：崩溃恢复门禁也在等人工，它同样不是某个动作
-            if task_id in self._recovery_notes:
+            if self._has_recovery_note(task_id):
                 return self._confirm_recovery_locked(task_id, approved)
             return False
 
@@ -136,11 +135,11 @@ class ConfirmationMixin:
         if failed is not None:
             logger.error("任务 %s 的恢复裁定事件写盘失败，裁定不生效：%s", task_id, failed)
             return False
-        self._recovery_notes.pop(task_id, None)
+        self._clear_recovery_note(task_id)
         logger.info("任务 %s 的崩溃恢复待办已被人工处理（approved=%s）", task_id, approved)
         return True
 
     def forget(self, task_id: str) -> None:
         with self._states_lock:
             self._states.pop(task_id, None)
-            self._recovery_notes.pop(task_id, None)
+            self._clear_recovery_note(task_id)
