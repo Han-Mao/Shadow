@@ -181,23 +181,54 @@ android/
 │   └── endpoint/
 │       ├── BridgeHttpServer.kt              极小的 HTTP 端点（ServerSocket，零依赖）
 │       └── DeviceEndpointService.kt         前台服务（端点是常驻的）
-└── app/src/test/java/.../UiTreeSerializerTest.kt   序列化器的格式契约（JVM 可跑）
+├── app/src/test/java/.../UiTreeSerializerTest.kt   序列化器的格式契约（JVM 可跑）
+└── tools/verify_kotlin_compile.py           无 SDK 环境下的真编译 + JVM 单测（见上）
 ```
 
-## 测试
+## 测试与编译验证
+
+### 静态契约（每次提交都跑，零下载）
 
 ```bash
-cd android && ./gradlew :app:test      # 只需 JVM，不需要真机/模拟器
 cd .. && python -m pytest tests/test_android_bridge_contract.py -q
 ```
 
-两边合起来才是一个闭环：
+Kotlin 侧的方法名 / 参数个数 / HTTP 路由 / 序列化属性集合 / 清单权限 / `R.string` 引用,
+都在这里与 Python 侧比对。其中 `R.*` 那两条是 AAPT 的 `error: resource not found` 的替身
+——没有 SDK 的环境同样能挡住「改了 `strings.xml` 忘了改代码」和「代码引用了没写的资源」。
 
-- Kotlin 侧证明「序列化器输出的 XML == golden 文件」；
-- Python 侧把 golden 文件喂给**真实的** `vision.target` / `agent.evidence` /
-  `agent.risk_gate`，证明「这份 XML 是有用的」；
-- 再加上方法名 / 参数个数 / 属性集合的静态比对（`test_android_bridge_contract.py`），
-  把「跨语言改名」「漏输出一个属性」这类**不会报错只会变松**的漂移挡住。
+### 真编译（不需要 Android Studio，一次性下载约 125MB 工具链）
+
+本工程**零 androidx 依赖**，Kotlin 侧只用 `android.*` / `java.*` / `org.json`，
+所以带着一个 `android.jar` 就能编——不需要 AGP、不需要模拟器、不需要真机：
+
+```bash
+python android/tools/verify_kotlin_compile.py
+# [1/3] android.jar 就位
+# [2/3] 生成 R/BuildConfig 桩（string=27 id=9 layout=1）
+# [3/3] 编译全部 Kotlin 源码 … 编译通过：27 个 class
+# 运行 JVM 单测 … OK (10 tests)
+```
+
+- 缺工具链时脚本会直接打出下载命令：kotlinc 来自 Maven Central，`android.jar` 来自
+  dl.google.com 的 `platform-35`（与 `compileSdk = 35` 一致）；JDK 用任意 17+，
+  本机用的是 PyCharm 自带的 `jbr`（可用 `SHADOW_JAVA` 覆盖）。
+- `R` / `BuildConfig` 是 AGP 的生成物：脚本从 `res/` 与 `build.gradle.kts` **真解析**出名字
+  再生成桩，所以「引用了不存在的资源」会像真实构建那样直接编译失败。
+- 有 SDK 的正常路径仍是 `cd android && ./gradlew :app:test`（JVM 单测）与 `assembleDebug`。
+
+> 这条路抓到过两处**真缺陷**（均已修）：
+> `ShadowAccessibilityService.globalAction()` 里的 `require()` 被 Kotlin 解析成了标准库的
+> `kotlin.require(Boolean)`（本类没有同名成员，报错信息完全指不到问题）；
+> `findFocus(FOCUS_INPUT)` 少了类名限定（`FOCUS_INPUT` 属于 `AccessibilityNodeInfo`）。
+> 两处在真机上只会表现为「返回/回桌面莫名失败」和「输入找不到焦点框」。
+
+### 两边合起来才是闭环
+
+- Kotlin 侧证明「序列化器输出的 XML == golden 文件」，Python 侧把 golden 文件喂给
+  **真实的** `vision.target` / `agent.evidence` / `agent.risk_gate`，证明「这份 XML 是有用的」；
+- 再加上方法名 / 参数个数 / 属性集合的静态比对，把「跨语言改名」「漏输出一个属性」
+  这类**不会报错只会变松**的漂移挡住。
 
 ---
 
@@ -235,9 +266,12 @@ cd .. && python -m pytest tests/test_android_bridge_contract.py -q
 5. **只支持单台手机一个端点**：一个 App 实例一个端点（端口 8765）。
    多台手机＝多台各跑一个，Core 侧用 `ADB_SERIAL`/日志区分标识——这与
    `device/factory.py` 的 `resolve_device_serials`「Android 后端恒为一台」一致。
-6. **未做端到端真机验证**：本仓库的开发环境没有 Android SDK / Gradle / 真机，
-   所以 Kotlin 侧**只经过逐行复核与静态契约测试，没有编译过**。
-   第一次 `./gradlew :app:test`（JVM 单测）与 `assembleDebug` 是真正的第一道验证。
+6. **真机端到端未验证**（打包与真机行为这两层）：Kotlin 侧已通过**真编译**（27 个 class，
+   含 MainActivity / 端点 / 投屏 / 无障碍服务）与 JVM 单测（10 条，其中一条是「序列化输出与
+   golden 逐字节相同」）——见上面「测试与编译验证」。
+   **仍未验证的是**：AAPT 资源打包 / dex / 安装（`./gradlew :app:assembleDebug` 仍是这一层的
+   第一道验证），以及真机行为。真机上最需要盯的三条：手势坐标是否被 ROM 缩放、
+   投屏帧率与延迟是否够 VLM 用、厂商后台存活策略会不会杀掉前台服务。
 
 ---
 

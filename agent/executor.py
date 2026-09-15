@@ -89,8 +89,10 @@ def execute(device: DeviceController, action: Action, ui_tree: str | None = None
                 # 原来直接 `adb.type_text()` 只支持安全 ASCII，Agent 生成的
                 # `Action(TYPE, "给妈妈发消息")` 会在设备端被吞成空 —— 同一个人工
                 # `/text` 能输中文、Agent 反而输不了，是功能割裂。
-                # 统一走 `build_default_input`：ASCII 走 input text，非 ASCII 走
-                # ADB Keyboard 广播（与 api/server.py 的 /text 端点同一条链路）。
+                # 统一走 `build_default_input`，由**控制器自己**声明该用哪条通道（V3.3 §5）：
+                # ADB 后端是「安全 ASCII 走 `input text`，其余走 ADB Keyboard 广播」
+                # （与 api/server.py 的 /text 端点同一条链路），
+                # Android 后端是 Accessibility `ACTION_SET_TEXT`（中文英文同一条路）。
                 provider = build_default_input(device)
                 provider.input(action.value)
                 return {"ok": True, "text": action.value, "provider": provider.name}

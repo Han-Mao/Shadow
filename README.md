@@ -96,14 +96,15 @@ V3.3 起 `Vision / Device` 这一层的左边是 `DeviceController` **协议**�
 │   ├── server.py           # FastAPI
 │   └── auth.py             # 令牌 / 只读 / 设备范围 / 人工确认令牌（V2.2 §九）
 ├── android/                # 手机侧设备层 + 设备端点（Kotlin，V3.3）
-│   ├── README.md           # 部署步骤 / 两条路线 / 权限 / 排障
+│   ├── README.md           # 部署步骤 / 两条路线 / 权限 / 排障 / 无 SDK 的编译验证
+│   ├── tools/              # verify_kotlin_compile.py：无 SDK 环境下真编译 + JVM 单测
 │   └── app/src/main/java/com/bluewhale/shadow/
 │       ├── device/         # AccessibilityService / MediaProjection / Intent 启动 / 12 个桥方法
 │       └── endpoint/       # 极小的 HTTP 设备端点（前台服务）
 ├── scripts/
 │   ├── demo_preemption.py  # 抢占恢复演示（离线可跑）
 │   └── replay_task.py      # 命令行回放一个任务的事件流
-└── tests/                  # 588 个离线用例
+└── tests/                  # 611 个离线用例
 ```
 
 ## 职责边界
@@ -1196,7 +1197,8 @@ for Chaquopy*，chaquo/chaquopy#1160；另一份专门为 Chaquopy 构建它的�
 | `android/` | Kotlin 设备层 + 设备端点（见 `android/README.md`） |
 | `tests/test_android_adapter.py` | 假桥驱动**整条任务链**（含危险动作仍被 RiskGate 拦下） |
 | `tests/test_android_remote_bridge.py` | 远程传输：12 个方法的参数名/路径/回包 + 失败语义 |
-| `tests/test_android_bridge_contract.py` | 跨语言契约：方法名、参数个数、属性集合、golden UI 树喂给真实解析器 |
+| `tests/test_android_bridge_contract.py` | 跨语言契约：方法名、参数个数、属性集合、golden UI 树喂给真实解析器、`R.*` 引用与清单 `@string` 必须在 `res/` 里存在 |
+| `tests/test_device_port.py` | 端口解耦守卫：核心侧五个模块不许出现 `AdbController`、设备参数必须标 `DeviceController`、用到的能力必须在协议里声明过 |
 
 **改动**
 
@@ -1209,26 +1211,38 @@ for Chaquopy*，chaquo/chaquopy#1160；另一份专门为 Chaquopy 构建它的�
 | `models/action.py` | `DURATION_RANGE_MS` 从 `device/adb.py` 挪过来（动作参数的合法区间不是后端细节） |
 | `models/exceptions.py` | 新增 `ActionArgumentError` |
 | `device/__init__.py` | 导出端口层的符号 |
+| `agent/observer.py` / `device/screenshot.py` / `device/accessibility.py` / `vision/grounding.py` | 设备参数标注由 `AdbController` 改成端口的 `DeviceController`（运行早已解耦，标注滞后了一层）；`observer` 与 `grounding` 的注释按两个后端的真实预算/查询语义改写，`device/pool.py` 里那句「真机是 AdbController」也一起纠正 |
 
 ### 四、验证
 
-`python -m pytest -q` → **588 passed（14.2s）**，较上轮 526 新增 **62** 条，零回归。
+`python -m pytest -q` → **611 passed**，较上轮 526 新增 **85** 条，零回归。
 
 | 新增用例 | 覆盖 |
 |---|---|
 | `test_android_adapter.py`（28 条） | 端口完整性在装配期被检查、桥异常归一成 `DeviceError`、UI 树非 uiautomator 格式被拒、读不到树**抛异常**而不是返回空串、预算耗尽后不再开始新采集、输入走 `ACTION_SET_TEXT`、后端选错 fail-closed、**用假桥把整条任务链跑通**、**危险动作在 Android 后端上照样被 RiskGate 拦下** |
 | `test_android_remote_bridge.py`（19 条） | 12 个方法的路径与 JSON 键逐条对齐（`duration_ms` 写成 `duration` 这类错误会被抓住）、令牌随请求发出、截图走裸字节、**权限问题映射成 `AndroidServiceUnavailable`**、连不上/令牌错/回包不是 JSON 的提示各不相同、同进程优先于远程、**两条路线都不通时绝不回退 adb** |
-| `test_android_bridge_contract.py`（15 条） | Kotlin 侧方法名/参数个数与协议一致、HTTP 路由表覆盖全 12 个、序列化器属性集合 ⊇ `vision/parser.py` 读取的每一个、golden XML 喂给真实 `vision.target` / `agent.evidence` / `agent.risk_gate` 都能用、清单权限与辅助功能标志齐备 |
+| `test_android_bridge_contract.py`（18 条） | Kotlin 侧方法名/参数个数与协议一致、HTTP 路由表覆盖全 12 个、序列化器属性集合 ⊇ `vision/parser.py` 读取的每一个、golden XML 喂给真实 `vision.target` / `agent.evidence` / `agent.risk_gate` 都能用、清单权限与辅助功能标志齐备、**Kotlin 引用的 `R.string` / `R.id` / `R.layout` 与清单里的 `@string` 都必须在 `res/` 里真实存在**（AAPT `resource not found` 的替身） |
+| `test_device_port.py`（20 条） | 核心侧五个模块不出现 `AdbController`（否则手机形态要 fork 代码）、七个设备参数都用 `DeviceController` 标注、AST 扫出用到的设备能力必须都在协议里声明、`_REQUIRED_METHODS` 与协议声明一致（否则装配期检查会静默漏检）、ADB 专属通道**反向**仍保留 `AdbController` 标注 |
 
-`android/` 侧另有 `./gradlew :app:test`（纯 JVM，不需要真机）：`UiTreeSerializerTest`
-把序列化输出与 golden 文件逐字比较，并覆盖转义（含**双重转义**与 `<`/`>`）与边界。
+`android/` 侧的 Kotlin 也**真编译过**：本轮在**没有 Android Studio** 的环境里编通了全部源码
+（PyCharm 自带的 JDK + Maven Central 的 kotlinc + 一个 `android.jar`，共 27 个 class），
+并用同一个产物跑了 `UiTreeSerializerTest` 的 10 条 JVM 单测——其中「序列化输出与 golden
+文件逐字节相同」把跨语言契约钉死。过程固化成 `android/tools/verify_kotlin_compile.py`，
+命令与工具链下载地址写在 `android/README.md`。
+
+那次编译当场抓到两处**只会在真机上暴露**的缺陷，均已修：`globalAction()` 里的
+`require()` 被 Kotlin 解析成标准库的 `kotlin.require(Boolean)`（本类没有同名成员，
+报错信息完全指不到问题）；`findFocus(FOCUS_INPUT)` 少了类名限定（`FOCUS_INPUT` 属于
+`AccessibilityNodeInfo`，不是 `AccessibilityService` 的常量）。
 
 ### 五、如实说明
 
-1. **Kotlin 侧没有编译过。** 开发环境没有 Android SDK / Gradle / 真机，所以
-   `android/` 的 Kotlin 只经过逐行复核 + 静态契约测试（上面那 15 条）。
-   第一次 `./gradlew :app:test` 与 `:app:assembleDebug` 才是它的第一道真实验证。
-   这一点写进 `android/README.md` 的「已知限制」第 6 条，不留在对话里。
+1. **Kotlin 侧编译过了，但没打包、也没上真机。** 本环境没有 Android SDK / Gradle / 真机，
+   所以走的是「一个 `android.jar` + kotlinc」的路子：全部源码编过（27 个 class）、
+   JVM 单测 10 条通过（见上）。**仍未验证**的是 AAPT 资源打包 / dex / 安装
+   （`./gradlew :app:assembleDebug` 仍是这一层的第一道验证）与真机行为（手势坐标是否被
+   ROM 缩放、投屏帧率与延迟、厂商后台存活策略会不会杀掉前台服务）。这一点写进
+   `android/README.md` 的「已知限制」第 6 条，不留在对话里。
 2. **路线 A 目前不可用**，原因是 pydantic 2 没有 Android 轮子（上面 §二 有出处）。
    刻意**没有**用「兜底的假 pydantic」绕过它——那会让核心的模型校验语义悄悄变样，
    而这种偏离在被审核发现时比「还没做」严重得多。
@@ -1377,7 +1391,7 @@ pip install -r requirements.txt
 python -m pytest -q
 ```
 
-**588 个用例，全部离线**：不需要 adb、模拟器或 API Key。
+**611 个用例，全部离线**：不需要 adb、模拟器或 API Key。
 
 | 文件 | 覆盖 |
 |---|---|
@@ -1406,7 +1420,8 @@ python -m pytest -q
 | `test_api_authz.py` | **授权边界**：设备范围裁剪（读 / inject / devices / 调度快照）、越界设备 403 而非 500、确认令牌绑定操作者、否决危险动作不杀任务 |
 | `test_android_adapter.py` | **Android 后端**：端口完整性在装配期被查、桥异常归一成 `DeviceError`、UI 树非 uiautomator 格式被拒、读不到树抛异常（不是空串）、预算耗尽后不再开始采集、输入走 `ACTION_SET_TEXT`、**假桥驱动整条任务链跑通**、**危险动作照样被 RiskGate 拦下** |
 | `test_android_remote_bridge.py` | **桥的远程传输**：12 个方法的路径与 JSON 键逐条对齐、令牌随请求发出、截图走裸字节、权限问题映射成 `AndroidServiceUnavailable`、四种失败各有可操作的提示、同进程优先于远程、**两条路线都不通时绝不回退 adb** |
-| `test_android_bridge_contract.py` | **跨语言契约**：Kotlin 方法名与参数个数 == 协议、HTTP 路由表覆盖全 12 个、序列化器属性集合 ⊇ `vision/parser.py` 的读取集合、golden UI 树喂给真实 `vision.target` / `agent.evidence` / `agent.risk_gate` 都能用、清单权限与辅助功能标志齐备 |
+| `test_android_bridge_contract.py` | **跨语言契约**：Kotlin 方法名与参数个数 == 协议、HTTP 路由表覆盖全 12 个、序列化器属性集合 ⊇ `vision/parser.py` 的读取集合、golden UI 树喂给真实 `vision.target` / `agent.evidence` / `agent.risk_gate` 都能用、清单权限与辅助功能标志齐备、`R.*` 引用与清单 `@string` 必须在 `res/` 里存在（AAPT 的替身） |
+| `test_device_port.py` | **设备端口解耦**：核心侧五个模块不出现 `AdbController`、设备参数都标 `DeviceController`、AST 扫出的设备能力全在协议里、`_REQUIRED_METHODS` 与协议声明一致、ADB 专属通道反向保留 ADB 标注 |
 
 ## 注意事项
 

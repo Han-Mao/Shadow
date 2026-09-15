@@ -232,7 +232,12 @@ class ShadowAccessibilityService : AccessibilityService() {
     }
 
     private fun globalAction(action: Int, what: String) {
-        val service = require()
+        // 必须显式走 `requireService()`：这里若写成 `require()`，Kotlin 会解析到
+        // **标准库的** `kotlin.require(Boolean)`（本类里没有同名成员），
+        // 报错信息是「没有传 value 参数」——很难联想到是「服务没连上要抛自己的异常」。
+        // 走 requireService() 而不是直接 performGlobalAction：服务已解绑时
+        // 前者给出的原因（未开辅助功能）才是真实原因，后者只会返回 false。
+        val service = requireService()
         // performGlobalAction 的返回值是「有没有受理」，不是「动作生效了没有」。
         // 这一点必须记住：返回 true 只说明系统接下了这次请求。
         if (!service.performGlobalAction(action)) {
@@ -259,7 +264,9 @@ class ShadowAccessibilityService : AccessibilityService() {
         val root = safeRoot()
             ?: throw ShadowServiceUnavailable("读不到当前窗口，无法定位输入框。")
 
-        val target = findFocus(FOCUS_INPUT)
+        // `FOCUS_INPUT` 是 `AccessibilityNodeInfo` 的常量，不是 AccessibilityService 的——
+        // 不限定类名会报 unresolved reference（真机上则表现为「输入永远找不到焦点框」）。
+        val target = findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
             ?.takeIf { it.isEditable }
             ?: firstEditable(root)
             ?: throw ShadowActionFailed(

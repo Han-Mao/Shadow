@@ -109,9 +109,10 @@ class DevicePool:
 def build_pool(controller_factory, serials: list[str] | None = None):
     """按 serial 列表建一批会话。
 
-    `controller_factory(serial)` 负责造出该设备的控制器（真机是 `AdbController`，
-    测试里是 `FakeDevice` 的封装）。没有给 serial 列表时返回空池——
-    由调用方自己 register，保持「装配方式」开放。
+    `controller_factory(serial)` 负责造出该设备的控制器（由
+    `device.factory.build_controller` 按 `SHADOW_DEVICE_BACKEND` 决定是
+    `AdbDeviceController` 还是 `AndroidDeviceController`，测试里是 `FakeDevice` 的封装）。
+    没有给 serial 列表时返回空池——由调用方自己 register，保持「装配方式」开放。
     """
     from .session import DeviceSession
 
