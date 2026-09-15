@@ -102,7 +102,9 @@ V3.3 起 `Vision / Device` 这一层的左边是 `DeviceController` **协议**�
 │   └── auth.py             # 令牌 / 只读 / 设备范围 / 人工确认令牌（V2.2 §九）
 ├── android/                # 手机侧设备层 + 设备端点（Kotlin，V3.3）
 │   ├── README.md           # 部署步骤 / 两条路线 / 权限 / 排障 / 无 SDK 的编译验证
-│   ├── tools/              # verify_kotlin_compile.py：无 SDK 环境下真编译 + JVM 单测
+│   ├── tools/              # 无 SDK 环境下的构建工具（见 android/README.md）
+│   │                        #   verify_kotlin_compile.py：真编译 + JVM 单测
+│   │                        #   build_apk.py：aapt2/d8/zipalign/apksigner → 可安装 APK
 │   └── app/src/main/java/com/bluewhale/shadow/
 │       ├── device/         # AccessibilityService / MediaProjection / Intent 启动 / 12 个桥方法
 │       └── endpoint/       # 极小的 HTTP 设备端点（前台服务）
@@ -1242,12 +1244,15 @@ for Chaquopy*，chaquo/chaquopy#1160；另一份专门为 Chaquopy 构建它的�
 
 ### 五、如实说明
 
-1. **Kotlin 侧编译过了，但没打包、也没上真机。** 本环境没有 Android SDK / Gradle / 真机，
-   所以走的是「一个 `android.jar` + kotlinc」的路子：全部源码编过（27 个 class）、
-   JVM 单测 10 条通过（见上）。**仍未验证**的是 AAPT 资源打包 / dex / 安装
-   （`./gradlew :app:assembleDebug` 仍是这一层的第一道验证）与真机行为（手势坐标是否被
-   ROM 缩放、投屏帧率与延迟、厂商后台存活策略会不会杀掉前台服务）。这一点写进
-   `android/README.md` 的「已知限制」第 6 条，不留在对话里。
+1. **能打包了，但还没上真机。** 本环境没有 Android SDK / Gradle / 真机，所以走的是
+   「`android.jar` + kotlinc + build-tools」的路子，分两步：
+   `python android/tools/verify_kotlin_compile.py`（全部源码编过 —— 27 个 class +
+   JVM 单测 10 条）、`python android/tools/build_apk.py`（aapt2 → javac → kotlinc → d8 →
+   zipalign → apksigner，产出 `android/app/build/outputs/apk/debug/app-debug.apk`，
+   并静态校验签名 / 包名 / 权限 / 「清单声明的组件都在 dex 里」）。
+   **仍未验证**的是真机行为：手势坐标是否被 ROM 缩放、投屏帧率与延迟、
+   厂商后台存活策略会不会杀掉前台服务——这三条只有设备在手才能看。
+   这一点写进 `android/README.md` 的「已知限制」第 6 条，不留在对话里。
 2. **路线 A 目前不可用**，原因是 pydantic 2 没有 Android 轮子（上面 §二 有出处）。
    刻意**没有**用「兜底的假 pydantic」绕过它——那会让核心的模型校验语义悄悄变样，
    而这种偏离在被审核发现时比「还没做」严重得多。

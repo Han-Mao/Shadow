@@ -75,13 +75,39 @@ cd android
 
 ### 1. 构建
 
+两条路，产出同一个东西（`app/build/outputs/apk/debug/app-debug.apk`）：
+
 ```bash
+# ① 有 Android Studio / SDK / Gradle：常规路径
 cd android
 ./gradlew :app:assembleDebug
 adb install -r app/build/outputs/apk/debug/app-debug.apk
+
+# ② 什么都没有（不需要 Android Studio / Gradle / SDK）：本仓库自带的脚本
+python android/tools/build_apk.py      # 首次会下约 125MB 工具链到 ~/.workbuddy/binaries/
+adb install -r android/app/build/outputs/apk/debug/app-debug.apk
 ```
 
-需要 JDK 17（AGP 8 的要求）。首次构建会去 `google()` / `mavenCentral()` 拉依赖。
+第 ② 条不是「凑合」——它把 `assembleDebug` 那一步拆开手工走一遍，每一步都是官方工具：
+
+```
+aapt2 compile   res/ → .flat
+aapt2 link      清单 + 资源 + android.jar → base.apk（含 resources.arsc）+ R.java
+javac           R.java + BuildConfig.java
+kotlinc         src/main 的 Kotlin 源码
+d8              27 个 class → classes.dex
+zip 装包        base.apk + classes.dex
+zipalign        -p 4
+apksigner       调试密钥签名（v2 + v3）
+```
+
+产出与 Android Studio 的 debug 构建同形：`debuggable=true`、`BuildConfig.DEBUG=true`、
+调试密钥签名。脚本最后会自己校验签名、包名、版本、权限，并逐条核对
+**「清单里声明的每个组件类都在 dex 里」**——那正是 `ClassNotFoundException` 的替身
+（AGP 会把这类问题留到安装/启动时才炸）。
+
+> 需要 JDK 17（AGP 8 的要求；本机没有 JDK 时脚本会用 PyCharm 自带的 `jbr`）。
+> 有 SDK 的机器上仍然推荐第 ① 条：`./gradlew` 会顺带跑 lint 与资源合并的完整流程。
 
 ### 2. 在手机上授权（两件事，都要做）
 
@@ -182,7 +208,10 @@ android/
 │       ├── BridgeHttpServer.kt              极小的 HTTP 端点（ServerSocket，零依赖）
 │       └── DeviceEndpointService.kt         前台服务（端点是常驻的）
 ├── app/src/test/java/.../UiTreeSerializerTest.kt   序列化器的格式契约（JVM 可跑）
-└── tools/verify_kotlin_compile.py           无 SDK 环境下的真编译 + JVM 单测（见上）
+└── tools/
+    ├── _toolchain.py                        JDK / android.jar / build-tools 的定位与下载（两个脚本共用）
+    ├── verify_kotlin_compile.py             无 SDK 环境下真编译 + JVM 单测
+    └── build_apk.py                         无 SDK 环境下打出可安装的 debug APK
 ```
 
 ## 测试与编译验证
@@ -210,12 +239,35 @@ python android/tools/verify_kotlin_compile.py
 # 运行 JVM 单测 … OK (10 tests)
 ```
 
-- 缺工具链时脚本会直接打出下载命令：kotlinc 来自 Maven Central，`android.jar` 来自
-  dl.google.com 的 `platform-35`（与 `compileSdk = 35` 一致）；JDK 用任意 17+，
-  本机用的是 PyCharm 自带的 `jbr`（可用 `SHADOW_JAVA` 覆盖）。
+- 缺工具链时脚本会直接下载（约 125MB，进 `~/.workbuddy/binaries/`，**不装系统目录**）；
+  加 `--no-download` 则只打印手工下载命令。kotlinc 来自 Maven Central，
+  `android.jar` 来自 dl.google.com 的 `platform-35`（与 `compileSdk = 35` 一致）；
+  JDK 用任意 17+，本机用的是 PyCharm 自带的 `jbr`（可用 `SHADOW_JAVA` 覆盖）。
 - `R` / `BuildConfig` 是 AGP 的生成物：脚本从 `res/` 与 `build.gradle.kts` **真解析**出名字
   再生成桩，所以「引用了不存在的资源」会像真实构建那样直接编译失败。
 - 有 SDK 的正常路径仍是 `cd android && ./gradlew :app:test`（JVM 单测）与 `assembleDebug`。
+
+### 打包成可安装的 APK（同样不需要 Android Studio）
+
+```bash
+python android/tools/build_apk.py
+# [1/9] 合并清单（package=com.bluewhale.shadow，debuggable=true）
+#      清单声明 3 个组件：MainActivity、ShadowAccessibilityService、DeviceEndpointService
+# [2/9] aapt2 compile …  [3/9] aapt2 link …  [4/9] javac …  [5/9] kotlinc …
+# [6/9] d8：27 个 class → classes.dex（74 KB）
+# [7/9] 装包 + zipalign …  [8/9] 签名（调试密钥）…  [9/9] 校验
+# 产物：android/app/build/outputs/apk/debug/app-debug.apk（49 KB）
+```
+
+它额外下载 build-tools r35（约 60MB，与 `compileSdk` 对齐），并用到其中的
+`aapt2` / `d8` / `zipalign` / `apksigner` / `dexdump`。三处**踩过的坑**都写在脚本注释里，
+因为它们都会给出误导性的错误信息：
+
+| 现象 | 真正的原因 |
+|---|---|
+| `resource string/app_name does not override an existing resource`（一大片） | `aapt2 link` 的 `-R` 是**overlay 语义**（help 里写着「最后给出的冲突资源胜出」）。普通资源要走**位置参数** |
+| `Unsupported source file type`（d8） | 传了目录，kotlinc 在输出目录里留了 `META-INF/main.kotlin_module`。改成显式列出 `.class` |
+| `Couldn't get file size: Bad file descriptor`（dexdump） | `dexdump` 只认裸 `.dex`，给它 APK 不行。把包里那份解出来再验 |
 
 > 这条路抓到过两处**真缺陷**（均已修）：
 > `ShadowAccessibilityService.globalAction()` 里的 `require()` 被 Kotlin 解析成了标准库的
@@ -266,12 +318,15 @@ python android/tools/verify_kotlin_compile.py
 5. **只支持单台手机一个端点**：一个 App 实例一个端点（端口 8765）。
    多台手机＝多台各跑一个，Core 侧用 `ADB_SERIAL`/日志区分标识——这与
    `device/factory.py` 的 `resolve_device_serials`「Android 后端恒为一台」一致。
-6. **真机端到端未验证**（打包与真机行为这两层）：Kotlin 侧已通过**真编译**（27 个 class，
-   含 MainActivity / 端点 / 投屏 / 无障碍服务）与 JVM 单测（10 条，其中一条是「序列化输出与
-   golden 逐字节相同」）——见上面「测试与编译验证」。
-   **仍未验证的是**：AAPT 资源打包 / dex / 安装（`./gradlew :app:assembleDebug` 仍是这一层的
-   第一道验证），以及真机行为。真机上最需要盯的三条：手势坐标是否被 ROM 缩放、
-   投屏帧率与延迟是否够 VLM 用、厂商后台存活策略会不会杀掉前台服务。
+6. **打包与真机行为：前者已做，后者仍未验证。**
+   - **已做**：`python android/tools/build_apk.py` 产出 `app-debug.apk`
+     （aapt2 → javac → kotlinc → d8 → zipalign → apksigner，49 KB，v2+v3 签名），
+     并静态校验了包名 / 版本 / 权限 / 签名 / 「清单声明的组件都在 dex 里」/
+     辅助功能配置 XML 在包内。清单里的 `minSdk 26 / targetSdk 34 / compileSdk 35`
+     与 `build.gradle.kts` 一致。
+   - **仍未验证**：真机行为。最需要盯的三条——手势坐标是否被 ROM 缩放、
+     投屏帧率与延迟是否够 VLM 用、厂商后台存活策略会不会杀掉前台服务。
+     这三条只有设备在手才能看，脚本能保证的只到「包是完整的、装得上去」。
 
 ---
 
