@@ -52,7 +52,12 @@ from models.execution import (
     ActionExecution,
     ExecutionStatus,
 )
-from storage.event_log import ACTION_DISPATCHED, ACTION_VERIFIED, RISK_ASSESSED
+from storage.event_log import (
+    ACTION_DISPATCHED,
+    ACTION_VERIFIED,
+    EXECUTION_RECOVERED,
+    RISK_ASSESSED,
+)
 
 from . import state
 
@@ -232,6 +237,28 @@ class ExecutionService:
             result=result,
             note=note,
             risk=risk,
+        )
+
+    # ---- 启动恢复（v4.1 §六） ----
+
+    def recover(self, execution: ActionExecution, *, target: str, note: str = "") -> bool:
+        """把一条**进程死后留下来的**执行落定为 `target`（启动恢复专用）。
+
+        与 `settle()` 的差别只有 `expect`：这里用**启动时观察到的那个状态**，
+        而不是「任意非终态」。理由是恢复可能在和一个还活着的进程抢同一条记录
+        （多进程部署，见 `SHADOW_ALLOW_MULTI_PROCESS`）——
+        「我看到它是什么，就从那个状态迁走」比「不管它现在是什么都能改成 UNKNOWN」
+        精确得多：后者会把别的进程正在跑的执行也一起接管。
+
+        恢复事件（`EXECUTION_RECOVERED`）**不是安全关键事件**：它丢了审计链也断不了，
+        因为「为什么被改成这个终态」同时写在记录的 `note` 里，而记录才是权威事实。
+        """
+        return self._advance(
+            execution,
+            expect={execution.status},
+            to=target,
+            note=note,
+            event=EXECUTION_RECOVERED,
         )
 
     # ---- 内部 ----

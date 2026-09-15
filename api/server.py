@@ -22,7 +22,7 @@ from dataclasses import dataclass
 
 from agent import executor, observer, replay as replay_mod, verifier
 from agent.classifier import TaskClassifier
-from agent.execution import ExecutionService
+from agent.execution import ExecutionService, recover_executions
 from agent.risk_gate import ActionRiskGate, RiskAssessment, RiskContext
 from agent.runtime import AgentRuntime
 from agent.scheduler import DeviceNotAllowedError, TaskScheduler
@@ -49,7 +49,9 @@ from models.execution import (
     ActionExecution,
     EXECUTION_FAILED,
     EXECUTION_REFUSED,
+    EXECUTION_STATUSES,
     EXECUTION_SUCCEEDED,
+    EXECUTION_UNKNOWN,
     EXECUTION_UNVERIFIED,
 )
 from models.state import Observation
@@ -256,9 +258,53 @@ def _prune_orphan_checkpoints() -> int:
     return removed
 
 
+def _execution_recovery_grace() -> float:
+    """启动恢复的宽限窗口（v4.1 §六）。
+
+    默认 **0**：启动时看到非终态执行，它就是死进程留下的。这个结论的前提是
+    「单进程」，而单进程在本仓库是硬前提（`_guard_single_process()`，约定 [78]）。
+
+    显式开了 `SHADOW_ALLOW_MULTI_PROCESS` 的部署没有这个前提——另一个进程可能正拿着
+    某条 RUNNING 在跑。那种情况下退回审核给的 5 分钟宽限：更年轻的记录留给它的持有者，
+    超时了才由本进程接管。`SHADOW_EXECUTION_STALE_SECONDS` 可以显式覆盖两者。
+    """
+    raw = os.getenv("SHADOW_EXECUTION_STALE_SECONDS", "").strip()
+    if raw:
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            logger.warning(
+                "SHADOW_EXECUTION_STALE_SECONDS 不是数字（%r），按 0 处理", raw
+            )
+            return 0.0
+    return 300.0 if _multi_process_opted_in() else 0.0
+
+
+def recover_stale_executions() -> dict[str, int]:
+    """启动恢复：把进程死后留下的非终态执行收掉（v4.1 §六/§七）。
+
+    两条出路由「设备有没有被调用过」决定：没被调用过 → `FAILED`（可以安全重做），
+    已经交出去 → `UNKNOWN`（禁止自动重试，只能重新观察对账或问人）。
+
+    恢复失败**绝不挡住启动**——它是维护动作；而且「服务起不来」会让那些数据
+    本来能查也查不到了。
+    """
+    try:
+        counts = recover_executions(
+            execution_service, stale_after=_execution_recovery_grace()
+        )
+    except Exception as exc:  # noqa: BLE001 - 维护动作失败不影响服务启动
+        logger.warning("启动恢复执行记录失败（已跳过）：%s", exc)
+        return {}
+    if counts.get(EXECUTION_UNKNOWN) or counts.get(EXECUTION_FAILED):
+        logger.warning("启动恢复：%s", counts)
+    return counts
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     _prune_orphan_checkpoints()
+    recover_stale_executions()
     scheduler.start()
     try:
         yield
@@ -1176,22 +1222,38 @@ def execute_action(req: ActionRequest, request: Request, device_serial: str | No
 
 
 @app.get("/executions")
-def list_executions(request: Request, limit: int = 50):
+def list_executions(request: Request, limit: int = 50, status: str = ""):
     """最近的执行记录，新的在前（V4 §一/§五）。
 
     手工端点每次调用都有一条——**被拒绝的也有一条**（`REFUSED`），
     因为「谁想点付款、被判成危险、被拒」正是要能回答的问题。
 
     设备范围会裁剪：受限令牌只能看到自己被授权设备上的执行（与 `/tasks` 同口径）。
+
+    `status` 可以按状态过滤（逗号分隔，如 `?status=UNKNOWN`）。这条参数是 v4.1 §七
+    的操作面：`UNKNOWN` 意味着「手机侧可能已经产生副作用，而我们不知道结果」，
+    禁止自动重试——但要能**找到**它们，对账（重新观察手机）才有人去启动。
+    状态名写错一律 400，而不是安静地返回空列表：后者会让「没有待处理的执行」
+    和「我把状态名拼错了」长得一模一样。
     """
     principal = current_principal(request)
     window = max(1, min(limit, 200))
-    records = [
-        record
-        for record in execution_store.recent(limit=window)
-        if principal.may_use_device(record.device_id)
+    wanted = [item.strip().upper() for item in status.split(",") if item.strip()]
+    unknown = [item for item in wanted if item not in EXECUTION_STATUSES]
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=f"不认识的状态：{', '.join(unknown)}（可选：{', '.join(sorted(EXECUTION_STATUSES))}）",
+        )
+    records = (
+        execution_store.by_status(wanted, limit=window)
+        if wanted
+        else execution_store.recent(limit=window)
+    )
+    visible = [
+        record for record in records if principal.may_use_device(record.device_id)
     ]
-    return {"ok": True, "executions": [record.to_dict() for record in records]}
+    return {"ok": True, "executions": [record.to_dict() for record in visible]}
 
 
 @app.get("/executions/{execution_id}")
@@ -1670,6 +1732,12 @@ def health_detail():
         "confirmation_consumption": auth.consumption_backend(),
         "device_backend": describe_backend(resolve_device_serial()),
         "principals_error": auth.config_error(),
+        # v4.1 §六/§七：有多少次执行的**效果还没交代清楚**。
+        # `UNKNOWN` = 进程死在动作交给设备之后：手机侧可能已经付款/发送/删除，
+        # 而系统不知道结果。它不是「失败」，也不许自动重试——只能对账或问人。
+        # 这个数字长期不为 0 就说明有人在拖着不处理（用
+        # `GET /executions?status=UNKNOWN` 列出它们）。
+        "executions_effect_unknown": execution_store.count({EXECUTION_UNKNOWN}),
     }
 
 

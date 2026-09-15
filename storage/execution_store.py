@@ -358,10 +358,42 @@ class ExecutionStore:
         兜底定序——同一毫秒创建的两条记录否则谁先谁后不确定，而「最近的执行」
         这种给人看的列表必须是稳定顺序。
         """
+        return self._query_recent(limit=limit, statuses=None)
+
+    def by_status(self, statuses: Collection[str], *, limit: int = 50) -> list[ActionExecution]:
+        """按状态取最近的若干条（新的在前）。
+
+        `GET /executions?status=UNKNOWN` 用它回答 §七 的那个操作性问题：
+        「现在有哪些执行是效果未知的」——不知道有哪些，就没法对账。
+        """
+        return self._query_recent(limit=limit, statuses=list(statuses))
+
+    def unfinished(self, *, limit: int = 500) -> list[ActionExecution]:
+        """**非终态**的执行，旧的在前（v4.1 §六 的恢复扫描）。
+
+        旧的在前是有意的：恢复要先处理最早那批（它们最可能是上一个进程留下的），
+        上限 `limit` 防的是「异常积累了几万条非终态记录」把启动拖死——
+        真出现那种情况，先恢复一部分、下次启动接着扫，比卡在启动阶段好。
+        """
+        placeholders = ", ".join("?" * len(NON_TERMINAL_EXECUTION_STATUSES))
+        rows = self._db.query(
+            f"SELECT * FROM executions WHERE status IN ({placeholders}) "
+            "ORDER BY created_at ASC, rowid ASC LIMIT ?",
+            (*sorted(NON_TERMINAL_EXECUTION_STATUSES), max(0, int(limit))),
+        )
+        return [record for record in (_row_to_execution(row) for row in rows) if record is not None]
+
+    def _query_recent(self, *, limit: int, statuses: list[str] | None) -> list[ActionExecution]:
+        clause = ""
+        params: tuple = ()
+        if statuses:
+            clause = f"WHERE status IN ({', '.join('?' * len(statuses))}) "
+            params = tuple(statuses)
         try:
             rows = self._db.query(
-                "SELECT * FROM executions ORDER BY created_at DESC, rowid DESC LIMIT ?",
-                (max(0, int(limit)),),
+                f"SELECT * FROM executions {clause}"
+                "ORDER BY created_at DESC, rowid DESC LIMIT ?",
+                (*params, max(0, int(limit))),
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("列执行记录失败：%s", exc)
@@ -372,8 +404,20 @@ class ExecutionStore:
         """全部执行 id（不保证顺序）——测试与运维清点用。"""
         return [row["execution_id"] for row in self._db.query("SELECT execution_id FROM executions")]
 
-    def count(self) -> int:
-        return int(self._db.query_one("SELECT COUNT(*) AS n FROM executions")["n"])
+    def count(self, statuses: Collection[str] | None = None) -> int:
+        """记录总数；给了 `statuses` 就只数这些状态的行（`/health/detail` 用它报
+        「有多少次执行的效果还没交代清楚」）。"""
+        if statuses is None:
+            return int(self._db.query_one("SELECT COUNT(*) AS n FROM executions")["n"])
+        wanted = list(statuses)
+        if not wanted:
+            return 0
+        placeholders = ", ".join("?" * len(wanted))
+        row = self._db.query_one(
+            f"SELECT COUNT(*) AS n FROM executions WHERE status IN ({placeholders})",
+            tuple(wanted),
+        )
+        return int(row["n"])
 
     def close(self) -> None:
         """只关连接——**共享 `Database` 时不要调它**（别的 store 还在用同一个连接）。"""

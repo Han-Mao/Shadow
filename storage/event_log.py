@@ -79,6 +79,14 @@ GOAL_REJECTED = "goal_rejected"
 EFFECT_UNKNOWN = "effect_unknown"
 """动作已发出但效果无法确认（拿不到验证观察）。下一个安全点要对账。"""
 
+EXECUTION_RECOVERED = "execution_recovered"
+"""启动恢复把一条**进程死后留下来的**执行落定为终态（v4.1 §六）。
+
+刻意**不**放进 `SAFETY_CRITICAL_KINDS`：这条事件丢失不会让审计链断掉——
+「它为什么被改成了 UNKNOWN / FAILED」这个理由同时写在执行记录的 `note` 字段里，
+而记录本身是权威事实。事件在这里是**解释**，不是凭据。
+"""
+
 RISK_ASSESSED = "risk_assessed"
 """风险门禁的判定结论，含「模型试图降级被拒」这种要留痕的情况。"""
 
