@@ -1,63 +1,31 @@
-"""ConfirmationConsumptionStore（V3.2 §二 · V3.3 §六）：确认令牌的消费记录。
+"""ConfirmationConsumptionStore：确认令牌的「已消费」记录（V3.2 §二 · V3.3 §六 · V4 §三）。
 
-审核指出的是一个**真实的语义缺口**，而且代码注释自己就承认了：
+三件事在这里叠起来，缺一件这套「一次性审批」就不成立：
 
-    _consumed_confirmations: dict[str, int] = {}      # 进程内存
+1. **跨重启**（V3.2 §二）：记录的签名密钥是稳定的，所以「一次性」若只活在进程内存里，
+   重启后一张仍在 TTL 内的旧票据会复活。判定靠 `jti` 主键 + 原子 INSERT。
+2. **两阶段**（V3.3 §六）：`reserve`（预占，不作废）→ 改业务状态 → `commit`（作废）；
+   业务失败则 `release` 退回。中间那步失败时不该把用户的票据烧掉。
+3. **同一事务**（V4 §三）：现在这张表与 `tasks` / `events` 在**同一个库**里，
+   于是 `/confirm` 能做到「校验并预占票据 → 改 Task 状态 → 写 CONFIRMED 事件 → 作废票据」
+   一次提交。跨文件没有事务——这也是它从独立 `confirmations.db` 搬进来的原因。
 
-而确认令牌的签名密钥在配置了 `SHADOW_API_TOKEN` / `SHADOW_CONFIRM_SECRET` 时是**稳定**的。
-两者相加的后果是「一次性」只在进程生命周期内成立：
+为什么仍然保留「表」这层隔离而不是和 tasks 混一张表：两者的清空语义相反。
+租约/票据类数据在运维上**可以**整体清空（那个任务重新排队就行），
+而审批记录**绝不能**清——清了等于把用过的票据又变成可用的。
+表分开 + 注释写明，比放在不同文件里更容易被正确对待。
 
-    09:00  签发令牌 A
-    09:01  用它确认了一个危险动作
-    09:02  服务重启 —— 记录清空，但签名密钥没变
-    09:03  令牌 A 仍在 TTL 内，签名依然有效 → 它又「可用」了
-
-所以现状是「**进程生命周期内**一次性」，不是「一次性」。这里把它搬到 SQLite：
-`jti` 做主键，判重 = 一条 INSERT，唯一约束由数据库保证——天然是**跨进程 + 跨重启**
-的原子判定。不需要额外加锁，也不可能出现「两个进程同时通过同一个检查」。
-
-## V3.3 §六：两步语义 —— 预占（reserve）与消费（commit）
-
-V3.2 的实现只有一步 `consume`，而调用方（`POST /confirm`）的顺序是：
-
-    消费令牌 → 改业务状态（resolve_confirmation）
-
-于是出现一个**不好但不危险**的窗口：票据已经作废，可业务状态没改成（并发改写、
-任务已结束……）→ 用户看到 409，还必须重新申请一张票据。审核原话是
-「这不是安全漏洞，反而是 fail-safe，但用户体验会比较糟」。
-
-现在拆成三步，把「不可逆」推迟到最后：
-
-    reserve(jti)            # 预占：还没消费，只是先占住这个 jti（原子）
-        ↓
-    改业务状态               # 真正的副作用在这里发生
-        ↓
-    commit(jti)             # 一旦成功，这张票据就永久作废
-    （业务失败则 release(jti) 退回预占，用户可以拿同一张票据重试）
-
-为什么这样仍然安全：
-- **判重语义没变弱**：`reserve` 与 `consume` 一样是主键 + 单条 SQL，两个并发请求
-  不可能同时预占成功；`commit` 之后的行是 `consumed`，任何 `reserve` 都会失败。
-- **`release` 只能退「预占」**，退不掉已消费的记录（`WHERE state='reserved'`）。
-- **卡死的预占会自动过期**：进程在 `reserve` 之后崩溃会留下一个 `reserved` 行，
-  超过 `RESERVE_TTL_SECONDS` 就允许被**同一个 jti** 重新预占（否则这张票据就永久
-  卡住了）。这个 TTL 只影响「崩溃后重试要等多久」，不影响「用过就不能再用」。
-
-为什么用独立的 `confirmations.db` 而不是复用 `lease.db`：
-两者的运维语义是**相反**的。租约在「想让任务重新排队」时**可以**整体清空；
-而已消费的审批票据**绝不能**清空——那等于把用过的票据又变成可用的。
-放在同一个文件里，迟早有人顺手 `DELETE FROM` 全部。分开更安全。
-
-`sqlite3` 是标准库，零额外依赖（与 V3 M3 的 `lease_store` 同一取舍）。
+`sqlite3` 是标准库，零额外依赖。
 """
 from __future__ import annotations
 
 import logging
 import os
 import sqlite3
-import threading
 import time
 from pathlib import Path
+
+from .database import Database
 
 logger = logging.getLogger(__name__)
 
@@ -66,71 +34,107 @@ logger = logging.getLogger(__name__)
 # 60 秒足够覆盖一次确认请求的正常耗时（改状态是本地操作），又短到不至于让人等。
 RESERVE_TTL_SECONDS = float(os.getenv("SHADOW_CONFIRM_RESERVE_TTL_SECONDS", "60"))
 
+_INSERT_FIELDS = (
+    "jti",
+    "task_id",
+    "principal",
+    "fingerprint",
+    "consumed_at",
+    "expires_at",
+    "state",
+    "reserved_at",
+)
+
 
 class ConfirmationConsumptionStore:
-    """基于 SQLite 的确认令牌消费表。
+    """确认票据消费表（表名 `consumed_confirmation`）。"""
 
-    表结构（审核建议的字段都在，方便事后回答「这张票据是谁在用、用在哪」）：
+    def __init__(self, target, *, legacy_path: str | Path | None = None) -> None:
+        """`target` 可以是 `Database`（推荐：与 tasks / events 共享库与事务，§三 需要它）
+        或一个路径（目录 → `<目录>/shadow.db`，`*.db` → 用它本身）。"""
+        self._owns_database = not isinstance(target, Database)
+        self._db = target if isinstance(target, Database) else Database(target)
+        # V3.2 时期的独立文件（`<存储目录>/confirmations.db`）。显式传 `legacy_path`
+        # （`SHADOW_CONFIRM_DB` 指向老文件的场景）时优先用它。
+        self._legacy_path = Path(legacy_path) if legacy_path else self._db.legacy_dir("confirmations.db")
+        self._ensure_columns()
+        imported = self._import_legacy_rows()
+        if imported:
+            logger.info("已把 %d 条历史确认票据记录导入 SQLite（%s）", imported, self._db.path)
 
-        CREATE TABLE consumed_confirmation (
-            jti         TEXT PRIMARY KEY,
-            task_id     TEXT NOT NULL,
-            principal   TEXT NOT NULL,
-            fingerprint TEXT NOT NULL,
-            consumed_at REAL NOT NULL,
-            expires_at  REAL NOT NULL,
-            state       TEXT NOT NULL DEFAULT 'consumed',   -- consumed | reserved
-            reserved_at REAL NOT NULL DEFAULT 0
-        )
+    # ---- 迁移 ----
 
-    只有 `jti` 是主键、其余都是证据字段：**判重只靠主键**，任何字段缺失都不影响
-    「同一张票据不能用第二次」这条语义。
+    def _ensure_columns(self) -> None:
+        """补齐 `state` / `reserved_at` 两列。
 
-    `state` / `reserved_at` 是 V3.3 §六 加的（两阶段：先预占、后消费）。
-    老库（V3.2 建的、只有 6 列）在 `__init__` 里自动补列——历史行都是已消费的，
-    所以默认值取 `'consumed'` 正是它们真实的状态。
-    """
-
-    def __init__(self, path: str | Path) -> None:
-        self._path = str(path)
-        Path(self._path).parent.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.RLock()
-        self._conn = sqlite3.connect(self._path, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS consumed_confirmation (
-                jti         TEXT PRIMARY KEY,
-                task_id     TEXT NOT NULL,
-                principal   TEXT NOT NULL,
-                fingerprint TEXT NOT NULL,
-                consumed_at REAL NOT NULL,
-                expires_at  REAL NOT NULL,
-                state       TEXT NOT NULL DEFAULT 'consumed',
-                reserved_at REAL NOT NULL DEFAULT 0
-            )
-            """
-        )
-        self._migrate_legacy_columns()
-        self._conn.commit()
-
-    def _migrate_legacy_columns(self) -> None:
-        """给 V3.2 建的老表补上 `state` / `reserved_at`。
-
-        为什么值得写这段：直接 `ALTER TABLE ADD COLUMN` 只有在列不存在时才成功，
-        所以先查 `PRAGMA table_info`；不查的话第二次启动就会抛 `duplicate column`。
-        历史行没有 state 字段，而它们全部是**已消费**的（V3.2 只有那一种语义），
-        因此默认值 `'consumed'` 不是「随便填的」。
+        主库里的表由迁移 v3 建好，这里其实是**给老文件兜底**：`SHADOW_CONFIRM_DB`
+        指向一个 V3.2 时期建的表（6 列）时，`CREATE TABLE IF NOT EXISTS` 是空操作，
+        少了两列会让所有读写直接报错。判断列存在必须靠 `PRAGMA table_info`——
+        直接 `ALTER TABLE ADD COLUMN` 在第二次启动时会抛 `duplicate column`。
         """
-        columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(consumed_confirmation)")}
+        columns = {
+            row["name"]
+            for row in self._db.query("PRAGMA table_info(consumed_confirmation)")
+        }
+        if not columns:
+            return
         if "state" not in columns:
-            self._conn.execute(
+            self._db.execute(
                 "ALTER TABLE consumed_confirmation ADD COLUMN state TEXT NOT NULL DEFAULT 'consumed'"
             )
         if "reserved_at" not in columns:
-            self._conn.execute(
+            self._db.execute(
                 "ALTER TABLE consumed_confirmation ADD COLUMN reserved_at REAL NOT NULL DEFAULT 0"
             )
+        # 索引在这里建（不在迁移里）：见 `storage/migrations/__init__.py` 的说明——
+        # 老表缺列时迁移里的索引语句会让「升级」变成「起不来」。
+        # 放在补齐列之后，它就永远是安全的，而且对已经跑过迁移的老库也是自愈的。
+        self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_confirmation_state ON consumed_confirmation(state)"
+        )
+
+    def _import_legacy_rows(self) -> int:
+        """把旧的独立 `confirmations.db` 里已消费的 jti 搬进主库（只做一次）。
+
+        **这一步必须做**：「一次性」完全依赖这张表。升级时把它丢在一边，
+        那些**升级前用过、仍在 TTL 内**的票据就会重新可用——而那正是 V3.2 §二 修掉的洞。
+        旧文件保持不动（它是证据），只在表空且文件存在时搬。
+        """
+        legacy = self._legacy_path
+        if legacy is None or not legacy.exists() or self.count() > 0:
+            return 0
+        if Path(self._db.path).resolve() == legacy.resolve():
+            return 0  # 就是同一个文件（老部署直接把它当主库用），没什么可搬
+
+        try:
+            source = sqlite3.connect(f"file:{legacy}?mode=ro", uri=True)
+            source.row_factory = sqlite3.Row
+            rows = source.execute("SELECT * FROM consumed_confirmation").fetchall()
+            source.close()
+        except sqlite3.Error as exc:
+            logger.warning("读取旧确认票据库失败（%s）：%s", legacy, exc)
+            return 0
+
+        imported = 0
+        for row in rows:
+            keys = set(row.keys())
+            self._db.execute(
+                "INSERT OR IGNORE INTO consumed_confirmation "
+                "(jti, task_id, principal, fingerprint, consumed_at, expires_at, state, reserved_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    row["jti"],
+                    row["task_id"] if "task_id" in keys else "",
+                    row["principal"] if "principal" in keys else "",
+                    row["fingerprint"] if "fingerprint" in keys else "",
+                    row["consumed_at"] if "consumed_at" in keys else 0.0,
+                    row["expires_at"] if "expires_at" in keys else 0.0,
+                    row["state"] if "state" in keys else "consumed",
+                    row["reserved_at"] if "reserved_at" in keys else 0.0,
+                ),
+            )
+            imported += 1
+        return imported
 
     # ---- 一步式（V3.2 语义，保留给不需要「改状态」的调用方与老测试）----
 
@@ -146,29 +150,32 @@ class ConfirmationConsumptionStore:
     ) -> bool:
         """原子消费这个 jti。返回 False 表示**之前已经被消费（或占着）**。
 
-        实现就是一条 INSERT：主键冲突由 SQLite 抛出 `IntegrityError`，我们把它翻译成
-        「已消费」。这就是跨进程的 CAS——不需要先 SELECT 再判断，那两步之间永远有窗口。
+        实现是「同一事务里先查再插」：事务一开始就拿了写锁（`BEGIN IMMEDIATE`），
+        所以「查」与「插」之间没有窗口——跨进程的第二个请求会先等锁，
+        等到了就已经能看见第一个请求提交的行。
+
+        为什么不写成单条 `INSERT` 靠主键冲突判重（V3.3 之前那样）：`reserve` 留下的
+        **`reserved` 行也要挡住 `consume`**（预占中的票据不能被另一条路径消费掉），
+        而单条 INSERT 只看主键冲突、分不清状态。`IntegrityError` 仍然兜着——
+        它是最后一道保险，不是主判据。
         """
         if not jti:
             return False
         current = time.time() if now is None else now
-        with self._lock:
-            try:
-                self._conn.execute(
-                    """
-                    INSERT INTO consumed_confirmation
-                        (jti, task_id, principal, fingerprint, consumed_at, expires_at, state, reserved_at)
-                    VALUES (?, ?, ?, ?, ?, ?, 'consumed', ?)
-                    """,
+        try:
+            with self._db.transaction():
+                if self._reserved_or_consumed(jti):
+                    return False
+                self._db.execute(
+                    "INSERT INTO consumed_confirmation "
+                    "(jti, task_id, principal, fingerprint, consumed_at, expires_at, state, reserved_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, 'consumed', ?)",
                     (jti, task_id, principal, fingerprint, current, expires_at, current),
                 )
-                self._conn.commit()
-            except sqlite3.IntegrityError:
-                return False
-            # 顺手清掉过期记录，避免这张表无限增长。放在消费之后：先保证「判重」，
-            # 清理只是维护动作，失败也不该让消费失败。
-            self._prune_quietly(now=current)
-            return True
+        except sqlite3.IntegrityError:
+            return False
+        self._prune_quietly(now=current)
+        return True
 
     # ---- 两步式（V3.3 §六）----
 
@@ -187,18 +194,20 @@ class ConfirmationConsumptionStore:
         一条 SQL 完成「插入或接管过期预占」：
 
         - 没有这个 jti → 插入 `reserved` 行 → 成功；
-        - 已有 `consumed` 行 → `WHERE` 不成立，更新被跳过 → 返回 False（用过就是用过）；
-        - 已有**新鲜的** `reserved` 行 → 同样跳过 → 返回 False（另一个请求正在处理它）；
+        - 已有 `consumed` 行 → `WHERE` 不成立，更新被跳过 → False（用过就是用过）；
+        - 已有**新鲜的** `reserved` 行 → 同样跳过 → False（另一个请求正在处理它）；
         - 已有**过期**的 `reserved` 行 → 接管（崩在中间的预占不该把票据永久卡死）。
 
-        `cursor.rowcount` 是这里的判据：0 表示那条 `WHERE` 挡住了更新，也就是「没占上」。
+        `cursor.rowcount` 是判据：0 表示那条 `WHERE` 挡住了更新，也就是「没占上」。
+        它可以**加入外层事务**（§三）：`/confirm` 里预占、提交、退回都在同一个事务里，
+        任何一步失败都会把它们一起回滚。
         """
         if not jti:
             return False
         current = time.time() if now is None else now
         stale_before = current - RESERVE_TTL_SECONDS
-        with self._lock:
-            cursor = self._conn.execute(
+        with self._db.transaction():
+            affected = self._db.execute(
                 """
                 INSERT INTO consumed_confirmation
                     (jti, task_id, principal, fingerprint, consumed_at, expires_at, state, reserved_at)
@@ -215,8 +224,7 @@ class ConfirmationConsumptionStore:
                 """,
                 (jti, task_id, principal, fingerprint, expires_at, current, stale_before),
             )
-            self._conn.commit()
-            reserved = cursor.rowcount == 1
+        reserved = affected == 1
         if reserved:
             self._prune_quietly(now=current)
         return reserved
@@ -232,42 +240,43 @@ class ConfirmationConsumptionStore:
         """把预占转成**已消费**（「一次性」就此永久生效）。False = 没有可提交的预占。
 
         `expires_at` 只为与内存守卫的签名保持一致而接受——过期时刻在 `reserve`
-        那一刻已经记在这行里了，这里不需要重写。`**_evidence` 同理（证据字段已在
-        reserve 时落库）。
+        那一刻已经记在这行里了。`**_evidence` 同理（证据字段已在 reserve 时落库）。
         """
         if not jti:
             return False
         current = time.time() if now is None else now
-        with self._lock:
-            cursor = self._conn.execute(
-                """
-                UPDATE consumed_confirmation
-                   SET state = 'consumed', consumed_at = ?
-                 WHERE jti = ? AND state = 'reserved'
-                """,
-                (current, jti),
-            )
-            self._conn.commit()
-            return cursor.rowcount == 1
+        affected = self._db.execute(
+            "UPDATE consumed_confirmation SET state = 'consumed', consumed_at = ? "
+            "WHERE jti = ? AND state = 'reserved'",
+            (current, jti),
+        )
+        return affected == 1
 
     def release(self, jti: str, **_evidence) -> bool:
         """退回预占，让同一张票据可以重试。**已消费的记录退不掉**（`WHERE` 挡住）。
 
-        这是 V3.3 §六 的关键一步：审核指出「票据已作废但业务没做成」时用户必须重新
-        申请票据。有了它，那种情况下票据会被退回——毕竟**危险动作没有发生**，
+        V3.3 §六 的关键一步：业务没做成时票据会被退回——毕竟危险动作没有发生，
         把票据烧掉只是让用户多点一次。
+        V4 §三 之后还有一条更强的路径：整个 `/confirm` 在一个事务里，
+        中途失败由**回滚**把预占一起撤掉（不需要显式 release）。
+        这里保留它，给「事务之外」的调用方与测试用。
         """
         if not jti:
             return False
-        with self._lock:
-            cursor = self._conn.execute(
-                "DELETE FROM consumed_confirmation WHERE jti = ? AND state = 'reserved'",
-                (jti,),
+        return (
+            self._db.execute(
+                "DELETE FROM consumed_confirmation WHERE jti = ? AND state = 'reserved'", (jti,)
             )
-            self._conn.commit()
-            return cursor.rowcount == 1
+            == 1
+        )
 
     # ---- 查询与维护 ----
+
+    def _reserved_or_consumed(self, jti: str) -> bool:
+        row = self._db.query_one(
+            "SELECT 1 FROM consumed_confirmation WHERE jti = ?", (jti,)
+        )
+        return row is not None
 
     def is_consumed(self, jti: str) -> bool:
         """只读查询：这张票据**已经用掉了**吗（预占中的不算）。
@@ -275,20 +284,16 @@ class ConfirmationConsumptionStore:
         预占中的票据还没有产生任何业务效果，所以它在审计上不该显示成「已使用」——
         要不要区分这两者，正是 V3.3 §六 那个问题的核心。
         """
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT 1 FROM consumed_confirmation WHERE jti = ? AND state = 'consumed'",
-                (jti,),
-            ).fetchone()
+        row = self._db.query_one(
+            "SELECT 1 FROM consumed_confirmation WHERE jti = ? AND state = 'consumed'", (jti,)
+        )
         return row is not None
 
     def is_reserved(self, jti: str) -> bool:
         """只读查询：这张票据正在被某次请求处理（预占中）。"""
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT 1 FROM consumed_confirmation WHERE jti = ? AND state = 'reserved'",
-                (jti,),
-            ).fetchone()
+        row = self._db.query_one(
+            "SELECT 1 FROM consumed_confirmation WHERE jti = ? AND state = 'reserved'", (jti,)
+        )
         return row is not None
 
     def prune_expired(self, *, now: float | None = None) -> int:
@@ -298,12 +303,9 @@ class ConfirmationConsumptionStore:
         （`_verify_and_parse` 会先判过期），留着记录不再提供任何保护，只是占空间。
         """
         current = time.time() if now is None else now
-        with self._lock:
-            cursor = self._conn.execute(
-                "DELETE FROM consumed_confirmation WHERE expires_at < ?", (current,)
-            )
-            self._conn.commit()
-            return cursor.rowcount
+        return self._db.execute(
+            "DELETE FROM consumed_confirmation WHERE expires_at < ?", (current,)
+        )
 
     def _prune_quietly(self, *, now: float) -> None:
         try:
@@ -313,25 +315,20 @@ class ConfirmationConsumptionStore:
 
     def record(self, jti: str) -> dict | None:
         """取一条记录（排查「这张票据被谁在什么时候用掉了 / 正被谁占着」）。"""
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT * FROM consumed_confirmation WHERE jti = ?", (jti,)
-            ).fetchone()
+        row = self._db.query_one(
+            "SELECT * FROM consumed_confirmation WHERE jti = ?", (jti,)
+        )
         return dict(row) if row is not None else None
 
     def count(self) -> int:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT COUNT(*) AS n FROM consumed_confirmation"
-            ).fetchone()
+        row = self._db.query_one("SELECT COUNT(*) AS n FROM consumed_confirmation")
         return int(row["n"])
 
     def clear(self) -> None:
         """清空全部记录。**只给测试用**——生产上清空等于让用过的票据复活。"""
-        with self._lock:
-            self._conn.execute("DELETE FROM consumed_confirmation")
-            self._conn.commit()
+        self._db.execute("DELETE FROM consumed_confirmation")
 
     def close(self) -> None:
-        with self._lock:
-            self._conn.close()
+        """只关自己开的连接；共享 `Database` 时不动它（别的 store 还在用）。"""
+        if self._owns_database:
+            self._db.close()
