@@ -143,17 +143,18 @@ class Event:
 class EventLog:
     """追加式事件日志（SQLite 表 `events`）。"""
 
-    def __init__(self, root: str | Path) -> None:
-        """`root` 可以是**目录**（历史用法：库落在 `<root>/events.db`）或一个 `.db` 路径。
+    def __init__(self, target) -> None:
+        """`target` 可以是 `Database`（推荐：与 TaskStore / CheckpointStore 共享一个库与
+        事务，§三 的「同一事务」就靠它）或一个路径：目录 → `<目录>/shadow.db`，
+        `*.db` → 用它本身。
 
-        保留「传目录」这种用法是有意的：三十多个调用点都在传
-        `STORAGE_DIR / "events"`，而这次改的是存储不是用法。
+        保留「传目录」这种用法是有意的：调用点都在传 `STORAGE_DIR`，
+        而这次改的是存储不是用法。
         """
-        target = Path(root)
-        self._legacy_root = target if target.suffix != ".db" else target.parent
-        db_path = target if target.suffix == ".db" else target / "events.db"
-        self.path = str(db_path)
-        self._store = EventStore(db_path)
+        self._store = EventStore(target)
+        self.path = self._store.path
+        # V4 之前事件写在 `<存储目录>/events/*.jsonl`；迁移时按这个约定导入
+        self._legacy_root = self._store.legacy_dir("events")
         imported = self._import_legacy_jsonl()
         if imported:
             logger.info("已把 %d 条历史 JSONL 事件导入 SQLite（%s）", imported, self.path)

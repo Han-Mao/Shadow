@@ -16,19 +16,21 @@ JSONL 那版（V3.3 §一/§二）解决的是**落盘可靠性**——`write �
 唯一约束 `UNIQUE(task_id, sequence)` 是最后一道保险——序号万一算重，数据库直接拒掉，
 不会静默写出两条同样的序号。
 
-落盘强度由 `database.connect()` 的 `synchronous=FULL` 给：**commit 返回即落盘**。
+落盘强度由 `Database` 的 `synchronous=FULL` 给：**commit 返回即落盘**。
 这与 JSONL 版 `fsync` 是同一个语义，但由数据库保证，而且天然覆盖「一个事务里的多条写入」。
+
+V4 §三 起它还能**加入外层事务**（`Database.transaction()` 可重入）：`/confirm` 要在一个
+事务里写完「票据 + Task 状态 + 事件」，靠的就是这一点。
 """
 from __future__ import annotations
 
 import json
 import sqlite3
-import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
 
-from . import database
+from .database import Database
 
 
 class EventStore:
@@ -38,12 +40,11 @@ class EventStore:
     「事件是什么」由 `storage/event_log.py` 定义（它再把行翻译成 `Event`）。
     """
 
-    def __init__(self, path: str | Path) -> None:
-        self.path = str(path)
-        self._conn = database.connect(self.path)
-        # 进程内串行：SQLite 的连接对象不是线程安全的，而 API 线程与后台 worker 会共用它。
-        # 跨进程的互斥由 BEGIN IMMEDIATE + busy_timeout 负责（见 database.py）。
-        self._lock = threading.RLock()
+    def __init__(self, target) -> None:
+        """`target` 可以是 `Database`（推荐：与 TaskStore / CheckpointStore 共享库与事务）
+        或一个路径（目录 → `<目录>/shadow.db`，`*.db` → 用它本身）。"""
+        self._db = target if isinstance(target, Database) else Database(target)
+        self.path = str(self._db.path)
 
     # ---- 写 ----
 
@@ -64,6 +65,9 @@ class EventStore:
 
         `event_id` / `created_at` 只在**导入历史数据**时显式传：那时要保留原来的身份与
         时间，否则搬过来的事件会看起来「全都发生在导入那一刻」。
+
+        这个方法**自己不提交**任何额外东西：它是"加入当前事务"的——外层若有事务
+        （§三 的 `/confirm`），这条事件与外面的写入同生共死。
         """
         payload = json.dumps(data or {}, ensure_ascii=False)
         event_id = event_id or uuid.uuid4().hex[:8]
@@ -75,47 +79,46 @@ class EventStore:
         principal = str(source.get("principal") or "")
         device_id = str(source.get("device_id") or source.get("device") or "")
 
-        with self._lock:
-            for attempt in (1, 2):
-                try:
-                    with database.transaction(self._conn) as conn:
-                        row = conn.execute(
-                            "SELECT COALESCE(MAX(sequence), 0) + 1 AS next "
-                            "FROM events WHERE task_id = ?",
-                            (task_id,),
-                        ).fetchone()
-                        sequence = int(row["next"])
-                        conn.execute(
-                            "INSERT INTO events (event_id, task_id, execution_id, principal, "
-                            "device_id, kind, created_at, sequence, payload) "
-                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                            (
-                                event_id,
-                                task_id,
-                                execution_id,
-                                principal,
-                                device_id,
-                                kind,
-                                created_at,
-                                sequence,
-                                payload,
-                            ),
-                        )
-                    return {
-                        "event_id": event_id,
-                        "task_id": task_id,
-                        "execution_id": execution_id,
-                        "principal": principal,
-                        "device_id": device_id,
-                        "kind": kind,
-                        "created_at": created_at,
-                        "sequence": sequence,
-                        "payload": payload,
-                    }
-                except sqlite3.IntegrityError:
-                    if attempt == 2:
-                        raise
-                    continue
+        for attempt in (1, 2):
+            try:
+                with self._db.transaction():
+                    row = self._db.query_one(
+                        "SELECT COALESCE(MAX(sequence), 0) + 1 AS next "
+                        "FROM events WHERE task_id = ?",
+                        (task_id,),
+                    )
+                    sequence = int(row["next"])
+                    self._db.execute(
+                        "INSERT INTO events (event_id, task_id, execution_id, principal, "
+                        "device_id, kind, created_at, sequence, payload) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            event_id,
+                            task_id,
+                            execution_id,
+                            principal,
+                            device_id,
+                            kind,
+                            created_at,
+                            sequence,
+                            payload,
+                        ),
+                    )
+                return {
+                    "event_id": event_id,
+                    "task_id": task_id,
+                    "execution_id": execution_id,
+                    "principal": principal,
+                    "device_id": device_id,
+                    "kind": kind,
+                    "created_at": created_at,
+                    "sequence": sequence,
+                    "payload": payload,
+                }
+            except sqlite3.IntegrityError:
+                if attempt == 2:
+                    raise
+                continue
         raise AssertionError("不可达")  # pragma: no cover
 
     # ---- 读 ----
@@ -126,54 +129,55 @@ class EventStore:
         先按序号倒序取 limit 条、再翻回升序：要的是「最近的 N 条」，但读出来必须是
         时间顺序——反过来的话回放会把因果颠倒过来。
         """
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT * FROM (SELECT * FROM events WHERE task_id = ? "
-                "ORDER BY sequence DESC LIMIT ?) ORDER BY sequence ASC",
-                (task_id, int(limit)),
-            ).fetchall()
+        rows = self._db.query(
+            "SELECT * FROM (SELECT * FROM events WHERE task_id = ? "
+            "ORDER BY sequence DESC LIMIT ?) ORDER BY sequence ASC",
+            (task_id, int(limit)),
+        )
         return [dict(row) for row in rows]
 
     def kinds(self, task_id: str) -> list[str]:
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT kind FROM events WHERE task_id = ? ORDER BY sequence ASC", (task_id,)
-            ).fetchall()
+        rows = self._db.query(
+            "SELECT kind FROM events WHERE task_id = ? ORDER BY sequence ASC", (task_id,)
+        )
         return [row["kind"] for row in rows]
 
     def read_by_execution(self, execution_id: str, limit: int = 200) -> list[dict]:
         """按 `execution_id` 取事件——V4 §五 那条「一次执行串起全链条」的入口。"""
         if not execution_id:
             return []
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT * FROM (SELECT * FROM events WHERE execution_id = ? "
-                "ORDER BY created_at DESC, sequence DESC LIMIT ?) "
-                "ORDER BY created_at ASC, sequence ASC",
-                (execution_id, int(limit)),
-            ).fetchall()
+        rows = self._db.query(
+            "SELECT * FROM (SELECT * FROM events WHERE execution_id = ? "
+            "ORDER BY created_at DESC, sequence DESC LIMIT ?) "
+            "ORDER BY created_at ASC, sequence ASC",
+            (execution_id, int(limit)),
+        )
         return [dict(row) for row in rows]
 
     # ---- 维护与自省 ----
 
+    def legacy_dir(self, name: str) -> Path:
+        """旧版「一个 store 一个目录」时的目录（迁移导入用）。"""
+        return self._db.legacy_dir(name)
+
     def task_ids(self) -> list[str]:
         """出现过事件的任务 id（`scripts/replay_task.py` 用它列出可回放的任务）。"""
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT DISTINCT task_id FROM events ORDER BY task_id"
-            ).fetchall()
+        rows = self._db.query("SELECT DISTINCT task_id FROM events ORDER BY task_id")
         return [row["task_id"] for row in rows]
 
     def count(self, task_id: str | None = None) -> int:
-        with self._lock:
-            if task_id is None:
-                row = self._conn.execute("SELECT COUNT(*) AS n FROM events").fetchone()
-            else:
-                row = self._conn.execute(
-                    "SELECT COUNT(*) AS n FROM events WHERE task_id = ?", (task_id,)
-                ).fetchone()
+        if task_id is None:
+            row = self._db.query_one("SELECT COUNT(*) AS n FROM events")
+        else:
+            row = self._db.query_one(
+                "SELECT COUNT(*) AS n FROM events WHERE task_id = ?", (task_id,)
+            )
         return int(row["n"])
 
+    def delete_for_task(self, task_id: str) -> int:
+        """删掉某个任务的全部事件（测试与运维清理用）。"""
+        return self._db.execute("DELETE FROM events WHERE task_id = ?", (task_id,))
+
     def close(self) -> None:
-        with self._lock:
-            self._conn.close()
+        """只关连接——**共享 `Database` 时不要调它**（别的 store 还在用同一个连接）。"""
+        self._db.close()

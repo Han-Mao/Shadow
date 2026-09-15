@@ -56,6 +56,7 @@ from models.task import RECOVERY_ERROR, TaskPriority, TaskStatus
 from storage import (
     CheckpointStore,
     ConfirmationConsumptionStore,
+    Database,
     EventLog,
     ExecutionStore,
     TaskStore,
@@ -157,13 +158,18 @@ logger.info("设备后端：%s", describe_backend(resolve_device_serial()))
 # 事件日志服务事后追溯（只追加）。
 # V2.4 起它还要接一件更早的事——TaskStore 发现损坏任务时在这里留一条 TASK_CORRUPTED，
 # 所以必须先于 task_store 构造。
-event_log = EventLog(STORAGE_DIR / "events")
+#
+# V4 §二/§三：任务、恢复点、事件现在在**同一个数据库**（`<STORAGE_DIR>/shadow.db`）。
+# 一个 `Database` 对象 = 一个连接 + 一套迁移 + **可重入事务**，于是 §三 要的
+# 「确认票据 + Task 状态 + 事件同一个事务」才有可能。旧的 `tasks/*.json` /
+# `checkpoints/*.json` / `events/*.jsonl` 会在各 store 构造时一次性导入，升级不丢数据。
+db = Database(STORAGE_DIR)
+event_log = EventLog(db)
+task_store = TaskStore(db, event_log=event_log)
+checkpoint_store = CheckpointStore(db)
 # 执行记录（V4 §一）：手工端点每次调用一条，`execution_id` 同时是它的事件流所有者。
-# 与事件日志分开存——事件记「过程」，执行记录记「身份与结果」，两者按 id 关联。
+# 它仍然是「一执行一文件」——每条记录彼此无关，没有跨记录事务的需求。
 execution_store = ExecutionStore(STORAGE_DIR / "executions")
-# 损坏任务的隔离与留痕都挂在同一个日志上（V2.4 §十）
-task_store = TaskStore(STORAGE_DIR / "tasks", event_log=event_log)
-checkpoint_store = CheckpointStore(STORAGE_DIR / "checkpoints")
 
 # ---- 确认令牌的「已消费」记录（V3.2 §二）----
 #
@@ -174,11 +180,14 @@ checkpoint_store = CheckpointStore(STORAGE_DIR / "checkpoints")
 # 生产路径换成 SQLite：jti 是主键，消费是一条 INSERT，唯一约束由数据库保证，
 # 天然是跨进程 + 跨重启的原子 consume。`SHADOW_CONFIRM_DB` 可显式指定位置
 # （多个实例要共享「谁用过这张票据」时必须指向同一个文件）。
-auth.configure_consumption(
-    ConfirmationConsumptionStore(
-        os.getenv("SHADOW_CONFIRM_DB", "").strip() or (STORAGE_DIR / "confirmations.db")
-    )
-)
+# V4 §三：票据表与 tasks / events 现在在**同一个库**里（`shadow.db`），
+# 所以 `/confirm` 能把「校验并预占票据 → 改 Task 状态 → 写 CONFIRMED 事件 → 作废票据」
+# 放进**一个事务**——跨文件是没有事务的，这是它从独立 `confirmations.db` 搬进来的原因。
+#
+# `SHADOW_CONFIRM_DB` 仍然可以覆盖（多实例必须共享「谁用过这张票据」时用），
+# 但要清楚它的代价：指向**另一个文件**时跨库没有事务，§三 的原子性只在默认布局下成立。
+_confirm_db = os.getenv("SHADOW_CONFIRM_DB", "").strip()
+auth.configure_consumption(ConfirmationConsumptionStore(_confirm_db or db))
 # 轨迹落盘（V2.1）：长跑任务重启后不能「失忆」——恢复点在，但前面几步干了什么也得在
 trajectory = TrajectoryStore(root=STORAGE_DIR / "trajectories")
 # 请求审计（V2.2 §九）：回答「谁在什么时候调了什么、被批准还是被拒绝」
@@ -1355,61 +1364,63 @@ def confirm_task(task_id: str, req: ConfirmRequest, request: Request):
     if kind == "none":
         raise HTTPException(status_code=409, detail="该任务当前没有待确认的动作或完成裁定")
 
-    if auth.enabled():
-        pending = runtime.pending_confirmation(task_id)
-        # 没有 pending 动作时，指纹取确认类型（goal / recovery）——它们同样要绑进令牌，
-        # 否则「完成裁定令牌」和「崩溃恢复放行令牌」可以互换（V2.6 §七）
-        fingerprint = (
-            pending.fingerprint if pending is not None else manager.confirmation_kind(task_id)
-        )
-        # V3.3 §六：先**预占**票据，业务状态改成功之后才 commit。
-        # 老顺序是「先消费、再改状态」，遇到并发冲突时票据已经烧掉而动作没执行，
-        # 用户必须重新申请一张票据（审核原话：fail-safe，但体验糟）。
-        ok, reason, jti = auth.reserve_confirmation_token(
-            req.token, principal.name, task_id, fingerprint, task.version
-        )
-        if not ok:
-            if _AUDIT:
-                audit_log.record(
-                    method="POST",
-                    path=request.url.path,
-                    principal=principal.name,
-                    status=403,
-                    note=f"confirmation denied: {reason}",
-                )
-            raise HTTPException(
-                status_code=403,
-                detail=(
-                    f"确认未通过（{reason}）：请先 POST /tasks/{{id}}/confirmation-token "
-                    "申请令牌，再把返回的 token 传到这里"
-                ),
+    # V4 §三：整段放进**一个事务**——「预占票据 → 改 Task 状态 → 写 CONFIRMED 事件 →
+    # 作废票据」要么全成功、要么全回滚。审核点出的两种跨存储状态因此都不可能出现：
+    #
+    #     Task 已确认 / Token 未消费      → 不可能（同一事务）
+    #     Token 已消费 / Task 没确认      → 不可能（同上）
+    #
+    # 内层会**加入**这个事务而不是各开一个（`Database.transaction()` 可重入）：
+    # `manager.resolve_confirmation` 里最终落到 `TaskStore.save`，写 `CONFIRMED`
+    # 又是安全关键事件（fail-closed）——写不下就整笔回滚，正是我们要的。
+    #
+    # 409 那条路径也不再需要显式 `release`：**回滚本身就把预占一起撤销**。
+    # （`release` 仍然保留给事务之外的调用方，见 `storage/confirmation_store.py`。）
+    with db.transaction():
+        if auth.enabled():
+            pending = runtime.pending_confirmation(task_id)
+            # 没有 pending 动作时，指纹取确认类型（goal / recovery）——它们同样要绑进令牌，
+            # 否则「完成裁定令牌」和「崩溃恢复放行令牌」可以互换（V2.6 §七）
+            fingerprint = (
+                pending.fingerprint
+                if pending is not None
+                else manager.confirmation_kind(task_id)
             )
-    else:
-        jti = ""
+            # V3.3 §六 的两阶段：先**预占**（不作废），业务状态改成功之后才 commit。
+            # V4 §三 起这两步与「改状态」共处一个事务，中途失败由回滚兜底。
+            ok, reason, jti = auth.reserve_confirmation_token(
+                req.token, principal.name, task_id, fingerprint, task.version
+            )
+            if not ok:
+                if _AUDIT:
+                    audit_log.record(
+                        method="POST",
+                        path=request.url.path,
+                        principal=principal.name,
+                        status=403,
+                        note=f"confirmation denied: {reason}",
+                    )
+                raise HTTPException(
+                    status_code=403,
+                    detail=(
+                        f"确认未通过（{reason}）：请先 POST /tasks/{{id}}/confirmation-token "
+                        "申请令牌，再把返回的 token 传到这里"
+                    ),
+                )
+        else:
+            jti = ""
 
-    # 状态写入全部收口到 TaskManager（V2.2 §九 / §十）：API 不再自己 task.mark(...)
-    try:
+        # 状态写入全部收口到 TaskManager（V2.2 §九 / §十）：API 不再自己 task.mark(...)
         resolved = manager.resolve_confirmation(task_id, approved=req.approved)
-    except Exception:
-        # 业务没做成 → 退回预占，同一张票据可以重试。**危险动作没有发生，就不该烧票据。**
-        if jti:
-            auth.release_confirmation_token(jti)
-        raise
+        if resolved is None:
+            raise HTTPException(status_code=409, detail="该任务当前没有可处理的待确认事项")
 
-    if resolved is None:
-        if jti:
-            auth.release_confirmation_token(jti)
-        raise HTTPException(status_code=409, detail="该任务当前没有可处理的待确认事项")
-
-    if jti and not auth.commit_confirmation_token(jti):
-        # 状态已经改成功了，所以**不回滚业务**——只是这张票据停在「预占」状态，
-        # 直到 RESERVE_TTL_SECONDS 之后才能被重新预占。这比「票据已烧、业务没做」好：
-        # 前者最坏是「重试要等一会儿」，后者是「用户白点一次还得重新申请」。
-        logger.warning(
-            "确认令牌预占提交失败（业务状态已变更，票据将停在预占状态）：jti=%s task=%s",
-            jti,
-            task_id,
-        )
+        if jti and not auth.commit_confirmation_token(jti):
+            # 同一个事务里「状态改了但票据没作废」在逻辑上不该发生；真出现就留痕，
+            # 事务会照常提交（因为业务状态确实变了，回滚它反而更糟）。
+            logger.warning(
+                "确认令牌预占提交失败（同一事务内）：jti=%s task=%s", jti, task_id
+            )
 
     return {
         "ok": True,

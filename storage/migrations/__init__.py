@@ -43,7 +43,74 @@ _EVENTS_V1 = [
     "CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind)",
 ]
 
-MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = ((1, tuple(_EVENTS_V1)),)
+# 任务与恢复点（V4 §二 —— 审核「unify task/checkpoint/event storage」那一步）。
+#
+# 为什么把它们从「一个实体一个 JSON 文件」搬进表里：
+# - **跨文件一致性**：Checkpoint 与 Task 指针此前是两个文件两次写入，中间崩溃就留下
+#   孤儿恢复点（靠启动清理事后补救）。同一个库里它们可以在**一个事务**里提交（V4 §三）。
+# - **查询**：`status` / `created_at` 是真列，于是「现在有多少 running」「谁最新」不必
+#   解析每一份 JSON。
+# - **CAS 更直接**：原来靠 `JsonStore.update_atomic` 把「读-比较-递增-写」塞进同一把锁；
+#   现在是 `BEGIN IMMEDIATE` 里读一次 revision 再写，锁由数据库给（跨进程也成立）。
+#
+# `payload` 是权威内容，`status` / `created_at` / `revision` 是**派生列**（与 events 的
+# 关联列同一个口径）：它们只服务于查询与 CAS，读出来仍然以 payload 为准。
+_TASKS_V2 = [
+    """
+    CREATE TABLE IF NOT EXISTS tasks (
+        task_id    TEXT PRIMARY KEY,
+        revision   INTEGER NOT NULL,
+        status     TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        payload    TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)",
+    "CREATE INDEX IF NOT EXISTS idx_tasks_created ON tasks(created_at)",
+    """
+    CREATE TABLE IF NOT EXISTS checkpoints (
+        task_id       TEXT NOT NULL,
+        checkpoint_id TEXT NOT NULL,
+        created_at    TEXT NOT NULL DEFAULT '',
+        payload       TEXT NOT NULL,
+        PRIMARY KEY (task_id, checkpoint_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_checkpoints_task ON checkpoints(task_id, checkpoint_id)",
+]
+
+# 确认票据的消费记录（V4 §三 —— 审核「confirmation 必须进入同一事务」那一步）。
+#
+# V3.2 起它已经在 SQLite 上（`jti` 主键 + 原子 INSERT），但放在**另一个文件**里
+# （`confirmations.db`）。审核 §三 要的是：「校验票据 → 改 Task 状态 → 写事件 → 作废票据」
+# 在一个事务里。跨文件没有事务，所以表搬进主库——于是 §三 才有可能成立。
+#
+# 表结构沿用 V3.3 §六 的两阶段（`state` = reserved | consumed），
+# 因为那套语义（预占 → 提交 / 退回）正是 §三 事务里要用的东西。
+_CONFIRMATIONS_V3 = [
+    """
+    CREATE TABLE IF NOT EXISTS consumed_confirmation (
+        jti         TEXT PRIMARY KEY,
+        task_id     TEXT NOT NULL DEFAULT '',
+        principal   TEXT NOT NULL DEFAULT '',
+        fingerprint TEXT NOT NULL DEFAULT '',
+        consumed_at REAL NOT NULL DEFAULT 0,
+        expires_at  REAL NOT NULL DEFAULT 0,
+        state       TEXT NOT NULL DEFAULT 'consumed',
+        reserved_at REAL NOT NULL DEFAULT 0
+    )
+    """,
+    # 索引**故意不在这里**建：`SHADOW_CONFIRM_DB` 指向一个 V3.2 时期的老表（6 列、没有
+    # `state`）时，`CREATE TABLE IF NOT EXISTS` 是空操作，而这条索引会因缺列直接报错——
+    # 那会把「升级老部署」变成「起不来」。索引改由
+    # `ConfirmationConsumptionStore._ensure_columns()` 在补齐列之后创建（它是自愈的）。
+]
+
+MIGRATIONS = (
+    (1, tuple(_EVENTS_V1)),
+    (2, tuple(_TASKS_V2)),
+    (3, tuple(_CONFIRMATIONS_V3)),
+)
 
 
 def apply_migrations(conn: sqlite3.Connection) -> list[int]:
