@@ -98,14 +98,3 @@ Core 仍跑在电脑上，手机只装一个「设备端点」APK，两者走局
 | **纯 Kotlin（零 androidx）** | 手机设备层只用 `android.*`/`java.*`/`org.json`，所以无需 Android Studio 也能 `aapt2+kotlinc+d8` 打出 APK |
 | **VLM 走 HTTP、可替换** | 只认 OpenAI 兼容接口（`VLM_BASE_URL`），云端 Qwen / 本地 vLLM / Ollama 都只是三个环境变量的事 |
 | **无 ADB 依赖的 Android 后端** | `AccessibilityService` + `MediaProjection` 取代 ADB 控制自己，中文输入走 `ACTION_SET_TEXT`，不装 ADB Keyboard |
-
-> 设计取舍与演进背景见 `DEVLOG.md`（开发过程文档，**不随仓库发布**）。
-
-## 测试
-
-```bash
-pip install -r requirements-dev.txt
-python -m pytest -q        # 744 个用例，全部离线（不需要 adb/模拟器/API Key）
-```
-
-> 测试与 `scripts/` 属开发侧本地维护、不随仓库发布（`tests/`、`scripts/` 在 `.gitignore`）。
