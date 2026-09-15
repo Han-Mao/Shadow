@@ -66,7 +66,11 @@ V3.3 起 `Vision / Device` 这一层的左边是 `DeviceController` **协议**�
 │   ├── risk_gate.py        # 统一风险门禁（策略风险 = 下限，模型只能抬不能降）
 │   ├── reconciliation.py   # 动作对账：EFFECT_UNKNOWN → 继续/重做/重规划/找人
 │   ├── replay.py           # 任务回放：事件流 → 时间轴 + 「值得注意的地方」
-│   └── scheduler.py        # 优先级队列 / 抢占 / 恢复
+│   ├── scheduler.py        # 优先级队列 / 抢占 / 恢复
+│   └── execution/          # 动作级执行（v4.1 §九）
+│       ├── state.py        #   执行状态机：合法迁移表 + 「崩溃后该落到哪个终态」
+│       ├── service.py      #   ExecutionService：状态迁移与它的事件同一个事务
+│       └── recovery.py     #   启动恢复：进程被杀后留下的非终态执行怎么收
 ├── models/
 │   ├── task.py             # Task + 11 态状态机（含 DEGRADED / DEVICE_UNAVAILABLE / CANCEL_REQUESTED）+ 优先级 + 预算 + 版本号 + revision
 │   ├── task_step.py        # TaskStep：计划是可追踪的状态机（只描述计划）
@@ -79,6 +83,7 @@ V3.3 起 `Vision / Device` 这一层的左边是 `DeviceController` **协议**�
 │   ├── verification.py     # ActionDispatch / ActionEffect / GoalVerification 三概念
 │   └── state.py            # Observation / StepOutcome
 ├── storage/                # 各 store + SQLite 地基（database / migrations / event_store）
+│                           # 任务 / 恢复点 / 事件 / 票据 / 执行记录同库（v4.1 §二）
 ├── device/
 │   ├── controller.py       # DeviceController 端口 + DeviceError 家族（V3.3 §1：核心只依赖它）
 │   ├── factory.py          # 按 SHADOW_DEVICE_BACKEND 装配后端（adb / android）
@@ -104,7 +109,7 @@ V3.3 起 `Vision / Device` 这一层的左边是 `DeviceController` **协议**�
 ├── scripts/
 │   ├── demo_preemption.py  # 抢占恢复演示（离线可跑）
 │   └── replay_task.py      # 命令行回放一个任务的事件流
-└── tests/                  # 675 个离线用例
+└── tests/                  # 719 个离线用例
 ```
 
 ## 职责边界
@@ -1602,6 +1607,102 @@ V4 之后「唯一写者」可以落在**数据库事务**上（地基已铺好�
 
 ---
 
+## V4.1 修复轮（依据 `v4.1审核建议.md`）
+
+审核这一份**不是缺陷清单，是十阶段重构计划**（它自己写着「不要大改，按 commit 推进」）。
+所以本轮按它给的 commit 顺序分 **6 次提交**落地，每条 commit message 点名对应哪个阶段。
+
+### 一、先说核对：哪些阶段本来就成立
+
+审核文档通常针对更早的提交，所以先拿它的代码片段去对真实源码：
+
+| 阶段 | 核对结果 |
+|---|---|
+| §八「events 增加 `execution_id` 列」 | **早就做了**。`events.execution_id` 与 `idx_events_execution` 是迁移 **v1** 建的（V4 §四），`EventLog.read_by_execution()` 也在。本轮补的是**另一件事**：Agent 路径的事件以前没有 execution_id 可带——因为那条路径压根没有执行记录 |
+| §九「增加统一 ExecutionService」 | **部分成立**。手工端点已有一个执行内核（`run_manual_action`，V3.2 §一），但它不是独立入口，Agent 路径连执行记录都没有。本轮补成 `agent/execution/` |
+| §十 测试3「重复确认」 | **早有覆盖**：`test_api_auth.py::test_confirmation_token_is_single_use`（V3.2 §六 起票据是两阶段 reserve/commit + jti 唯一约束） |
+| §十 测试4「同一 execution_id 不能 tap 两次」 | 机制原来不存在（文件存储的「读-判断-写」之间有窗口）。本轮用受保护迁移把它做成一条 SQL |
+| §五 状态机 | 只有 `RUNNING / SUCCEEDED / FAILED / REFUSED / UNVERIFIED`——**缺全部中间态**，而中间态正是崩溃恢复唯一能用的信息 |
+| §一/§二/§三（executions 表 + 换实现） | 确实仍存在：执行记录是**最后一个**还在 JSON 上的存储 |
+
+### 二、逐阶段落地
+
+| 阶段 | commit | 落点 |
+|---|---|---|
+| §一 executions 表 | `feat(storage): add executions sqlite table` | 迁移 **v4**：表 + 4 条索引（task / principal / device / **status**，最后一条是恢复扫描的入口） |
+| §二/§三 换 SQLite 实现 | `refactor: replace JSON ExecutionStore with SQLite` | `storage/execution_store.py` 内部换实现，**接口不变**；新增 `create()` / `transition()`；旧 `executions/*.json` 首次打开导入 |
+| §四/§五/§九 事务顺序 + 状态机 + 服务 | `feat: add Execution state machine` | `agent/execution/{state,service}.py`；`CREATED → RISK_CHECKED → DISPATCHED → RUNNING →` 终态 |
+| §六/§七 启动恢复 + 禁重试 | `feat: add stale execution recovery` | `agent/execution/recovery.py`；`GET /executions?status=UNKNOWN` + `/health/detail.executions_effect_unknown` |
+| §八/§九 统一（含 Agent 路径） | `refactor: unify execution service` | `AgentRuntime(executions=...)`；Act 环节建记录、`action_dispatched` 带 execution_id；`GET /executions/{id}` 改按 execution_id 取事件 |
+| §十 故障测试 | `test: add crash recovery tests` | `tests/test_execution_faults.py` |
+
+### 三、与审核的三处**有意偏离**（都写在代码注释里，不是遗漏）
+
+1. **事务顺序**：审核原图把「执行设备」画在 `ACTION_DISPATCHED` **之前**。照那样写，
+   「先记录意图、再产生副作用」这条写前日志的纪律就没了——设备调用成功而 `DISPATCHED`
+   写失败时，没有任何东西能证明那次点击是本系统发出的。改成
+   `受理 → 判风险 → 记意图 → 交给设备 → 记结果`，设备调用在**所有事务之外**
+   （Prepare → Effect → Commit，审核 §四 的原则，只是顺序按它自己的原则修正了）。
+
+2. **`DISPATCHED` vs `RUNNING`**：审核的状态集里 `ACTION_DISPATCHED` 是最后一个中间态，
+   所以它的测试1只能要求「此后被杀一律记 UNKNOWN」。本实现把这一格拆成两格：
+
+   ```
+   DISPATCHED  意图已落盘，设备**还没**被调用   → 崩溃后 FAILED（可安全重做）
+   RUNNING     动作已交给设备                  → 崩溃后 UNKNOWN（禁止自动重试）
+   ```
+
+   两次写入之间只有 `RUNNING` 一条语句，所以死在 `DISPATCHED` 上等于
+   `executor.execute` 从未被调用过——这不是推测，是代码顺序。代价是每条动作多一次
+   SQLite 提交；收益是「进程死在按下付款之前」这种最常见的情况不会进人工队列
+   （门禁变成噪声之后就会被绕过，V3.1 P0-3 的教训）。
+
+3. **不建 `execution_attempts` 表**：审核建议 `UNIQUE(execution_id, action_attempt)` 拦
+   「同一条执行被派发两次」，而 `status` 本身就是那个唯一约束（`UPDATE ... WHERE
+   execution_id=? AND status=?`，读-判断-写全在一个 `BEGIN IMMEDIATE` 里）。
+   多一张表只会多一份可能与状态不一致的事实。它**拦不住**的是「同一意图被执行两次」
+   （两个不同的 execution_id），那属于上层职责（`reconciliation` / `is_safe_to_retry`）。
+
+### 四、行为变化提醒
+
+1. **执行记录搬进 `<存储目录>/shadow.db`**（此前是一执行一个 JSON 文件）。
+   旧的 `executions/*.json` 首次打开时一次性导入，**保留 id / 时间戳 / 状态**——
+   否则历史记录会看起来全发生在升级那一刻，§六 的恢复扫描会立刻把它们当成刚崩溃的执行。
+2. **执行状态多了中间态**：`GET /executions` 里会先看到 `CREATED` / `RISK_CHECKED` /
+   `DISPATCHED` / `RUNNING`；终态多一个 **`UNKNOWN`**（进程死在设备调用之后）。
+   老的状态名与含义没变，新字段只增不改。
+3. **`GET /executions` 现在包含 Agent 路径的记录**（以前只有手工端点有）。
+   用 `channel` 区分：`manual` / `agent`。
+4. 新增 `GET /executions?status=UNKNOWN`（逗号分隔，状态名写错 400）与
+   `/health/detail.executions_effect_unknown`。
+5. **启动时会扫描并收掉崩溃遗留**。新环境变量 `SHADOW_EXECUTION_STALE_SECONDS`
+   （默认 0；显式开了 `SHADOW_ALLOW_MULTI_PROCESS` 时默认 300）。
+6. **被拒绝的手工动作现在也留一条 `RISK_ASSESSED` 事件**（以前什么都没有，
+   `GET /executions/{id}` 只有记录字段、没有「凭什么拒」）。
+7. **删除了 `storage/json_store.py`**：执行记录是它最后一个使用者。
+   此后所有需要「查询 / 受保护迁移 / 与别的事实同事务」的东西都在表里。
+8. 每条 Agent 动作多 4 次 SQLite 提交（`create` / `assessed` / `dispatched`+`running` /
+   `settle`）。`synchronous=FULL` 之下这是毫秒级，相对一次 VLM 调用可忽略。
+
+### 五、验证
+
+`python -m pytest -q` → **719 passed**（上轮 675 → +44，零回归）。
+
+| 新增/改动用例 | 覆盖 |
+|---|---|
+| `test_execution_state.py`（12 条） | 状态机：终态无出边、**`UNKNOWN` 只能从 `RUNNING` 进来**、恢复分流（设备有没有被调用过）、非法迁移抛异常而守卫落空只返回 `False`、**事件写失败时状态回滚**、派发窗口、同一执行不可派发两次、`UNKNOWN` 终态不可改写、内存对象与库一致、事件归属 |
+| `test_execution_recovery.py`（10 条） | 死在设备前后两种结论、幂等、宽限窗口、恢复留痕的分级、`UNKNOWN` 没有回程、坏行不影响、无任务的手工执行、升级前的老记录 |
+| `test_execution_faults.py`（5 条） | **点击进行中 `kill -9`** → `UNKNOWN` 且不可重试、**设备调用前被杀** → `FAILED`、**落定写失败** → 降级 `UNKNOWN`（不留幽灵）、数据库真写不动 → 留给恢复、降级目标由状态机算 |
+| `test_execution.py`（+5 条 / 改 4 条） | 状态词汇分区、`DISPATCHED`/`RUNNING` 分界、`create` 拒绝覆盖、受保护迁移、终态不可改写、历史 JSON 一次性导入 |
+| `test_database.py`（+2 条） | `executions` 表形状与四条索引、新库一次迁到最新版本 |
+| `test_api.py`（+4 条 / 改 2 条） | 启动恢复、`?status=` 过滤与 400、`/health/detail` 计数、宽限默认值 |
+| `test_runtime.py`（+4 条） | **Agent 路径的执行身份**与事件链、`action_dispatched` 带 execution_id、只申请完成不建记录、跑完不留非终态执行 |
+
+> 残留：`SHADOW_EXECUTION_STALE_SECONDS` 只在**启动时**扫一次，没有周期性巡检。
+> 触发条件是「服务长期不重启但仍出现崩溃遗留」——那时应当把恢复挂到定时任务上。
+
+---
+
 ## 快速开始
 
 ```powershell
@@ -1731,7 +1832,7 @@ pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 
-**675 个用例，全部离线**：不需要 adb、模拟器或 API Key。
+**719 个用例，全部离线**：不需要 adb、模拟器或 API Key。
 
 | 文件 | 覆盖 |
 |---|---|
@@ -1762,6 +1863,10 @@ python -m pytest -q
 | `test_android_remote_bridge.py` | **桥的远程传输**：12 个方法的路径与 JSON 键逐条对齐、令牌随请求发出、截图走裸字节、权限问题映射成 `AndroidServiceUnavailable`、四种失败各有可操作的提示、同进程优先于远程、**两条路线都不通时绝不回退 adb** |
 | `test_android_bridge_contract.py` | **跨语言契约**：Kotlin 方法名与参数个数 == 协议、HTTP 路由表覆盖全 12 个、序列化器属性集合 ⊇ `vision/parser.py` 的读取集合、golden UI 树喂给真实 `vision.target` / `agent.evidence` / `agent.risk_gate` 都能用、清单权限与辅助功能标志齐备、`R.*` 引用与清单 `@string` 必须在 `res/` 里存在（AAPT 的替身） |
 | `test_device_port.py` | **设备端口解耦**：核心侧五个模块不出现 `AdbController`、设备参数都标 `DeviceController`、AST 扫出的设备能力全在协议里、`_REQUIRED_METHODS` 与协议声明一致、ADB 专属通道反向保留 ADB 标注 |
+| `test_execution_state.py` | **执行状态机与唯一写入口**（v4.1 §四/§五/§九）：迁移合法性、`UNKNOWN` 仅由 `RUNNING` 进入、恢复分流、事件写失败时状态回滚、派发守卫、终态不可改写 |
+| `test_execution_recovery.py` | **崩溃遗留的启动恢复**（v4.1 §六/§七）：死在设备前后两种结论、幂等、宽限窗口、`UNKNOWN` 不可自动重试 |
+| `test_execution_faults.py` | **故障测试**（v4.1 §十）：点击中被 `kill -9`、落定写失败降级、数据库写不动留给恢复 |
+| `test_database.py` | 持久化 PRAGMA、迁移版本、事务可回滚/可重入、**`executions` 表与索引**、共享库、旧目录两种传法、坏行隔离 |
 
 ## 注意事项
 
@@ -1777,5 +1882,10 @@ python -m pytest -q
 - 执行器与观察阶段都承诺「不抛异常」，失败统一收敛为 `ERROR` 步骤并计入重试熔断；
   任务一旦启动，任何异常都会先把状态落为失败态，不会留下卡在 `running` 的僵尸任务。
 - VLM 调用对 429 / 5xx / 网络错误做 3 次指数退避重试；4xx（除 429）不重试。
-- 存储层默认是 JSON 文件（可读、便于演示），接口是窄方法集，
-  换成 SQLite / PostgreSQL 只需替换实现类。
+- **存储层已经全部收敛到 SQLite**（V4 §二 + v4.1 §二）：任务、恢复点、事件、确认票据、
+  执行记录在同一个 `<存储目录>/shadow.db` 里，靠 `Database` 共享连接与**可重入事务**。
+  仍为文件的只有轨迹（会被裁剪）与请求审计（HTTP 层旁路）。
+  接口是窄方法集，换成 PostgreSQL 只需替换实现类。
+- **执行状态里的 `UNKNOWN` 禁止自动重试**（v4.1 §七）：它表示「手机侧可能已经产生副作用，
+  而系统不知道结果」。想继续只能重新观察对账或转人工。
+  用 `GET /executions?status=UNKNOWN` 找它们，用 `/health/detail` 看积压数。
