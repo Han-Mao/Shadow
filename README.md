@@ -111,7 +111,7 @@ V3.3 起 `Vision / Device` 这一层的左边是 `DeviceController` **协议**�
 ├── scripts/
 │   ├── demo_preemption.py  # 抢占恢复演示（离线可跑）
 │   └── replay_task.py      # 命令行回放一个任务的事件流
-└── tests/                  # 719 个离线用例
+└── tests/                  # 737 个离线用例
 ```
 
 ## 职责边界
@@ -1708,6 +1708,84 @@ V4 之后「唯一写者」可以落在**数据库事务**上（地基已铺好�
 
 ---
 
+## V4.2 审查轮（依据 `v4.2审查建议.md`）
+
+这一份与前面几轮**性质不同**：它不是缺陷清单，是「还可以更强」的清单——先给架构评价
+与优点，再列 P0/P1/P2。所以先逐条核对现状，**只做真有缺口的那几项**，其余写清理由与
+触发条件（这些理由同时写进了代码注释，下一轮审核读代码就能看到）。
+
+### 一、核对：每一条现在是什么状态
+
+| 审核条目 | 核对结果 | 本轮 |
+|---|---|---|
+| **P0** ExecutionService 与 Runtime 职责交叉 | **部分成立**。执行闭环本来就在 `_execution.py`；`runtime.py` 354 行 + 4 个 mixin，离「Agent + Scheduler + Recovery + Persistence + Safety」还很远。真正能划出干净界限的只有**恢复**那一块 | ✅ 拆出 `agent/_recovery.py`，并给这条边界加了 AST 守卫 |
+| **P1** Planner 不像 Agent Planner（要 `TaskPlan`） | **4 项里 3 项早就有**：`id` / `description`（= `goal`）/ `dependency`（= `depends_on`）在 `TaskStep` 上从 V2 §三 就有；缺的只有 `expected_state` | ✅ 补 `expected_state`（+ 说清它**为什么不参与裁定**） |
+| **P1** Vision Grounding 偏弱 | **部分成立**。执行侧（`vision/grounding`）与风险侧（`vision/target`）**共用同一个匹配函数**，口径早就一致；真正缺的是「**当前这个按钮是不是我要点的**」——匹配器只返回一个赢家 | ✅ 新增 `TargetResolution.AMBIGUOUS`：并列候选 = 证据缺口 |
+| **P1** Android 需真机验证 / SetupWizard | **权限检查早就有**（逐项状态 + 一键跳系统设置 + onResume 自动刷新，且**刻意不做状态缓存**）。缺的是**结论**（两行「未开启」要用户自己判断）。Overlay 项**有理由不查**（见下） | ✅ 加一行就绪结论；真机验证延期 |
+| **P2** 安全层要加 Context / Content Risk | **成立**，而且是最要紧的一条：`TYPE` 的 value 是「要写进设备的东西」，却**完全没有参与风险判定**——卡号在文案上一个危险词都没有，语义层永远认不出它 | ✅ `models.semantic.sensitive_content` + `policy_risk` 第 5 项 |
+| **P2** 缺真实场景测试 | **3 个场景里 2 个已覆盖**：崩溃→转人工（`test_scheduler.py` + 执行层的 `test_execution_faults.py`）、插入任务（`test_multi_device_e2e.py` 4 条）；缺的是「发消息全链路」 | ✅ `tests/test_scenarios.py` |
+| 真机行为（后台存活 / 权限流程） | 需要设备在手才能验 | ⏸ 延期，触发条件写进 `android/README.md` |
+| model classifier / 风险历史回路 | 既有延期项，触发条件已写在 `models/semantic.py` | ⏸ 本轮不动 |
+
+### 二、逐条落地
+
+| 审核条目 | commit | 落点 |
+|---|---|---|
+| P2 内容风险 | `feat(risk): 输入内容也要参与风险判定` | `models/semantic.py`（`sensitive_content`）+ `agent/risk_gate.py`（第 5 项 `content_risk`） |
+| P1 目标不唯一 | `feat(risk): 目标不唯一也是证据缺口` | `vision/parser.py`（`rank_by_text`）+ `vision/target.py`（`AMBIGUOUS`）+ 门禁 |
+| P0 拆分 | `refactor(agent): 把崩溃恢复从 Runtime 拆出来` | `agent/_recovery.py` + `_confirm.py` 改用四个动作接口 |
+| P1 Planner | `feat(plan): 每步带上「预期状态」` | `models/task_step.py` + `vision/vlm.py`（prompt + 归一化）+ `agent/planner.py` |
+| P1 SetupWizard | `feat(android): 权限页给一句「就绪结论」` | `MainActivity.kt` + `activity_main.xml` + `strings.xml` |
+| P2 场景测试 | 见「五、验证」 | `tests/test_scenarios.py` |
+
+### 三、与审核不同的四处（都有理由，不是漏做）
+
+1. **`expected_state` 不参与裁定**。审核的 `TaskPlan` 把它当「每步的验收标准」。
+   但 `goal_verifier` 的立身之本是**只认独立证据**（页面结构变没变 / 目标元素还在不在 /
+   有没有成功标志）。把模型自己写的预期当证据，等于让「模型说它成了」变成「它成了」——
+   V2.2 §四 整轮就是在拆这个。要让它参与，前提是它能被验成**机器可判的谓词**
+   （`agent/goal_oracle` 那套），那是独立一轮的工作量。所以本轮它进计划、进 prompt、
+   进 `/tasks/{id}` 与审计，但不参与 PASS/FAIL。
+2. **悬浮窗（Overlay）权限不查**。本应用从不申请 `SYSTEM_ALERT_WINDOW`——设备层只走
+   `AccessibilityService` + `MediaProjection`（`AndroidManifest.xml` 顶部写了为什么）。
+   列一项自己根本不需要的权限，只会诱导用户去开一个对本应用毫无作用的开关。
+3. **不改 `runtime/` 包**。审核给了 `runtime/{loop,recovery,checkpoint,safety,context}.py`
+   的目录。那是一次大搬迁，收益是目录好看、代价是全仓库 import 与 `git blame` 断裂，
+   而现状离 God object 还很远。触发条件写在 `_recovery.py` 的模块 docstring 里。
+4. **Content Risk 分两档**（普通屏只留痕 / 敏感屏才转人工）。全量转人工会把门禁变成噪声，
+   然后被绕过——V3.1 P0-3 的教训。
+
+### 四、行为变化提醒
+
+1. **风险判定多了「内容」这一维**：敏感屏/敏感应用里 `TYPE` 卡号/身份证 → `DANGEROUS`（转人工）；
+   普通屏只多一条理由、不改等级。识别只认**强信号**（12–19 位连续数字、按 4 位分组的卡号、
+   18 位身份证），6 位验证码与手机号**刻意不认**。
+2. **目标解析多了 `ambiguous` 这一档**：文本目标出现**并列候选**时（页面上有两个「确认」）
+   → 敏感屏转人工、普通屏只留痕。坐标目标永不歧义。它会计入「证据缺口」，
+   所以 `/tasks/{id}` 与事件流里能看到 `target_resolution=ambiguous`。
+3. **计划里的步骤可能带 `expected_state`**（模型给了才有）；`format_plan` 会把它渲染进
+   下一步决策的 prompt。**没有目标的项会被跳过**（以前会变成一条空 goal 的僵尸步骤）。
+4. **Android 权限页多一行「就绪状态」**，直接点名缺哪项、或提示端点没启动。
+5. `AgentRuntime` 的恢复职责搬到 `RecoveryMixin`；`_recovery_notes` 容器不再对外可见
+   （`_confirm.py` 改用 `_note_recovery` / `_recovery_reason` / `_has_recovery_note` /
+   `_clear_recovery_note`）。
+
+### 五、验证
+
+`python -m pytest -q` → **737 passed**（上轮 719 → +18，零回归）；
+Android 静态契约 38 passed；`verify_kotlin_compile.py` 真编译 27 class + 10 条 JVM 单测；
+`build_apk.py` 重新出包（aapt2 校验了新布局与新字符串——这一步 kotlinc 看不到）。
+
+| 新增用例 | 覆盖 |
+|---|---|
+| `test_risk_gate.py`（+7） | 卡号写进绑卡页 → 转人工（**用例刻意让目标解析成功**，所以 DANGEROUS 只可能来自内容那条）／普通屏留痕不拦／身份证／一句话・6 位数字・手机号**不**命中／只有 `TYPE` 算内容风险／付款页两个「确认」→ 转人工／普通屏目标不唯一只记录 |
+| `test_vision.py`（+6） | `rank_by_text` 返回全部并列候选而 `match_by_text` 保持原行为（**纯重构**）／并列候选 → `AMBIGUOUS` 且仍是证据缺口／坐标目标不歧义／计划 prompt 要求 `expected_state`／归一化两种形状／模型**混着**返回也要收下 |
+| `test_runtime.py`（+2） | **AST 扫 `agent/*.py`：除 `_recovery.py` 谁都不许碰恢复备注容器**／门禁与状态同步仍在 MRO 上且 `__qualname__` 证明来自 `RecoveryMixin` |
+| `test_models.py`（+2） | `build_steps` 收两种形状 + 跳过无目标项 + 编号重排／`expected_state` 能过 `model_dump` → `model_validate` |
+| `test_scenarios.py`（+1） | **场景①发消息全链路**：计划 → LAUNCH → TYPE → TAP「发送」**停在人工确认**（`submit` 是 DANGEROUS）→ 批准 → 真的发出去 → 完成；断言「批准之前不许点下去」、三次 dispatch、三条执行记录（含输入的那句话） |
+
+---
+
 ## 快速开始
 
 ```powershell
@@ -1837,7 +1915,7 @@ pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 
-**719 个用例，全部离线**：不需要 adb、模拟器或 API Key。
+**737 个用例，全部离线**：不需要 adb、模拟器或 API Key。
 
 | 文件 | 覆盖 |
 |---|---|
@@ -1872,6 +1950,7 @@ python -m pytest -q
 | `test_execution_recovery.py` | **崩溃遗留的启动恢复**（v4.1 §六/§七）：死在设备前后两种结论、幂等、宽限窗口、`UNKNOWN` 不可自动重试 |
 | `test_execution_faults.py` | **故障测试**（v4.1 §十）：点击中被 `kill -9`、落定写失败降级、数据库写不动留给恢复 |
 | `test_database.py` | 持久化 PRAGMA、迁移版本、事务可回滚/可重入、**`executions` 表与索引**、共享库、旧目录两种传法、坏行隔离 |
+| `test_scenarios.py` | **真实场景**（v4.2 §三 P2）：发消息全链路——计划 → 三步动作 → TAP「发送」**停在人工确认** → 批准 → 真的发出去 → 完成（另外两个审核场景的归属写在文件头） |
 
 ## 注意事项
 
