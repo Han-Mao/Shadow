@@ -33,10 +33,11 @@ from models.action import (
     SENSITIVE_SCREEN_MARKERS,
     Action,
     ActionRisk,
+    ActionType,
     risk_rank,
     strictest,
 )
-from models.semantic import SemanticRole, infer_role, semantic_for
+from models.semantic import SemanticRole, infer_role, semantic_for, sensitive_content
 from vision import target as target_evidence
 
 logger = logging.getLogger(__name__)
@@ -275,7 +276,44 @@ class ActionRiskGate:
                 page_risk = ActionRisk.CAUTION
                 reasons.append(f"当前屏幕属敏感屏（命中特征「{screen_hint}」）")
 
-        return strictest(type_risk, text_risk, evidence_risk, page_risk), reasons, resolved.resolution
+        # 5) 输入内容里的身份/资金凭据（v4.2 §三 P2：Content Risk）
+        #
+        # 前四项看的都是「动作是什么」（类型 / 语义角色 / 目标证据 / 页面敏感度），
+        # 这一项看的是「动作里带着什么内容」。审核给的那个缺口是准确的：
+        # `TYPE` 的 value 是「要写进设备的东西」，而卡号 / 身份证号在文案上
+        # 一个危险词都没有，语义层永远认不出它。
+        #
+        # 两档的原因仍然是「代价不对称」：
+        #   - 敏感屏 / 敏感应用里写身份凭据 → DANGEROUS。这正是绑卡、实名、转账收款人
+        #     那类页面：写进去就可能被提交，而且不可撤销。
+        #   - 普通屏上写 → CAUTION。`TYPE` 的类型下限本来就是 CAUTION，所以这一档
+        #     是**不改现状**、只让审计看得见。不去全量转人工的理由：随手把卡号记进
+        #     备忘录也该由用户自己决定，全拦会变成噪声，然后被绕过（V3.1 P0-3）。
+        content_risk = ActionRisk.SAFE
+        if action.type is ActionType.TYPE:
+            content_hint = sensitive_content(str(action.value or ""))
+            if content_hint:
+                screen_hint = _screen_sensitivity_hint(context)
+                if _is_sensitive_package(context) or screen_hint:
+                    content_risk = ActionRisk.DANGEROUS
+                    scope = (
+                        f"敏感应用（{context.package if context else ''}）"
+                        if _is_sensitive_package(context)
+                        else f"敏感屏（命中特征「{screen_hint}」）"
+                    )
+                    reasons.append(
+                        f"输入内容像{content_hint}，且当前是{scope}："
+                        "写进去就可能被提交，且不可撤销，转人工确认"
+                    )
+                else:
+                    content_risk = ActionRisk.CAUTION
+                    reasons.append(f"输入内容像{content_hint}：写进设备的内容不可撤销，按保守处理")
+
+        return (
+            strictest(type_risk, text_risk, evidence_risk, page_risk, content_risk),
+            reasons,
+            resolved.resolution,
+        )
 
     @staticmethod
     def model_risk(action: Action) -> ActionRisk:

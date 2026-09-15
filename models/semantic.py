@@ -61,6 +61,7 @@ model classifier。继续扩 `SemanticRole` 词表不是解法——那只是把
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from enum import Enum
 
@@ -252,3 +253,56 @@ def infer_role(text: str) -> SemanticRole:
 def infer_semantic(text: str) -> ActionSemantic:
     """一步到位：文本 → 语义结论（role + risk + side_effect）。"""
     return semantic_for(infer_role(text))
+
+
+# ---- 输入内容里的「身份 / 资金凭据」（v4.2 §三 P2：Content Risk）----
+#
+# v4.2 指出的缺口：风险判定一直只看「动作是什么」，不看「动作里带着什么内容」。
+#
+#     TYPE  value="6222 0000 1234 5678"   →  role=UNKNOWN → 按类型兜底 CAUTION
+#
+# 而「把卡号/身份证号写进某个输入框」与「输入一句『晚上吃饭』」是两件事：
+# 前者**一提交就不可撤销**（卡号进了别人的表单、被记进日志、触发绑卡/转账），
+# 而且它在文案上很可能一个危险词都没有——所以语义层（`infer_role`）永远认不出它。
+#
+# 判定刻意**只认强信号**（V3.1 P0-3 的教训：门禁变噪声之后就会被绕过）：
+# 身份/资金凭据有固定形状，而「密码」「验证码」没有（前者是掩码、后者太短，
+# 6 位数字在别处到处都是）。拿不准的一律不报，交给上游的屏幕敏感度那一层。
+#
+# 这条**不改变 role**：它是与 role 并列的另一个维度（内容维度），
+# 由 `ActionRiskGate.policy_risk` 与 role 风险一起取最严格的那个。
+_ID_PATTERN = re.compile(r"(?<![0-9])[0-9]{17}[0-9Xx](?![0-9])")
+"""身份证号：18 位（末位可为 X）。比卡号更具体，先判它。"""
+
+_LONG_DIGITS_PATTERN = re.compile(r"(?<![0-9])[0-9]{12,19}(?![0-9])")
+"""12–19 位连续数字：银行卡 / 卡号连写 / 其它资金凭据。
+
+下界取 12（国际卡最短 12 位），上界 19（银联最新 19 位）。取 12 而不是 16 是**故意**
+放宽的：多问一次人比漏掉一张卡好，而误报的代价只到「多一条理由 + 敏感屏上转人工」。
+"""
+
+_GROUPED_CARD_PATTERN = re.compile(r"(?<![0-9])(?:[0-9]{4}[ -]){2,4}[0-9]{2,4}(?![0-9])")
+"""按 4 位分组的卡号写法（`6222 0000 1234 5678` / `6222-0000-1234-5678`）。
+
+连着写的那种由上面那条覆盖；分开写的时候中间有空格，不单独认就漏了。
+"""
+
+_SENSITIVE_CONTENT_PATTERNS: tuple[tuple[str, "re.Pattern[str]"], ...] = (
+    ("身份证号", _ID_PATTERN),
+    ("银行卡号", _GROUPED_CARD_PATTERN),
+    ("银行卡号", _LONG_DIGITS_PATTERN),
+)
+
+
+def sensitive_content(text: str | None) -> str:
+    """这段**将要写进设备的内容**里有没有身份/资金凭据。返回类型名（"" = 没有）。
+
+    纯函数、零成本、可解释——与 `infer_role` 同一档：它只负责「有没有」，
+    「算多严重」由 `ActionRiskGate` 结合当前屏幕决定。
+    """
+    if not text:
+        return ""
+    for label, pattern in _SENSITIVE_CONTENT_PATTERNS:
+        if pattern.search(text):
+            return label
+    return ""
