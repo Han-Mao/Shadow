@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from device.adb import DURATION_RANGE_MS, AdbController, AdbError
+from device.input import build_default_input
 from models.action import Action, ActionType, Point
 from models.retry import classify_exception
 from vision import grounding
@@ -77,8 +78,15 @@ def execute(adb: AdbController, action: Action, ui_tree: str | None = None) -> d
             case ActionType.TYPE:
                 if not action.value:
                     raise AdbError("TYPE 操作需要提供 value")
-                adb.type_text(action.value)
-                return {"ok": True, "text": action.value}
+                # V2.9 P1：中文输入链路必须与 `/text` API 一致。
+                # 原来直接 `adb.type_text()` 只支持安全 ASCII，Agent 生成的
+                # `Action(TYPE, "给妈妈发消息")` 会在设备端被吞成空 —— 同一个人工
+                # `/text` 能输中文、Agent 反而输不了，是功能割裂。
+                # 统一走 `build_default_input`：ASCII 走 input text，非 ASCII 走
+                # ADB Keyboard 广播（与 api/server.py 的 /text 端点同一条链路）。
+                provider = build_default_input(adb)
+                provider.input(action.value)
+                return {"ok": True, "text": action.value, "provider": provider.name}
 
             case ActionType.BACK:
                 adb.back()

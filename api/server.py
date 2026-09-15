@@ -171,7 +171,8 @@ def current_principal(request: Request) -> auth.Principal:
 # 三个后果，都真实存在过：
 #   1. `/inject` 先调 manager.inject() 改完任务、再检查设备 → Authorization after side effect
 #   2. 不指定 device_serial 就能绕过设备限制（调度器自动挑，可能挑到别人的设备）
-#   3. GET /tasks/{id} 不查设备 → 受限令牌能读到别人任务的**放行令牌**
+#   3. GET /tasks/{id} 曾随响应下发放行令牌 → 受限令牌能读到别人任务的**放行令牌**
+#      （V2.7 P1-8 已改为不随 GET 下发，需 POST /confirmation-token 显式申请）
 #
 # 所以这里只有一个入口：先解析对象、再判权限、最后才动它。
 
@@ -273,21 +274,6 @@ def resolve_manual_device(serial: str | None, request: Request):
     return device_pool.require(candidates[0])
 
 
-@contextmanager
-def device_access(timeout: float = 0.0):
-    """单步调试端点临时占用设备。
-
-    只给会**改变设备状态**的操作加锁：只读端点（/devices、/screenshot、/observe）
-    不加锁，否则任务一跑起来连设备信息都查不到。
-    """
-    if not session.acquire(_MANUAL_OWNER, timeout=timeout):
-        raise HTTPException(status_code=409, detail=f"设备忙：{session.owner or '未知任务'} 正在执行")
-    try:
-        yield adb
-    finally:
-        session.release(_MANUAL_OWNER)
-
-
 # ---- 请求模型 ----
 
 
@@ -377,8 +363,10 @@ class ConfirmRequest(BaseModel):
     token: str | None = None
     """人工确认令牌（V2.2 §九）。
 
-    启用鉴权时必须提供，值从 `GET /tasks/{id}` 的 `pending_confirmation.token` 取。
-    这样「知道 task_id」不再等于「有权放行危险动作」——令牌还绑定了具体是哪一个动作。
+    启用鉴权时必须提供。令牌**不随 GET 下发**（V2.7 P1-8），要先
+    `POST /tasks/{id}/confirmation-token` 显式申请，再把拿到的值传到这里。
+    这样「知道 task_id」不再等于「有权放行危险动作」——令牌还绑定了具体是哪一个动作，
+    且申请动作本身会进审计。
     """
 
 
@@ -839,8 +827,8 @@ def confirm_task(task_id: str, req: ConfirmRequest, request: Request):
             raise HTTPException(
                 status_code=403,
                 detail=(
-                    f"确认未通过（{reason}）：请从 GET /tasks/{{id}} 的 "
-                    "pending_confirmation.token 取值后再提交"
+                    f"确认未通过（{reason}）：请先 POST /tasks/{{id}}/confirmation-token "
+                    "申请令牌，再把返回的 token 传到这里"
                 ),
             )
 

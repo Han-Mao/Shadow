@@ -85,7 +85,7 @@ VLM 决定「下一步点哪里」，调度与检查点决定「多件事怎么�
 ├── scripts/
 │   ├── demo_preemption.py  # 抢占恢复演示（离线可跑）
 │   └── replay_task.py      # 命令行回放一个任务的事件流
-└── tests/                  # 448 个离线用例
+└── tests/                  # 450 个离线用例
 ```
 
 ## 职责边界
@@ -908,6 +908,36 @@ Runtime / Scheduler / TaskManager 三处全部写入点，回归风险远大于�
 | 人工批准只对指定动作尝试有效 | ✅ 本轮修掉（`ApprovalGrant` 指纹 + 双版本绑定） |
 | 状态 / Checkpoint / 事件日志能解释同一条历史 | ✅ 事件流自足（`action_dispatched` 带 target/value/fingerprint、`action_verified` 带 layer/screenshot）；`source` 覆盖全部状态迁移 |
 
+## V2.9 修复轮（依据 `v2.9审核建议.md`）
+
+这份文档主要落在「多进程部署边界 + 语义风险/目标验证的架构演进」上。逐条核对 HEAD 后，
+真正**本轮动手修**的是 1 条真实功能 bug + 3 处旧语义残留，其余要么已在早前几轮修掉、
+要么属于「有理由的延期」（触发条件已写进代码与 MEMORY，见下）。
+
+### 本轮真实改动
+
+| 条目 | 问题 | 改动 |
+|---|---|---|
+| P1 §六 中文输入链路割裂 | 人工 `/text` 走 `build_default_input` 能输中文，但 Agent 的 `ActionType.TYPE` 直接 `adb.type_text()` 只认安全 ASCII——「给妈妈发消息」会被吞成空 | `agent/executor.py` 的 TYPE 分支改走 `build_default_input(adb).input(value)`，与 `/text` 端点同一条链路（ASCII→input text、非 ASCII→ADB Keyboard 广播） |
+| P2 §十二 旧语义残留（1） | `api/server.py` 里 `device_access(timeout=...)` 定义了两遍，第一份引用的是已不存在的 `session`/单设备 `adb` | 删除第一份死代码，只保留真正的 `device_access(session_item, *, timeout, operation)` |
+| P2 §十二 旧语义残留（2） | `ConfirmRequest.token` docstring 与 `/confirm` 的 403 错误仍写「从 GET /tasks/{id} 的 pending_confirmation.token 取」 | 改为「先 POST /tasks/{id}/confirmation-token 申请令牌」；第 174 行的授权注释同步更正（V2.7 P1-8 已不随 GET 下发） |
+
+### 有理由的延期（本轮**刻意不修**，触发条件已就地标注）
+
+| 条目 | 处置 | 触发条件 |
+|---|---|---|
+| P0 TaskLease / 跨进程 CAS | 单进程内 `threading.RLock` 已闭环；跨进程要文件锁/SQLite，与 V2.6 §8 同一触发条件，注释已在 `runtime.py`/`scheduler.py` 就地写清 | **多进程/多实例部署** 或 **存储换 SQLite** |
+| P0/P1 风险关键词 → ActionSemanticLayer | `ActionRiskGate.assess` + `SideEffectClass` 已是方向正确的一步；统一的「动作语义层」是重构级 | 与 GoalOracle、多租户一起做 V3 |
+| P1 goal_verifier「计划自证」 | 已有 L6-a/b/c 三条独立证据 + 仅「有反证」才 REJECTED；`pending_steps==0` 只是其一 | 进一步拆 GoalOracle 属 V3 |
+| P1 stable/TOCTOU、EventLog fail-open、关系分类 | 架构级演进，本轮不动 | 同上 |
+
+### 验证
+
+`pytest -q` → **450 passed（10.0s）**，较上轮 448 新增 **2** 条（executor 中文输入走广播通道、
+executor ASCII 输入仍走 input text），零回归。
+
+---
+
 ## 快速开始
 
 ```powershell
@@ -1029,7 +1059,7 @@ pip install -r requirements.txt
 python -m pytest -q
 ```
 
-**448 个用例，全部离线**：不需要 adb、模拟器或 API Key。
+**450 个用例，全部离线**：不需要 adb、模拟器或 API Key。
 
 | 文件 | 覆盖 |
 |---|---|
