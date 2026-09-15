@@ -20,6 +20,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+from models.exceptions import PersistenceError
+
 logger = logging.getLogger(__name__)
 
 # 事件类型集中定义，避免字符串散落各处后拼写漂移、事后查不到
@@ -61,6 +63,29 @@ RISK_ASSESSED = "risk_assessed"
 """风险门禁的判定结论，含「模型试图降级被拒」这种要留痕的情况。"""
 
 
+# ---- V3 M4：安全关键事件 fail-safe ----
+#
+# v2.9 P1 §八：EventLog 是 fail-open——写失败只 warning 后继续执行。
+# 对普通业务日志没问题，但这个日志同时承担「审计 + 回放 + 安全决策追踪」。
+# 最坏情形是：手机实际发生了转账，但 EventLog 没记录，事后「发生了什么 / 谁批准」无法追溯。
+#
+# 所以安全关键事件要 fail-safe：写不进 durable store，副作用就不该继续。
+# 这些事件一旦丢失，审计链就断了：
+SAFETY_CRITICAL_KINDS = frozenset(
+    {
+        ACTION_DISPATCHED,  # 动作已经要发出去了，这是「发生了什么」的最后一处记录点
+        RISK_ASSESSED,      # 风险怎么判的、模型有没有试图降级
+        CONFIRMED,          # 谁批准了危险动作 / 恢复 / 完成
+        GOAL_CONFIRMED,     # 谁认定任务完成
+    }
+)
+
+
+def is_safety_critical(kind: str) -> bool:
+    """这条事件是否属于「丢失即审计链断裂」的安全关键事件。"""
+    return kind in SAFETY_CRITICAL_KINDS
+
+
 @dataclass
 class Event:
     task_id: str
@@ -99,6 +124,28 @@ class EventLog:
                     handle.write(json.dumps(event.to_dict(), ensure_ascii=False) + "\n")
         except Exception as exc:  # noqa: BLE001 - 审计是旁路，不能成为故障源
             logger.warning("写事件日志失败（任务 %s / %s）：%s", task_id, kind, exc)
+        return event
+
+    def emit_critical(self, task_id: str, kind: str, **data) -> Event:
+        """写一条**安全关键**事件。写失败抛 `PersistenceError`（V3 M4）。
+
+        与 `emit` 的区别：`emit` 是旁路（fail-open，写不进不挡执行）；
+        安全关键事件（危险动作已 dispatch、风险判定、人工批准、完成认定）一旦
+        丢失，审计链就断了——「手机转账了但没记录」不可接受。所以这里写失败要
+        **抛出去**，由调用方（runtime）把任务降级、副作用不继续。
+
+        注意：普通事件仍走 `emit`（fail-open），只有明确的安全关键事件才走这里。
+        分级而不是一刀切，避免「审计日志抖动就把所有任务都降级」。
+        """
+        event = Event(task_id=task_id, kind=kind, data=data)
+        path = self._root / f"{task_id}.jsonl"
+        try:
+            with self._lock:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(event.to_dict(), ensure_ascii=False) + "\n")
+        except Exception as exc:  # noqa: BLE001 - 转换后重新抛出
+            raise PersistenceError(task_id, f"安全关键事件 {kind} 写盘失败：{exc}") from exc
         return event
 
     def read(self, task_id: str, limit: int = 200) -> list[Event]:

@@ -195,6 +195,15 @@ class AgentRuntime(
         if self._event_log is not None:
             self._event_log.emit(task_id, kind, **data)
 
+    def _emit_critical(self, task_id: str, kind: str, **data) -> None:
+        """写安全关键事件，失败抛 `PersistenceError`（V3 M4）。
+
+        与 `_emit`（旁路，永不抛）分工：危险动作 dispatch、风险判定、人工批准、
+        完成认定这些「丢失即审计链断裂」的事件必须落盘成功，副作用才继续。
+        """
+        if self._event_log is not None:
+            self._event_log.emit_critical(task_id, kind, **data)
+
     # ---- 阶段 ----
 
 

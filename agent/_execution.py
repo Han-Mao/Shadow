@@ -311,9 +311,11 @@ class ExecutionMixin:
             state.attempt_seq += 1
             state.current_attempt_id = f"{task.id}:a{state.attempt_seq}"
             state.last_action_effect = ActionEffectStatus.DISPATCHED
-            self._emit(
-                task.id,
-                ACTION_DISPATCHED,
+            # V3 M4：安全关键事件 fail-safe。危险动作的 dispatch 记录是「手机真的
+            # 要动起来了」的最后一处审计落点——写不进 durable store，副作用就不该
+            # 继续（否则转账发生但无记录，事后「发生了什么 / 谁批准」无法追溯）。
+            # 普通动作仍走旁路 emit（fail-open），只有危险动作走 critical。
+            dispatch_kwargs = dict(
                 attempt_id=state.current_attempt_id,
                 action=action.type.value,
                 risk=assessment.effective.value,
@@ -325,6 +327,13 @@ class ExecutionMixin:
                 value=action.value,
                 reason=action.reason,
             )
+            try:
+                if assessment.effective is ActionRisk.DANGEROUS:
+                    self._emit_critical(task.id, ACTION_DISPATCHED, **dispatch_kwargs)
+                else:
+                    self._emit(task.id, ACTION_DISPATCHED, **dispatch_kwargs)
+            except PersistenceError as exc:
+                return self._degrade(task, state, f"安全事件写盘失败，停止副作用：{exc.reason}")
             result = self._execute(task, action, observation, session)
             # 放行凭据已经在「放行那一刻」消费掉了（V2.7 P0-2），这里只需清掉待确认占位
             state.pending_confirmation = None
