@@ -210,6 +210,9 @@ runtime = AgentRuntime(
     checkpoints=checkpoint_store,
     task_store=task_store,
     event_log=event_log,
+    # v4.1 §八/§九：Agent 路径的每一步动作也要有执行身份——「Task → Execution →
+    # Events」这条链在两条路径上都成立，崩溃遗留的 UNKNOWN 才收得干净。
+    executions=execution_service,
 )
 scheduler = TaskScheduler(
     runtime, device_pool, task_store=task_store, event_log=event_log
@@ -1276,7 +1279,11 @@ def get_execution(execution_id: str, request: Request):
     return {
         "ok": True,
         "execution": record.to_dict(),
-        "events": [event.to_dict() for event in event_log.read(execution_id, limit=200)],
+        # v4.1 §八：按 `execution_id` **列**取，而不是按「事件流所有者」取。
+        # 手工动作的事件挂在执行自己名下，Agent 动作的挂在任务名下——用所有者当入口时，
+        # 后者在这个端点里会看起来「一条事件都没有」。`read_by_execution` 走的是
+        # `events.execution_id` 索引，两条路径都对。
+        "events": [event.to_dict() for event in event_log.read_by_execution(execution_id)],
     }
 
 

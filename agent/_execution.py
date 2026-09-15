@@ -15,6 +15,11 @@ from device.session import DeviceBusyError, DeviceSession
 from models.action import Action, ActionType, ActionRisk, ActionEffectStatus, Decision
 from models.checkpoint import Checkpoint
 from models.exceptions import PersistenceError
+from models.execution import (
+    EXECUTION_FAILED,
+    EXECUTION_SUCCEEDED,
+    EXECUTION_UNVERIFIED,
+)
 from models.retry import (
     DEFAULT_POLICY,
     ErrorClass,
@@ -393,25 +398,27 @@ class ExecutionMixin:
             # 手工端点（`/tap` `/text` `/back` `/actions`）现在也走同一套留痕。
             # 写不进 durable store 就不执行——否则会出现「手机点下去了、审计里没有」。
             #
-            # 这里显式用 `_emit_critical_or` 而不是 `_emit`：两者**当前**等价
-            # （`EventLog.emit` 自己按 `is_safety_critical(kind)` 分派），但显式调用
-            # 能让「这条必须落盘」这个意图在调用点就读出来，而不是要求读代码的人
-            # 记得去查那张常量表——上一次漏掉就是因为没人记得。
-            dispatch_kwargs = dict(
-                attempt_id=state.current_attempt_id,
-                action=action.type.value,
-                risk=assessment.effective.value,
-                step=state.execution_step,
-                # 带上动作细节，事件流才「自足」到可以回放（V2.1 §二十三）：
-                # 只记动作类型的话，回放时看不出它当时点在哪、输入了什么
-                fingerprint=action.fingerprint,
-                target=self._action_target(action),
-                value=action.value,
-                reason=action.reason,
-            )
-            failed = self._emit_critical_or(task.id, ACTION_DISPATCHED, **dispatch_kwargs)
-            if failed is not None:
-                return self._degrade(task, state, f"安全事件写盘失败，停止副作用：{failed}")
+            # v4.1 §九：配了执行服务时，这条事件由 `ExecutionService` 写——它与
+            # 「状态推进到 DISPATCHED」在**同一个事务**里，于是不会出现
+            # 「事件说派发了、状态说还没判风险」这种分叉。失败仍然是 fail-closed，
+            # 只是失败信号从返回值变成了 `PersistenceError`。
+            #
+            # 注意：上面那条（危险动作的）RISK_ASSESSED **没有** execution_id——
+            # 它发生时这条执行记录还不存在。这是有意的：记录是在「确定真的要发出
+            # 这个动作」之后才建的。若在判风险之前就建，HITL 会让「判定为危险、
+            # 正在等人工确认」的动作也留下一条记录，而每次重启恢复都会把它们收成
+            # FAILED，真正的崩溃遗留会被淹掉。那条事件挂在任务名下，
+            # `GET /tasks/{id}/events` 照样看得到它。
+            try:
+                execution = self._begin_execution(task, action, assessment, session)
+            except PersistenceError as exc:
+                return self._degrade(
+                    task, state, f"执行记录无法落盘，停止副作用：{exc.reason}"
+                )
+
+            failure = self._record_dispatch(task, state, execution, action, assessment)
+            if failure is not None:
+                return self._degrade(task, state, f"安全事件写盘失败，停止副作用：{failure}")
             result = self._execute(task, action, observation, session)
             # 放行凭据已经在「放行那一刻」消费掉了（V2.7 P0-2），这里只需清掉待确认占位
             state.pending_confirmation = None
@@ -422,20 +429,12 @@ class ExecutionMixin:
             # ---- Verify ----
             post, verification = self._verify(task, state, observation, action, result, session)
             self._append_trajectory(task, post)
-            self._emit(
-                task.id,
-                ACTION_VERIFIED,
-                attempt_id=state.current_attempt_id,
-                outcome=verification.outcome.value,
-                dispatch=verification.dispatch.status.value,
-                effect=verification.effect.status.value,
-                target=verification.effect.target.value,
-                goal_achieved=verification.goal.achieved,
-                layer=verification.layer,
-                message=verification.message,
-                # 截图路径进事件流，回放时能直接点开看当时那一屏
-                screenshot=post.screenshot_path,
-            )
+            self._record_verification(task, state, execution, verification, post)
+            # v4.1 §五：执行记录也落终态（三档，与手工路径同一条规则）。
+            # 放在这里而不是各分支里：动作**已经发出去了**，无论走了哪条分支，
+            # 「这次执行的结果是什么」都必须被记下来——否则它会一直停在 RUNNING，
+            # 而 RUNNING 在崩溃恢复里等于「可能已经点了但不知道成没成」。
+            self._settle_execution(execution, verification, result)
 
             # 效果由验证层判定（V2.1 §十九），Runtime 不再自己拍脑袋。
             # 关键差异：VLM 说「成功」但 UI 树没变时，这里落的是 EFFECT_UNKNOWN 而不是
@@ -744,6 +743,136 @@ class ExecutionMixin:
 
         state.failed_strategies.append(self._describe_action(decision.action))
         return decision
+
+
+    # ---- 执行身份与留痕（v4.1 §八/§九）----
+    #
+    # 这三个方法把「Agent 路径的动作」接进 `ExecutionService`。它们都允许
+    # `execution is None`（没配执行服务）——那时行为与 V4.1 之前完全一致：
+    # 事件照发，只是不带 execution_id。**两条路共用同一条纪律**：
+    # 写不进 durable store 就不产生副作用。
+
+
+    def _begin_execution(
+        self, task: Task, action: Action, assessment, session: DeviceSession
+    ):
+        """给这一步动作建执行记录，并推进到「风险已判」（v4.1 §九）。
+
+        返回 `None` = 没配执行服务（单测与脚本里的 runtime 大多如此）。
+        写不进去则抛 `PersistenceError`，调用方据此停止副作用。
+
+        `principal` 刻意留空：Runtime 不知道是谁触发的任务——「谁」记在任务与
+        HTTP 审计日志上（`request_id` 同理）。要把 principal 带到这里，得让它先
+        落在 `Task` 上再随调度进 runtime；那是单独一件事，触发条件是
+        「按 principal 做设备/执行范围校验」。在此之前，用**空 principal 而不是
+        编一个假的**：记录里宁可缺一项，也不要写一个不真的值。
+        """
+        if self._executions is None:
+            return None
+        execution = self._executions.start(
+            action=action,
+            # 必须是 `str`：`Task.device_serial` 的默认是 None，而这一列在表上是
+            # NOT NULL——空串表示「这台设备没有序列号」（单测里的 FakeDevice 就是），
+            # None 表示「不知道」，两者不该混。
+            device_id=getattr(session, "serial", "") or task.device_serial or "",
+            task_id=task.id,
+            channel="agent",
+            risk=assessment.effective.value,
+        )
+        self._executions.risk_cleared(execution, risk=assessment.effective.value)
+        return execution
+
+    def _record_dispatch(
+        self,
+        task: Task,
+        state: RuntimeState,
+        execution,
+        action: Action,
+        assessment,
+    ) -> str | None:
+        """记录派发意图（fail-closed），返回失败原因（`None` = 成功落盘）。
+
+        两条实现共用同一个纪律：**先记录、再产生副作用**。差别只在于有没有执行记录——
+        没配执行服务时仍走「事件 + `_emit_critical_or`」那条（与 V4.1 之前一致）。
+        """
+        detail = dict(
+            attempt_id=state.current_attempt_id,
+            action=action.type.value,
+            risk=assessment.effective.value,
+            step=state.execution_step,
+            # 带上动作细节，事件流才「自足」到可以回放（V2.1 §二十三）：
+            # 只记动作类型的话，回放时看不出它当时点在哪、输入了什么
+            fingerprint=action.fingerprint,
+            target=self._action_target(action),
+            value=action.value,
+            reason=action.reason,
+        )
+        if execution is None:
+            return self._emit_critical_or(task.id, ACTION_DISPATCHED, **detail)
+
+        try:
+            if not self._executions.dispatched(execution, **detail):
+                # 守卫落空：同一条执行已经派发过。绝不能再去调设备。
+                return "该执行已经派发过（守卫拒绝重复派发）"
+            # `RUNNING` 必须单独提交：从它之后「手机有没有被操作过」不再由我们决定，
+            # 崩溃恢复只能记 UNKNOWN（v4.1 §五/§七）。
+            self._executions.running(execution)
+        except PersistenceError as exc:
+            return exc.reason
+        return None
+
+    def _record_verification(
+        self, task: Task, state: RuntimeState, execution, verification, post
+    ) -> None:
+        """写 `ACTION_VERIFIED`（普通事件，fail-open）。
+
+        它跟在副作用之后，没有任何东西可以撤销了——所以写不进去只告警，不改结论。
+        """
+        detail = dict(
+            attempt_id=state.current_attempt_id,
+            outcome=verification.outcome.value,
+            dispatch=verification.dispatch.status.value,
+            effect=verification.effect.status.value,
+            target=verification.effect.target.value,
+            goal_achieved=verification.goal.achieved,
+            layer=verification.layer,
+            message=verification.message,
+            # 截图路径进事件流，回放时能直接点开看当时那一屏
+            screenshot=post.screenshot_path,
+        )
+        if execution is None:
+            self._emit(task.id, ACTION_VERIFIED, **detail)
+            return
+        self._executions.verified(execution, **detail)
+
+    def _settle_execution(self, execution, verification, result: dict) -> None:
+        """把执行记录落成终态。三档，与手工路径完全同一条规则（V4 §一）：
+
+            FAILED     —— 设备层就没成（参数错、被设备拒绝……）
+            SUCCEEDED  —— 验证层确认生效
+            UNVERIFIED —— 发出去了但效果没被确认（含 dispatched / navigated / ui_changed）
+
+        中间那一档是「已经点了但不知道成没成」——**绝不能被记成成功**，
+        也不允许自动重做（见 `agent/reconciliation`）。
+        """
+        if execution is None:
+            return
+        if not result.get("ok"):
+            status = EXECUTION_FAILED
+        elif verification.effect.status is ActionEffectStatus.VERIFIED_SUCCESS:
+            status = EXECUTION_SUCCEEDED
+        else:
+            status = EXECUTION_UNVERIFIED
+        try:
+            self._executions.settle(
+                execution, status, result=result, note=verification.message
+            )
+        except PersistenceError as exc:
+            # 落定失败不改这次任务的结果：记录会停在 RUNNING，`GET /executions` 看得见，
+            # 启动恢复（§六）还会把它收成 UNKNOWN——比悄悄丢掉它好。
+            logger.warning(
+                "执行记录落定失败（%s → %s）：%s", execution.execution_id, status, exc
+            )
 
 
     def _execute(

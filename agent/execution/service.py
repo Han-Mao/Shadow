@@ -149,6 +149,27 @@ class ExecutionService:
             risk=risk,
         )
 
+    def risk_cleared(self, execution: ActionExecution, *, risk: str = "") -> bool:
+        """记录「风险判定已过」——**只推进状态，不重复发事件**（v4.1 §九）。
+
+        与 `assessed()` 的分工要说清：`assessed()` 是「判定 + 留痕」一体，手工路径用它
+        （那里只有一处判定，事件与状态天然是一件事）。Agent 路径不同——它的判定发生在
+        **执行记录存在之前**（危险动作那条 `RISK_ASSESSED` 是安全关键的，早就按
+        fail-closed 写掉了，且挂在任务名下）。这里再发一条只会让同一件事在事件流里
+        出现两次。所以只推进状态，风险判定的结论由调用方通过 `risk=` 带在记录上
+        （`GET /executions/{id}` 看得到它）。
+
+        为什么不能跳过 `RISK_CHECKED` 直接派发：迁移表里 `CREATED → DISPATCHED`
+        **不是**一条合法边。那是有意的——「派发之前一定判过风险」应当是结构上成立的，
+        而不是靠每个调用点自觉。
+        """
+        return self._advance(
+            execution,
+            expect={ExecutionStatus.CREATED},
+            to=ExecutionStatus.RISK_CHECKED,
+            risk=risk,
+        )
+
     def refuse(self, execution: ActionExecution, *, risk: str = "", note: str = "", **detail) -> bool:
         """被风险门禁拦下：**没碰设备**（v4.1 §五 的 `REFUSED`）。
 

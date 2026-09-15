@@ -95,6 +95,7 @@ class AgentRuntime(
         checkpoints: object | None = None,
         task_store: object | None = None,
         event_log: EventLog | None = None,
+        executions: object | None = None,
     ) -> None:
         # 向后兼容：老调用方传单个 DeviceSession（单设备场景）
         self._pool = session if isinstance(session, DevicePool) else DevicePool([session])
@@ -104,6 +105,11 @@ class AgentRuntime(
         self._checkpoints = checkpoints
         self._task_store = task_store
         self._event_log = event_log
+        # v4.1 §八/§九：动作级执行记录的唯一写入口（`agent.execution.ExecutionService`）。
+        #
+        # 可以**不传**：不传时行为与 V4.1 之前完全一致（事件照发，只是不带 execution_id），
+        # 单测与脚本里的 runtime 大多属于这一类。线上一律由 `api/server.py` 注入。
+        self._executions = executions
         self._states: dict[str, RuntimeState] = {}
         # 多设备 = 多个 worker 线程并发调用 runtime，运行时状态必须加锁
         self._states_lock = threading.RLock()
