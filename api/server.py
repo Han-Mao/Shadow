@@ -26,9 +26,17 @@ from agent.scheduler import DeviceNotAllowedError, TaskScheduler
 from agent.task_manager import TaskManager
 from agent.verifier import Verification
 from device import screenshot as shots
-from device.adb import AdbController, AdbError, is_read_only
-from device.emulator import resolve_serial, resolve_serials
-from device.input import build_default_input
+# V3.3 §1：API 只认设备**端口**与**装配函数**，不再直接 new 具体后端。
+# 于是同一份 `api/server.py` 既能在 PC 上用 ADB 跑，也能在手机本机上跑
+# （`SHADOW_DEVICE_BACKEND=android`）——方案文档 §10 的两个产品形态共用这一个入口。
+from device.controller import DeviceController, DeviceError, is_read_only
+from device.factory import (
+    build_controller,
+    describe_backend,
+    resolve_device_serial,
+    resolve_device_serials,
+    selected_backend,
+)
 from device.pool import DevicePool, UnknownDeviceError, storage_hint
 from device.session import DeviceSession
 from models.action import Action, ActionRisk, ActionType, Point
@@ -121,14 +129,20 @@ _guard_single_process()
 
 # ---- 依赖装配 ----
 
-adb = AdbController(serial=resolve_serial())
+# 设备后端由 `SHADOW_DEVICE_BACKEND` 决定（V3.3 §1）：
+#   adb（默认）  PC 通过 ADB 控制手机——开发模式
+#   android      手机本机跑 Shadow 自己——产品模式（Accessibility + MediaProjection）
+# 这里取到的是同一个 `DeviceController` 协议实例，所以下面所有的
+# TaskManager / Scheduler / Runtime / RiskGate / Checkpoint 都**不用改一行**。
+adb = build_controller(resolve_device_serial())
 # 多设备（V2.1 §十三）：ADB_SERIAL 支持逗号分隔，调度器会为每台设备起一个 worker。
 # 单设备时 pool 里就一台，行为与老版本完全一致。
 device_pool = DevicePool(
-    [DeviceSession(AdbController(serial=serial), serial=serial) for serial in resolve_serials()]
+    [DeviceSession(build_controller(serial), serial=serial) for serial in resolve_device_serials()]
 )
 # 单步调试端点（/tap、/screenshot、/owned）面向「当前主设备」，仍用第一台
 session = device_pool.first()
+logger.info("设备后端：%s", describe_backend(resolve_device_serial()))
 # 审计/重放用的事件日志（V2.1 §二十三）。与轨迹分开：轨迹服务下一步决策（会被裁剪），
 # 事件日志服务事后追溯（只追加）。
 # V2.4 起它还要接一件更早的事——TaskStore 发现损坏任务时在这里留一条 TASK_CORRUPTED，
@@ -520,8 +534,14 @@ class ActionRequest(BaseModel):
 # ---- 异常处理 ----
 
 
-@app.exception_handler(AdbError)
-def adb_error_handler(_, exc: AdbError) -> JSONResponse:
+@app.exception_handler(DeviceError)
+def device_error_handler(_, exc: DeviceError) -> JSONResponse:
+    """设备后端失败 → 502。
+
+    注册在**端口基类**上（V3.3 §1）：`AdbError` 与 `AndroidBridgeError` 都是它的子类，
+    所以换后端不必动这里。以前只注册 `AdbError`，Android 后端一出错就会掉进 500 兜底，
+    返回「内部错误」而不是「设备侧失败」——排查时会往完全错的方向找。
+    """
     return JSONResponse(status_code=502, content={"ok": False, "error": str(exc)})
 
 
@@ -559,7 +579,9 @@ def devices(request: Request):
             continue
         session_item = device_pool.require(serial)
         items.append({"serial": serial, **session_item.snapshot(), "state": session_item.controller.state()})
-    return {"count": len(items), "devices": items, "primary": adb.serial}
+    # V3.3 §1：以前这里写死 `adb.serial`（模块级的 ADB 控制器），是「ADB 泄漏进核心」
+    # 的典型一处——换成 Android 后端后那个全局对象语义就变了。主设备应当是池里的第一台。
+    return {"count": len(items), "devices": items, "primary": device_pool.first().serial}
 
 
 def _artifact_dir_for(session_item) -> Path:
@@ -1318,6 +1340,9 @@ def health():
         "auth": "token" if auth.enabled() else "disabled",
         "host": HOST,
         "confirmation_consumption": auth.consumption_backend(),
+        # V3.3 §1：一句就能确认「现在是谁在控制设备」——手机上部署时最常问的
+        # 就是「到底跑的是 ADB 后端还是本机后端」，不该靠翻日志。
+        "device_backend": describe_backend(resolve_device_serial()),
         # 非 null 说明 SHADOW_API_PRINCIPALS 配错了，此刻**所有请求都在被 401**。
         # 必须能从这里查到——否则运维只看到「全部 401」，原因却只在一行日志里。
         "principals_error": auth.config_error(),

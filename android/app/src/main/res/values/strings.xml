@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Shadow</string>
+
+    <string name="accessibility_service_label">Shadow 设备端点</string>
+    <string name="accessibility_service_summary">让 Shadow 读取屏幕内容并执行点击、输入、滑动</string>
+    <string name="accessibility_service_description">开启后，Shadow 才能读取当前页面的控件树（用于判断点哪里、以及判断某个按钮是不是危险动作），并代替你执行点击、长按、滑动和输入。Shadow 不会在未经确认的情况下执行付款、发送、删除这类动作。</string>
+
+    <string name="title_activity_main">Shadow</string>
+
+    <string name="section_permissions">权限</string>
+    <string name="label_accessibility_state">辅助功能服务</string>
+    <string name="label_projection_state">屏幕捕获（投屏授权）</string>
+    <string name="label_endpoint_state">设备端点</string>
+    <string name="state_ready">已就绪</string>
+    <string name="state_missing">未开启</string>
+    <string name="state_running">运行中</string>
+    <string name="state_stopped">已停止</string>
+
+    <string name="action_open_accessibility">去开启辅助功能</string>
+    <string name="action_request_projection">授权屏幕捕获</string>
+    <string name="action_start_endpoint">启动设备端点</string>
+    <string name="action_stop_endpoint">停止设备端点</string>
+    <string name="action_copy">复制</string>
+
+    <string name="section_endpoint">给 Shadow Core 的连接信息</string>
+    <string name="label_endpoint_address">地址</string>
+    <string name="label_endpoint_token">令牌</string>
+    <string name="hint_endpoint_usage">在跑 Shadow Core 的机器上设置：\nSHADOW_DEVICE_BACKEND=android\nSHADOW_ANDROID_BRIDGE_URL=%1$s\nSHADOW_ANDROID_BRIDGE_TOKEN=%2$s</string>
+    <string name="warn_lan_exposure">这个端点等同于「操作这台手机」的能力。只在你信任的局域网里开启，用完请停止。令牌不要外传。</string>
+
+    <string name="notification_channel_name">设备端点</string>
+    <string name="notification_channel_description">Shadow 正在作为设备端点运行</string>
+    <string name="notification_title">Shadow 设备端点运行中</string>
+    <string name="notification_text">端口 %1$d，等待 Shadow Core 连接</string>
+</resources>

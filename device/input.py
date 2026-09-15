@@ -1,7 +1,15 @@
-"""输入提供者（V2 §十八）：让 Agent 只说「输入这段文字」，不关心底层用什么通道。
+"""输入提供者（V2 §十八 · V3.3 §5）：让 Agent 只说「输入这段文字」，不关心底层用什么通道。
 
-- ASCII → `input text`（快，但设备端会吞掉非 ASCII）
-- 中文等非 ASCII → ADB Keyboard 广播（`com.android.adbkeyboard`）
+三个实现，按后端选：
+
+- `AdbInputProvider`      ASCII → `input text`（快，但设备端会吞掉非 ASCII）
+- `BroadcastInputProvider` 中文等非 ASCII → ADB Keyboard 广播（`com.android.adbkeyboard`）
+- `AndroidInputProvider`  手机本机 → Accessibility `ACTION_SET_TEXT`
+
+前两个属于 ADB 后端，第三个属于 Android 后端。**由控制器自己声明用哪个**
+（`DeviceController.build_input_provider`），而不是在这里 if-else 判断后端类型——
+手机自己跑的时候没有 adb，写死 ADB 通道会直接失败。方案文档 §5 说的
+`InputProvider { AdbInputProvider, AndroidInputProvider }` 就是下面这份列表。
 """
 from __future__ import annotations
 
@@ -10,6 +18,7 @@ import logging
 from typing import Protocol
 
 from .adb import TYPE_SAFE_PATTERN, AdbController, AdbError
+from .controller import DeviceError
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +130,49 @@ class AutoInputProvider:
         self._broadcast.input(text)
 
 
-def build_default_input(adb: AdbController) -> AutoInputProvider:
-    """默认组合：ASCII 走 adb，其余走 ADB Keyboard 广播。"""
-    return AutoInputProvider(AdbInputProvider(adb), BroadcastInputProvider(adb))
+class AndroidInputProvider:
+    """Accessibility `ACTION_SET_TEXT` 通道（V3.3 §5）：手机本机运行时的输入。
+
+    **为什么手机侧不需要「ASCII / 非 ASCII 分流」**：`ACTION_SET_TEXT` 是把整段文本
+    直接写进焦点节点，不经过输入法，所以中文和英文走同一条路。ADB 侧之所以要分流，
+    是因为 `input text` 在设备端会被 IME 吞掉非 ASCII——那是 **ADB 通道的限制**，
+    不该让它变成「所有后端都得遵守的规则」。
+
+    这也顺手解决了一个老麻烦：ADB 侧输中文要先装并切到 ADB Keyboard
+    （`BroadcastInputProvider.ensure_enabled`），在手机上跑根本不该有这一步。
+    """
+
+    name = "android_accessibility"
+
+    def __init__(self, bridge) -> None:
+        self._bridge = bridge
+
+    def available(self) -> bool:
+        """始终可用：桥连不上时会在 `input` 里抛 `AndroidBridgeError`。
+
+        不像广播通道那样需要「先检查 ADB Keyboard 装没装」——辅助功能是系统组件。
+        """
+        return True
+
+    def input(self, text: str) -> None:
+        if not text:
+            # 空输入是上游传参问题，不是设备问题；但要**报出来**，别静默成功——
+            # 静默成功会让「我以为输入了」这种误判一路传到完成判定里。
+            raise DeviceError("输入文本为空")
+        self._bridge.set_text(text)
+
+
+def build_default_input(controller) -> InputProvider:
+    """按**控制器自己声明的**输入通道构造 provider（V3.3 §5）。
+
+    以前这个函数写死了「ADB 双通道」——于是 Android 后端在手机上运行时仍会去调
+    `adb shell input text`，而手机上根本没有 adb。现在改成问控制器要：
+    新增后端（云手机、iOS、Android App 内嵌）不需要改这里，也不需要改 `executor`。
+
+    没有声明该方法的对象（历史替身、简单假设备）退回 ADB 双通道，
+    行为与升级前**完全一致**——这是刻意留的兼容口。
+    """
+    declared = getattr(controller, "build_input_provider", None)
+    if callable(declared):
+        return declared()
+    return AutoInputProvider(AdbInputProvider(controller), BroadcastInputProvider(controller))

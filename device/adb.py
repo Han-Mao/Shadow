@@ -1,4 +1,9 @@
-"""DeviceController 接口的 ADB 实现（§6.1 / §6.2）。不暴露给 Agent。"""
+"""`DeviceController` 端口的 **ADB 实现**（PC 侧）。不暴露给 Agent。
+
+端口契约见 `device/controller.py`；手机本机运行时的对等实现见 `device/android.py`。
+两者共用同一套 TaskManager / Scheduler / AgentRuntime / RiskGate / Checkpoint——
+这个文件与那个文件之间的差别，就是「PC 控制手机」和「手机自己跑」的全部差别。
+"""
 from __future__ import annotations
 
 import re
@@ -10,64 +15,58 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
+from models.action import DURATION_RANGE_MS  # noqa: F401 - re-export，老导入路径继续有效
+
+from .controller import (
+    READ_ONLY_OPERATIONS,
+    DeviceBudgetExhausted,
+    DeviceError,
+    is_read_only,
+)
+
 DEFAULT_SERIAL = "emulator-5554"
 REMOTE_UI_DUMP = "/sdcard/window_dump.xml"
 # 校验的是「用户原始输入」：空格允许，% 禁止（% 是 ADB input text 的转义引导符，
 # 放行会让 "100%" 这类输入被设备当成非法转义）
 TYPE_SAFE_PATTERN = re.compile(r"^[a-zA-Z0-9_.@,/?! ]+$")
-# 时长类参数的合理区间：下限取 1ms 而非 0——wait(0) 是无意义空转，未来若出现轮询
-# 容易演变成忙循环；上限防 VLM 返回天文数字把任务卡死
-DURATION_RANGE_MS = (1, 60_000)
 
 # 当前上下文的命令总预算截止时刻（monotonic 秒）。见 `deadline_budget`。
 _DEADLINE: ContextVar[float | None] = ContextVar("adb_deadline", default=None)
 
 
-class AdbError(RuntimeError):
-    pass
+class AdbError(DeviceError):
+    """ADB 相关失败。
+
+    继承 `DeviceError`（V3.3 §1）而不是直接继承 `RuntimeError`：核心的失败收敛
+    只写一条 `except DeviceError` 就能同时接住 ADB 与 Android 两种后端。
+    `AdbError` 这个名字与原有捕获点全部保留，换基类对上层透明。
+    """
 
 
-class AdbBudgetExhausted(AdbError):
+class AdbBudgetExhausted(AdbError, DeviceBudgetExhausted):
     """总预算用完——**不是**设备坏了，而是我们主动不再往下等。
 
     单独一个类型是为了让上层能区分「设备真的出错」和「这次采集超预算了」：
     后者重试一次往往就好了，前者重试没用。
+
+    V3.3 起它同时是 `DeviceBudgetExhausted`，于是上层可以不分后端地接住
+    「预算耗尽」（Android 侧对应 `AndroidBudgetExhausted`）。
     """
 
 
-# 只读操作（V2.7 P1-7）：这些方法只**读取**设备状态，不改变设备上的任何东西。
-# API 的只读端点（/screenshot、/observe）只能调用这里面的方法；会改设备的
-# tap / text / swipe / keyevent / am start 一律不在此列。
-# 之前「只读」只是端点名约定，没有结构化声明——加了这个集合之后，
-# 「只读端点是否真的只读」可以从代码里查证，而不是靠人记住约定。
-READ_ONLY_OPERATIONS = frozenset(
-    {
-        "screenshot",
-        "screenshot_bytes",
-        "dump_ui",
-        "screen_size",
-        "current_focus",
-        "state",
-        "read_shell",
-        "shell",  # 危险：shell 本身可以执行任意命令，见 is_read_only 的说明
-    }
-)
-
-# 但 `shell` 是万能执行口，把它算「只读」只在**调用方只传只读命令**时成立。
-# 这里保守处理：`shell` 单独列出来，`is_read_only` 默认对它返回 False，
-# 只有明确的只读封装（screenshot / dump_ui / screen_size / current_focus）才算只读。
-_READ_ONLY_SAFE = READ_ONLY_OPERATIONS - {"shell", "read_shell"}
-
-
-def is_read_only(operation: str) -> bool:
-    """这次设备操作会不会改变设备状态（V2.7 P1-7）。
-
-    只读封装（screenshot / dump_ui / screen_size / current_focus / state）返回 True；
-    `shell` / `read_shell` 是万能口、无法保证只读，保守返回 False；
-    其余（tap / text / swipe / keyevent / launch 等）都是改设备的，返回 False。
-    """
-    return operation in _READ_ONLY_SAFE
-
+# 只读操作声明与 `is_read_only` 已挪到 `device/controller.py`（V3.3 §1）——
+# 那是「Shadow 认为什么算只读」的**约定**，不是 ADB 的实现细节，两种后端共用一份。
+# 这里 re-export，老导入路径（`from device.adb import is_read_only`）继续有效。
+__all__ = [
+    "AdbBudgetExhausted",
+    "AdbController",
+    "AdbError",
+    "DURATION_RANGE_MS",
+    "READ_ONLY_OPERATIONS",
+    "TYPE_SAFE_PATTERN",
+    "escape_type_text",
+    "is_read_only",
+]
 
 
 def escape_type_text(value: str) -> str:
@@ -207,8 +206,26 @@ class AdbController:
         else:
             self.shell("monkey", "-p", package, "1", timeout=self._LAUNCH_TIMEOUT)
 
+    def launch_app(self, package: str) -> None:
+        """按包名启动主界面（= `launch(package, None)`）。
+
+        端口（`device/controller.py`）显式列出这个方法，因为它是最高频的调用形态。
+        Android 侧对应 `PackageManager.getLaunchIntentForPackage` + `startActivity`。
+        """
+        self.launch(package)
+
     def wait(self, duration_ms: int = 1000) -> None:
         time.sleep(duration_ms / 1000.0)
+
+    def build_input_provider(self):
+        """本后端的输入通道：ASCII 走 `input text`，其余走 ADB Keyboard 广播（V2 §十八）。
+
+        延迟 import：`device.input` 会 import 本模块（要 `TYPE_SAFE_PATTERN`），
+        模块级互相 import 会成环。端口要求实现这个方法，见 `device/controller.py`。
+        """
+        from .input import AutoInputProvider, AdbInputProvider, BroadcastInputProvider
+
+        return AutoInputProvider(AdbInputProvider(self), BroadcastInputProvider(self))
 
     # ---- 采集 ----
 

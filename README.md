@@ -37,10 +37,18 @@
                   ┌────────────────┴────────────────┐
                   ↓                                 ↓
             Vision / Grounding                  Device / Session
+                                                    │
+                                        ┌───────────┴───────────┐
+                                        ↓                       ↓
+                              DeviceController(adb)   DeviceController(android)
+                                PC 通过 ADB 控制         手机本机控制自己
 ```
 
 **决定这套系统上限的不是 VLM，而是 `TaskManager + Scheduler + Checkpoint + Runtime` 这四件套。**
 VLM 决定「下一步点哪里」，调度与检查点决定「多件事怎么排队、被打断了怎么接着做」。
+
+V3.3 起 `Vision / Device` 这一层的左边是 `DeviceController` **协议**（`device/controller.py`）。
+两个后端（ADB / Android）可以互换，上面所有东西一行都不用改——这正是「手机化」的落点。
 
 ## 目录结构
 
@@ -72,20 +80,30 @@ VLM 决定「下一步点哪里」，调度与检查点决定「多件事怎么�
 │   └── state.py            # Observation / StepOutcome
 ├── storage/                # TaskStore / CheckpointStore / TrajectoryStore / EventLog / AuditLog
 ├── device/
-│   ├── adb.py screenshot.py accessibility.py emulator.py
+│   ├── controller.py       # DeviceController 端口 + DeviceError 家族（V3.3 §1：核心只依赖它）
+│   ├── factory.py          # 按 SHADOW_DEVICE_BACKEND 装配后端（adb / android）
+│   ├── adb.py              # ADB 后端（PC 侧）：adb -s <serial> ...
+│   ├── android.py          # Android 后端（手机侧）：AndroidBridge 协议 + AndroidDeviceController
+│   ├── remote.py           # 桥的远程传输：设备端点 HTTP 客户端（V3.3 §1）
+│   ├── screenshot.py accessibility.py emulator.py
 │   ├── session.py          # DeviceSession：设备所有权与抢占交接
 │   ├── pool.py             # DevicePool：serial → 会话的注册表（多设备）
-│   └── input.py            # InputProvider：ASCII 与中文输入通道
+│   └── input.py            # InputProvider：ADB（ASCII / 中文广播）与 Android（ACTION_SET_TEXT）
 ├── vision/                 # vlm / grounding / parser
 │   ├── fingerprint.py      # UI 结构指纹：恢复校验的 L2（比 package 细、比 VLM 便宜）
 │   └── target.py           # 把动作目标还原成 UI 节点（风险判定与效果验证共用）
 ├── api/
 │   ├── server.py           # FastAPI
 │   └── auth.py             # 令牌 / 只读 / 设备范围 / 人工确认令牌（V2.2 §九）
+├── android/                # 手机侧设备层 + 设备端点（Kotlin，V3.3）
+│   ├── README.md           # 部署步骤 / 两条路线 / 权限 / 排障
+│   └── app/src/main/java/com/bluewhale/shadow/
+│       ├── device/         # AccessibilityService / MediaProjection / Intent 启动 / 12 个桥方法
+│       └── endpoint/       # 极小的 HTTP 设备端点（前台服务）
 ├── scripts/
 │   ├── demo_preemption.py  # 抢占恢复演示（离线可跑）
 │   └── replay_task.py      # 命令行回放一个任务的事件流
-└── tests/                  # 450 个离线用例
+└── tests/                  # 588 个离线用例
 ```
 
 ## 职责边界
@@ -1116,6 +1134,125 @@ executor ASCII 输入仍走 input text），零回归。
 
 ---
 
+## V3.3 手机部署（依据 `手机部署方案.md`）
+
+方案文档要解决的事：**让手机自己成为 Agent 主机，不再由 PC 通过 ADB 控制它**。
+落地后本仓库的形态是方案文档 §10 想要的那两个产品形态：
+
+```text
+Shadow Core（本仓库的 Python 运行时）       TaskManager / Scheduler / Runtime / RiskGate / Checkpoint
+├── device/adb.py        ADB 后端            PC 控制手机（开发模式，默认）
+└── device/android.py    Android 后端        手机本机的 Accessibility + MediaProjection
+                         ↑ device/controller.py 的 DeviceController 协议是两者共用的接缝
+```
+
+### 一、方案 §1–§10 逐条落点
+
+| 方案要求 | 落点 | 说明 |
+|---|---|---|
+| §1 把 ADB 从核心控制链里拆出去（`AdbDeviceController` / `AndroidDeviceController`） | `device/controller.py`（端口）、`device/adb.py`、`device/android.py`、`device/factory.py` | `executor` 只依赖 `DeviceController`，只 `except DeviceError`；`AdbError` 改为继承它，老捕获点全部保留 |
+| §2 不要「Python 全套原封不动塞进手机」 | `device/android.py` 的 `AndroidBridge` + `android/` | Python Core 只保留原样；**FastAPI / uvicorn 不需要上手机**（手机上没人来调 HTTP）；设备层是原生 Kotlin |
+| §3 用 AccessibilityService 拿 `AccessibilityNodeInfo` | `android/.../ShadowAccessibilityService.kt` + `NodeInfoAdapter.kt` + `UiTreeSerializer.kt` | 树被序列化成**与 `uiautomator dump` 同构的 XML**，于是 `vision/*` 一行不用改 |
+| §4 截图不再走 ADB，改用 MediaProjection | `android/.../ScreenCapture.kt` | 授权一次、常驻一个 VirtualDisplay（Android 14+ 一个令牌只能建一次 VD） |
+| §5 输入改用 `ACTION_SET_TEXT`；`InputProvider` 分 ADB / Android 两支 | `device/input.py` 的 `AndroidInputProvider` + 控制器自己声明通道 | 手机上不需要 ADB Keyboard、不需要切输入法、不需要 ASCII/非 ASCII 分流 |
+| §6 App 启动改用 `PackageManager` + Intent | `android/.../AppLauncher.kt` | 相对写法 `/.ui.LauncherUI` 的补全与 `am start -n` 对齐 |
+| §7 Task/Scheduler/Checkpoint/RiskGate 保留 | 无改动 | 这正是本轮最想验证的一句话，见下面「验证」 |
+| §8 LLM 不放手机本地，走 HTTP 网关 | `vision/vlm.py` 现有实现 | `VLM_BASE_URL` / `VLM_API_KEY` / `VLM_MODEL`（OpenAI 兼容），云端 Qwen / 局域网 vLLM / 本地都只是改这三个变量 |
+| §9 第一版不追求完全离线 | `android/README.md` | 手机负责 Observe/Action/Verification，模型负责 Plan/Reason/Grounding |
+| §10 拆成 core / desktop / android | 目录 + `device/factory.py` | `SHADOW_DEVICE_BACKEND=adb\|android` 选后端；上层拿到同一个协议对象 |
+
+### 二、桥有两条承载路线（**这是本轮唯一需要你决策的地方**）
+
+`AndroidBridge` 是一条协议，协议可以有不同的「谁来承载」：
+
+| | 路线 A：同进程（Chaquopy） | **路线 B：设备端点（`android/` 默认实现）** |
+|---|---|---|
+| 拓扑 | APK 里同时有 Kotlin 设备层与 Python Core | 手机只当设备端点，Core 跑在 PC / 局域网 |
+| 设备层被怎么调用 | Chaquopy 把 Kotlin 对象注册给 Python | HTTP `/bridge/<方法名>`，Core 侧是 `device/remote.py` |
+| 现状 | **被一个第三方依赖挡住**，见下 | 可用 |
+| Python 侧要改 | 无 | 无（`SHADOW_ANDROID_BRIDGE_URL` 指过来） |
+
+**路线 A 的阻塞点（已查证，不是猜测）**：`models/` 里每一个模型都是 pydantic 2 的
+`BaseModel`，而 pydantic 2 的核心 `pydantic-core` 是 Rust 扩展，PyPI 上没有 Android 轮子，
+Chaquopy 官方仓库也没有收录它（维护者原话：*Pydantic version 2 isn't currently available
+for Chaquopy*，chaquo/chaquopy#1160；另一份专门为 Chaquopy 构建它的尝试卡在 PyO3 的 abi3
+特性上，pydantic/pydantic-core#1607）。这不是「换个包」，而是「核心的模型层要不要重写」。
+
+所以：**路线 B 是本轮交付的可用路径**，路线 A 需要的两处 Gradle/Kotlin 配置写在
+`android/README.md` 里，等你验证完那条错误信息再打开。方案文档 §2 自己也写着
+「不建议把整个 Shadow 原封不动塞进手机」，§10 的第三形态（手机 A/B/C → Shadow Cloud）
+就是路线 B——它反而是文档里更长远的那条路。
+
+### 三、本轮改动
+
+**新增**
+
+| 文件 | 作用 |
+|---|---|
+| `device/controller.py` | 设备**端口**：`DeviceController` 协议 + `DeviceError` 家族 + `READ_ONLY_OPERATIONS` / `is_read_only` |
+| `device/android.py` | Android 后端：`AndroidDeviceController` + `AndroidBridge` 协议（12 个方法）+ 注册/取桥 |
+| `device/remote.py` | 桥的**远程传输**：HTTP 客户端，实现同一份协议（路线 B） |
+| `device/factory.py` | 后端装配：`SHADOW_DEVICE_BACKEND` → 具体控制器；桥按「先同进程、后远程」取 |
+| `android/` | Kotlin 设备层 + 设备端点（见 `android/README.md`） |
+| `tests/test_android_adapter.py` | 假桥驱动**整条任务链**（含危险动作仍被 RiskGate 拦下） |
+| `tests/test_android_remote_bridge.py` | 远程传输：12 个方法的参数名/路径/回包 + 失败语义 |
+| `tests/test_android_bridge_contract.py` | 跨语言契约：方法名、参数个数、属性集合、golden UI 树喂给真实解析器 |
+
+**改动**
+
+| 文件 | 改动 |
+|---|---|
+| `device/adb.py` | `AdbError` 改继承 `DeviceError`；`AdbBudgetExhausted` 同时是 `DeviceBudgetExhausted`；`is_read_only` / `DURATION_RANGE_MS` 迁到端口层（旧导入路径 re-export）；补 `launch_app` |
+| `device/input.py` | 新增 `AndroidInputProvider`（`ACTION_SET_TEXT`）；`build_default_input` 改为**问控制器要**通道，不再写死 ADB 双通道 |
+| `agent/executor.py` | 只依赖 `DeviceController`；参数错误从 `AdbError` 换成核心的 `ActionArgumentError`（不再为了校验一个参数去 import 设备后端）；`LAUNCH` 无 activity 时走 `launch_app` |
+| `api/server.py` | 控制器改为 `build_controller(...)`；异常处理器注册在 `DeviceError` 基类上（Android 后端出错不再掉进 500 兜底）；`/devices` 的 `primary` 不再写死 `adb.serial`；`/health` 加 `device_backend` |
+| `models/action.py` | `DURATION_RANGE_MS` 从 `device/adb.py` 挪过来（动作参数的合法区间不是后端细节） |
+| `models/exceptions.py` | 新增 `ActionArgumentError` |
+| `device/__init__.py` | 导出端口层的符号 |
+
+### 四、验证
+
+`python -m pytest -q` → **588 passed（14.2s）**，较上轮 526 新增 **62** 条，零回归。
+
+| 新增用例 | 覆盖 |
+|---|---|
+| `test_android_adapter.py`（28 条） | 端口完整性在装配期被检查、桥异常归一成 `DeviceError`、UI 树非 uiautomator 格式被拒、读不到树**抛异常**而不是返回空串、预算耗尽后不再开始新采集、输入走 `ACTION_SET_TEXT`、后端选错 fail-closed、**用假桥把整条任务链跑通**、**危险动作在 Android 后端上照样被 RiskGate 拦下** |
+| `test_android_remote_bridge.py`（19 条） | 12 个方法的路径与 JSON 键逐条对齐（`duration_ms` 写成 `duration` 这类错误会被抓住）、令牌随请求发出、截图走裸字节、**权限问题映射成 `AndroidServiceUnavailable`**、连不上/令牌错/回包不是 JSON 的提示各不相同、同进程优先于远程、**两条路线都不通时绝不回退 adb** |
+| `test_android_bridge_contract.py`（15 条） | Kotlin 侧方法名/参数个数与协议一致、HTTP 路由表覆盖全 12 个、序列化器属性集合 ⊇ `vision/parser.py` 读取的每一个、golden XML 喂给真实 `vision.target` / `agent.evidence` / `agent.risk_gate` 都能用、清单权限与辅助功能标志齐备 |
+
+`android/` 侧另有 `./gradlew :app:test`（纯 JVM，不需要真机）：`UiTreeSerializerTest`
+把序列化输出与 golden 文件逐字比较，并覆盖转义（含**双重转义**与 `<`/`>`）与边界。
+
+### 五、如实说明
+
+1. **Kotlin 侧没有编译过。** 开发环境没有 Android SDK / Gradle / 真机，所以
+   `android/` 的 Kotlin 只经过逐行复核 + 静态契约测试（上面那 15 条）。
+   第一次 `./gradlew :app:test` 与 `:app:assembleDebug` 才是它的第一道真实验证。
+   这一点写进 `android/README.md` 的「已知限制」第 6 条，不留在对话里。
+2. **路线 A 目前不可用**，原因是 pydantic 2 没有 Android 轮子（上面 §二 有出处）。
+   刻意**没有**用「兜底的假 pydantic」绕过它——那会让核心的模型校验语义悄悄变样，
+   而这种偏离在被审核发现时比「还没做」严重得多。
+3. **`DeviceError` 刻意不声明 `error_class`。** `models/retry.classify_exception`
+   一旦读到 `error_class` 就**不再回退**到按类型/文本判断，而设备错误该归 transient
+   还是 fatal 取决于具体原因（掉线是 transient、「未授权」近似 fatal）。
+   给一个笼统的值会把 `models/_FATAL` 里已有的文本规则全部屏蔽掉。见
+   `device/controller.py` 的类注释。
+4. **屏幕旋转会让坐标偏移。** VirtualDisplay 按授权那一刻的尺寸建，
+   任务中途旋转后截图尺寸与 `screen_size` 不一致。做法与触发条件写在
+   `ScreenCapture` 的类注释与 `android/README.md` 里（需要注册 `DisplayListener` 重建）。
+5. **`/bridge` 端点等于「操作这台手机」的能力。** 三道闸：令牌、只在用户主动启动时监听、
+   `START_NOT_STICKY`。绝不要映射到公网。与 API 侧的安全口径一致。
+
+### 六、新增环境变量
+
+| 变量 | 作用 |
+|---|---|
+| `SHADOW_DEVICE_BACKEND` | `adb`（默认）/ `android`。写了不认识的值直接报错，不静默回退 |
+| `SHADOW_ANDROID_BRIDGE_URL` | 路线 B：手机设备端点地址，如 `http://192.168.1.20:8765` |
+| `SHADOW_ANDROID_BRIDGE_TOKEN` | 路线 B：与手机页面上显示的令牌一致 |
+
+---
+
 ## 快速开始
 
 ```powershell
@@ -1240,7 +1377,7 @@ pip install -r requirements.txt
 python -m pytest -q
 ```
 
-**526 个用例，全部离线**：不需要 adb、模拟器或 API Key。
+**588 个用例，全部离线**：不需要 adb、模拟器或 API Key。
 
 | 文件 | 覆盖 |
 |---|---|
@@ -1267,6 +1404,9 @@ python -m pytest -q
 | `test_api_auth.py` | **鉴权/只读/设备范围/确认令牌/请求审计**、`/health` 公开、**非回环裸绑定拒绝启动**、**确认令牌一次性消费** |
 | `test_goal_policy.py` | **任务画像 → 验证严格度**：导航/副作用/纯查询/未知分类与优先级（副作用 > 导航）、默认按画像分层、显式 `GOAL_VERIFY_MODE` 覆盖、同类情形按任务类型给出不同裁定 |
 | `test_api_authz.py` | **授权边界**：设备范围裁剪（读 / inject / devices / 调度快照）、越界设备 403 而非 500、确认令牌绑定操作者、否决危险动作不杀任务 |
+| `test_android_adapter.py` | **Android 后端**：端口完整性在装配期被查、桥异常归一成 `DeviceError`、UI 树非 uiautomator 格式被拒、读不到树抛异常（不是空串）、预算耗尽后不再开始采集、输入走 `ACTION_SET_TEXT`、**假桥驱动整条任务链跑通**、**危险动作照样被 RiskGate 拦下** |
+| `test_android_remote_bridge.py` | **桥的远程传输**：12 个方法的路径与 JSON 键逐条对齐、令牌随请求发出、截图走裸字节、权限问题映射成 `AndroidServiceUnavailable`、四种失败各有可操作的提示、同进程优先于远程、**两条路线都不通时绝不回退 adb** |
+| `test_android_bridge_contract.py` | **跨语言契约**：Kotlin 方法名与参数个数 == 协议、HTTP 路由表覆盖全 12 个、序列化器属性集合 ⊇ `vision/parser.py` 的读取集合、golden UI 树喂给真实 `vision.target` / `agent.evidence` / `agent.risk_gate` 都能用、清单权限与辅助功能标志齐备 |
 
 ## 注意事项
 

@@ -72,6 +72,22 @@ class CorruptDataError(PersistenceError):
         super().__init__(key, f"数据损坏 {path}：{reason}")
 
 
+class ActionArgumentError(ShadowError):
+    """Action 参数非法——executor 在下发到设备**之前**就判定这个动作没法执行。
+
+    例如 `SWIPE` 没给 4 个坐标、`TYPE` 没给 value、时长超出合法区间。
+    它与设备后端无关（ADB 和 Android 都会遇到），所以放在核心异常里，
+    而不是让 `agent/executor.py` 去 import 某个后端模块的异常类型
+    ——那正是 V3.3 §1 要拆掉的「ADB 泄漏进核心」的一种。
+
+    `error_class` 保持 `unknown`（与升级前 `AdbError` 的分类结果一致）。
+    把它改成 `parse_error` 会让重试策略从「重试」变成「换策略」，
+    那是一次独立的语义改动，不在本轮范围内（见 README 的延期说明）。
+    """
+
+    error_class = "unknown"
+
+
 class ConcurrentModificationError(ShadowError):
     """乐观并发校验失败：手里这份 Task 快照已经不是最新的一份（V2.4 §二）。
 

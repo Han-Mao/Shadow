@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Shadow Android 设备端点。
+
+  权限说明（每一条都是这个应用「为什么需要它」的答案）：
+
+    INTERNET / ACCESS_NETWORK_STATE   设备端点要监听端口给 Shadow Core 连
+    FOREGROUND_SERVICE                端点必须常驻——被系统回收的话，正在跑的任务
+                                      会突然发现设备消失（DEVICE_UNAVAILABLE）
+    FOREGROUND_SERVICE_DATA_SYNC      前台服务的类型声明（Android 10+ 必需）
+    POST_NOTIFICATIONS                前台服务的通知（Android 13+ 必需，
+                                      没有它服务仍能跑，但用户看不到「正在被控制」）
+    QUERY_ALL_PACKAGES                按包名启动应用（方案文档 §6）。
+                                      Android 11+ 的包可见性默认过滤，没有它
+                                      getLaunchIntentForPackage 会对已安装的应用返回 null，
+                                      表现为「打开微信」这个动作莫名失败。
+
+  刻意**不申请**的权限：
+    - 不申请 SYSTEM_ALERT_WINDOW / 不申请 root。整个设备层只走公开的
+      AccessibilityService + MediaProjection，与方案文档 §3/§4 一致。
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission
+        android:name="android.permission.QUERY_ALL_PACKAGES"
+        tools:ignore="QueryAllPackagesPermission" />
+
+    <!-- Android 11+ 包可见性：不加这段，getLaunchIntentForPackage 对第三方应用会返回 null -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
+
+    <application
+        android:allowBackup="false"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/ShadowTheme">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!--
+          辅助功能服务（方案文档 §3）。
+          android:exported="true" 是**系统**要求的：辅助功能服务由 system_server 绑定，
+          不是本应用自己绑定，所以必须导出。它的安全性由「只有用户在系统设置里手动
+          开启才会生效」保证——不是一个可由外部应用触发的入口。
+        -->
+        <service
+            android:name=".device.ShadowAccessibilityService"
+            android:exported="true"
+            android:label="@string/accessibility_service_label"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/shadow_accessibility_service" />
+        </service>
+
+        <!--
+          设备端点（前台服务）。exported="false"：它不该被外部应用启动，
+          只能由 MainActivity 拉起。
+        -->
+        <service
+            android:name=".endpoint.DeviceEndpointService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+    </application>
+</manifest>

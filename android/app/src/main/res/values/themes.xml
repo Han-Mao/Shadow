@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      刻意继承平台的 DeviceDefault 主题、不引 AppCompat：
+      这个应用只需要「一组按钮 + 一段文字」，为它引入一整个 UI 框架，
+      会让构建多出一个随时可能因为版本不匹配而坏掉的变量。
+
+      用 Theme.DeviceDefault 而不是 Theme.DeviceDefault.DayNight：后者是 API 29 才有的
+      资源，而 minSdk 是 26——引它会让构建出「resource requires API 29」的问题，
+      而这段主题本来就只影响背景色。
+    -->
+    <style name="ShadowTheme" parent="@android:style/Theme.DeviceDefault">
+        <item name="android:windowBackground">@android:color/background_dark</item>
+    </style>
+</resources>

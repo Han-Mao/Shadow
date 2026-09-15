@@ -1,0 +1,13 @@
+build/
+.gradle/
+local.properties
+*.iml
+.idea/
+captures/
+.externalNativeBuild/
+.cxx/
+
+# 路线 A（Chaquopy）用的 Python 源码目录：由 Gradle 任务从仓库根同步进来，
+# 不签入以免出现「两份 Python 源码」。见 README 的「路线选择」。
+app/src/main/python/
+app/src/main/python-runtime/

@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  辅助功能服务的配置。
+
+  关键的三项：
+
+    canRetrieveWindowContent="true"   要能读 AccessibilityNodeInfo 树（方案文档 §3）
+    canPerformGestures="true"         要能 dispatchGesture 做点击/长按/滑动
+    accessibilityFlags=...            flagReportViewIds 是**必须**的：
+                                      resource-id 只有在它打开时才有值，而 resource-id
+                                      既进 UI 树的解析（vision/parser），也进风险判定的
+                                      haystack（V3 M2）——少了它，「com.taobao:id/pay_confirm」
+                                      这类只能靠 id 认出来的按钮就认不出来了，风险判定
+                                      会跟着漏掉。
+
+  刻意**不写** packageNames 过滤：Agent 要操作的是任意应用（方案文档 §7 的例子是
+  微信 + 淘宝 + 支付宝），白名单没有意义。
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagReportViewIds|flagRetrieveInteractiveWindows|flagIncludeNotImportantViews"
+    android:canPerformGestures="true"
+    android:canRetrieveWindowContent="true"
+    android:description="@string/accessibility_service_description"
+    android:notificationTimeout="100"
+    android:summary="@string/accessibility_service_summary" />

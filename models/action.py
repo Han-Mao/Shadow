@@ -95,6 +95,16 @@ SAFE_ACTION_TYPES = frozenset(
 CAUTION_ACTION_TYPES = frozenset(
     {ActionType.TAP, ActionType.LONG_PRESS, ActionType.TYPE, ActionType.SWIPE, ActionType.LAUNCH}
 )
+
+# 时长类参数的合理区间（毫秒）：`wait` / `long_press` / `swipe` 共用。
+#
+# 下限取 1 而非 0——`wait(0)` 是无意义空转，未来若出现轮询容易演变成忙循环；
+# 上限防 VLM 返回天文数字把任务卡死。
+#
+# V3.3 从 `device/adb.py` 挪到这里：它是**动作参数的合法区间**，不是 ADB 的实现细节。
+# 放这儿之后 `agent/executor.py` 不必为了校验一个参数去 import 设备后端
+# （`device.adb` 仍 re-export，老导入路径继续有效）。
+DURATION_RANGE_MS = (1, 60_000)
 # 理应让页面或控件状态发生变化的动作（UIA 层验证只对这类动作有意义）
 MUTATING_ACTION_TYPES = frozenset(
     {ActionType.TAP, ActionType.LONG_PRESS, ActionType.TYPE, ActionType.SWIPE, ActionType.LAUNCH}
