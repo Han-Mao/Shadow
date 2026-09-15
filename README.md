@@ -51,6 +51,36 @@ curl -X POST http://127.0.0.1:8010/tasks -H "Content-Type: application/json" -d 
 
 > 首次跑真机：手机开 USB 调试 → `adb devices` 拿 serial → `$env:ADB_SERIAL="R5CTxxxx"`。
 
+## 演示
+
+两个离线脚本，**不需要 adb / 模拟器 / API Key**，clone 下来就能跑（看「看页面 / 问模型 /
+判断结果」被换成脚本，只保留调度与运行时这条真实链路）：
+
+```bash
+# ① 抢占与恢复：A 跑到一半，B 插入 → A 落 Checkpoint 让出设备 → B 完成 → A 从恢复点继续
+python scripts/demo_preemption.py
+
+# ② 回放某个真实任务的事件流（先 --list 看有哪些任务）
+python scripts/replay_task.py --list
+python scripts/replay_task.py <task_id>
+```
+
+演示 ① 输出的关键几行：
+
+```
+用户：#1 帮我在淘宝搜索一双黑色运动鞋       → 任务 A 开始执行
+  [设备] tap(300,800) ...
+用户：#2 先帮我打开微信给张三发"晚上开会"    → 任务 B（HIGH）插入
+  请求任务 A 让出设备，等待方 B
+  任务 A 已挂起（让出设备），等待恢复
+  开始执行任务 B ... 完成
+  开始执行任务 A ... 完成                     → 从恢复点继续
+```
+
+真正的「危险动作会停住等人确认」这条（发消息是 DANGEROUS、`submit` 语义），
+由 `tests/test_scenarios.py` 覆盖——演示与测试用的是同一套 Runtime，区别只在
+测试用 FakeDevice 断言、脚本用 PrintedDevice 打印。
+
 ## 部署到手机（可选，路线 B：设备端点）
 
 Core 仍跑在电脑上，手机只装一个「设备端点」APK，两者走局域网 HTTP，**不需要 ADB**：
@@ -98,3 +128,4 @@ Core 仍跑在电脑上，手机只装一个「设备端点」APK，两者走局
 | **纯 Kotlin（零 androidx）** | 手机设备层只用 `android.*`/`java.*`/`org.json`，所以无需 Android Studio 也能 `aapt2+kotlinc+d8` 打出 APK |
 | **VLM 走 HTTP、可替换** | 只认 OpenAI 兼容接口（`VLM_BASE_URL`），云端 Qwen / 本地 vLLM / Ollama 都只是三个环境变量的事 |
 | **无 ADB 依赖的 Android 后端** | `AccessibilityService` + `MediaProjection` 取代 ADB 控制自己，中文输入走 `ACTION_SET_TEXT`，不装 ADB Keyboard |
+
