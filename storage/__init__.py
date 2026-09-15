@@ -6,6 +6,7 @@
 from .checkpoint_store import CheckpointStore, RestoreVerdict
 from .event_log import Event, EventLog
 from .json_store import JsonStore
+from .lease_store import LeaseStore
 from .task_store import TaskStore
 from .trajectory_store import TrajectoryStore
 
@@ -14,6 +15,7 @@ __all__ = [
     "Event",
     "EventLog",
     "JsonStore",
+    "LeaseStore",
     "RestoreVerdict",
     "TaskStore",
     "TrajectoryStore",

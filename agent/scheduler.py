@@ -128,6 +128,7 @@ class TaskScheduler:
         task_store: Any | None = None,
         idle_poll_seconds: float = 0.2,
         event_log: EventLog | None = None,
+        lease_store: Any | None = None,
     ) -> None:
         self._runtime = runtime
         # 向后兼容：老调用方传的是单个 DeviceSession（单设备场景）
@@ -137,6 +138,11 @@ class TaskScheduler:
         self._task_store = task_store
         self._idle_poll = idle_poll_seconds
         self._event_log = event_log
+        # V3 M3：跨进程任务租约。None = 关闭（单进程部署，保持旧行为，向后兼容）。
+        # 多进程/多实例部署时传入 LeaseStore，`_execute` / `recover` 会在真正执行前
+        # 先 claim，抢不到就不执行——「一个任务同一时刻最多一个执行者」从「单进程内
+        # 靠 lane.running」升级为「跨进程靠 SQLite 租约」。
+        self._lease_store = lease_store
 
         self._lanes: dict[str, _DeviceLane] = {
             device.serial: _DeviceLane(serial=device.serial, session=device)
@@ -308,12 +314,25 @@ class TaskScheduler:
                         # V2.6 §七：进程被杀时任务停在 RUNNING——上一个动作到底发出去
                         # 没有是未知的。标上 recovery_required，让 runtime 在真正跑之前
                         # 先处理（有恢复点就对账，没有就转人工），而不是当普通任务重跑。
-                        task.recovery_required = True
-                        task.apply_event(TaskEvent.RESUMED, source="scheduler")
-                        lane = self._lane_for(task)
-                        lane.push_ready(task, self._counter)
-                        restored["queued"] += 1
-                        restored_as = "queued(from running, recovery_required)"
+                        #
+                        # V3 M3：跨进程部署下，RUNNING 可能不是「本进程留下的」，而是
+                        # **另一个进程正在跑**（它还没落盘成终态）。此时绝不能再抢来恢复
+                        # ——两个进程同时执行同一个任务就是 v2.9 的 P0。先 claim，抢不到
+                        # 说明别的进程活着，本进程**跳过这条**，由持有者完成或租约过期后
+                        # 下一轮恢复再接管。
+                        if self._lease_store is not None and self._lease_store.claim(task.id) is None:
+                            logger.info(
+                                "任务 %s 的租约被其他进程持有，恢复时跳过", task.id
+                            )
+                            restored["skipped_leased"] = restored.get("skipped_leased", 0) + 1
+                            restored_as = "skipped(leased by other worker)"
+                        else:
+                            task.recovery_required = True
+                            task.apply_event(TaskEvent.RESUMED, source="scheduler")
+                            lane = self._lane_for(task)
+                            lane.push_ready(task, self._counter)
+                            restored["queued"] += 1
+                            restored_as = "queued(from running, recovery_required)"
                     else:
                         # created / queued / waiting
                         # waiting 说明在等人工确认。**确认上下文（危险动作待确认、人工完成
@@ -900,7 +919,25 @@ class TaskScheduler:
             lane.running = task
 
         acquired = False
+        lease_token: str | None = None
         try:
+            # V3 M3：跨进程租约。执行前先 claim——抢不到说明另一个进程正在跑这个
+            # 任务（或它的租约还没过期），把它放回队列等重试，而不是硬抢。
+            # 这一层补齐了「单进程内靠 lane.running 唯一」之外、跨进程的缺口。
+            if self._lease_store is not None:
+                lease = self._lease_store.claim(task.id)
+                if lease is None:
+                    logger.info(
+                        "任务 %s 的租约被其他进程持有，暂不执行（设备 %s）",
+                        task.id,
+                        lane.serial,
+                    )
+                    with self._cond:
+                        lane.push_ready(task, self._counter)
+                        self._cond.wait(timeout=self._idle_poll)
+                    return
+                lease_token = lease.token
+
             # 设备可能被单步调试端点（/tap、/actions）临时占着，拿不到就稍后重试
             if not lane.session.acquire(task.id):
                 logger.info("设备 %s 忙，任务 %s 稍后重试", lane.serial, task.id)
@@ -930,6 +967,8 @@ class TaskScheduler:
                     lane.running = None
             if acquired:
                 lane.session.release(task.id)
+            if lease_token is not None and self._lease_store is not None:
+                self._lease_store.release(task.id, lease_token)
 
     def _handle_outcome(self, task: Task, outcome: Any, lane: _DeviceLane) -> None:
         """把 runtime 的结果映射回任务状态。
