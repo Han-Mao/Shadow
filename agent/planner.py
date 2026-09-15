@@ -7,6 +7,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from models.action import Action, Decision
+from models.task_plan import TaskPlan
 from models.task_step import TaskStep
 from vision import vlm
 
@@ -70,11 +71,13 @@ def generate_plan(
     instruction: str,
     screenshot_path: str | Path,
     ui_tree: str | None = None,
-) -> list[dict]:
-    """根据首屏生成语义级步骤目标（§4.2）。调用方用 `Task.set_plan` 转成 TaskStep。
+) -> TaskPlan:
+    """根据首屏生成一份计划（`v4.3 §1`：goal + constraints + success_condition + steps）。
 
-    返回 `[{"goal": …, "expected_state": …}, …]`（v4.2 §三 P1 起带预期状态）。
-    形状归一化在 `vision.vlm.generate_plan` 里做，这一层只负责透传。
+    返回 `TaskPlan`；调用方 `Task.set_plan` 会把它拆进
+    `task.plan` / `plan_goal` / `plan_constraints` / `success_condition`。
+    形状归一化在 `vision.vlm.generate_plan` 与 `TaskPlan.from_payload` 里做，
+    这一层只负责透传。
     """
     return vlm.generate_plan(instruction, str(screenshot_path), ui_tree)
 
@@ -86,8 +89,13 @@ def plan_next_action(
     history: list[dict[str, Any]] | None = None,
     plan: list[TaskStep] | None = None,
     current_step: TaskStep | None = None,
+    plan_context: str = "",
 ) -> Decision:
-    """路线 A + 路线 B：由 VLM 根据截图、UI 树与当前步骤决定下一步做什么。"""
+    """路线 A + 路线 B：由 VLM 根据截图、UI 树与当前步骤决定下一步做什么。
+
+    `plan_context` 是任务级的目标 / 约束 / 完成条件（v4.3 §1 的 `TaskPlan` 三要素）
+    ——步骤列表只回答「走到哪了」，这三样回答「为什么走、不许怎么走」。
+    """
     return vlm.decide_next_action(
         instruction,
         str(screenshot_path),
@@ -95,7 +103,14 @@ def plan_next_action(
         history,
         format_plan(plan),
         current_step.goal if current_step else "",
+        plan_context,
     )
+
+
+def format_plan_context(task) -> str:
+    """把一个 Task 的任务级上下文渲染成一段可放进 prompt 的文字（空则返回空串）。"""
+    lines = task.plan_context_lines() if hasattr(task, "plan_context_lines") else []
+    return "\n".join(lines)
 
 
 def replan(

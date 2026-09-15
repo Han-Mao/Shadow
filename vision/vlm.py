@@ -14,6 +14,7 @@ from typing import Any
 import httpx
 
 from models.action import COMPLETION_ACTION_TYPES, Action, ActionRisk, ActionType, Decision, Point
+from models.task_plan import TaskPlan
 
 logger = logging.getLogger(__name__)
 
@@ -115,15 +116,22 @@ def build_plan_prompt(instruction: str, screenshot_path: str, ui_tree: str | Non
     tree = _compact_ui_tree(ui_tree)
     return (
         "你正在控制一部 Android 模拟器。请根据当前页面截图与可点击元素列表，"
-        f"为以下任务制定一个简洁的语义级执行计划（3-8 步）：\n{instruction}\n\n"
+        f"为以下任务制定一份执行计划（3-8 步）：\n{instruction}\n\n"
         "可点击元素（部分）：\n" + (tree or "无") + "\n\n"
-        "每一步请给出两样：`goal`（这一步要达成什么）与 "
+        "请先复述这次任务的三件事，再给步骤（v4.3 §1：任务级的规划上下文）：\n"
+        "  `goal`              —— 这一趟到底要达成什么（一句话）\n"
+        "  `constraints`       —— 执行过程中**不许做**什么（数组，没有就给空数组）\n"
+        "  `success_condition` —— 什么现象出现才算完成（一句话，可被观察到的）\n"
+        "然后给每一步：`goal`（这一步要达成什么）与 "
         "`expected_state`（做完之后页面上应该能看到什么，用于事后核对）。\n"
         "请仅返回 JSON：\n"
         "{\n"
-        '  "plan": [\n'
-        '    {"goal": "步骤1", "expected_state": "页面上应出现…"},\n'
-        '    {"goal": "步骤2", "expected_state": "…"}\n'
+        '  "goal": "打开微信给张三发消息",\n'
+        '  "constraints": ["不要跳转到浏览器"],\n'
+        '  "success_condition": "消息出现在与张三的聊天里",\n'
+        '  "steps": [\n'
+        '    {"goal": "打开微信", "expected_state": "微信首页出现"},\n'
+        '    {"goal": "进入与张三的聊天", "expected_state": "聊天页标题是张三"}\n'
         "  ]\n"
         "}"
     )
@@ -163,6 +171,7 @@ def build_decision_prompt(
     history: list[dict[str, Any]],
     plan: list[str],
     current_step_goal: str = "",
+    plan_context: str = "",
 ) -> str:
     steps = "\n".join(
         f"步骤 {o['step']}: {_format_action(o.get('action'))} -> {o.get('status')} "
@@ -172,9 +181,12 @@ def build_decision_prompt(
     plan_text = "\n".join(f"{i+1}. {p}" for i, p in enumerate(plan)) if plan else "无"
     focus = current_step_goal.strip() or "（尚未确定，请自行判断）"
     tree = _compact_ui_tree(ui_tree)
+    # 任务级上下文（目标 / 约束 / 完成条件，v4.3 §1）：**空就不占篇幅**——
+    # 「约束：无」这种行只会稀释 prompt，而模型对「没写」和「空」的理解是一样的。
     return (
         "你正在控制一部 Android 模拟器。任务：\n" + instruction + "\n\n"
-        "整体计划（[状态] 目标）：\n" + plan_text + "\n\n"
+        + (plan_context + "\n\n" if plan_context else "")
+        + "整体计划（[状态] 目标）：\n" + plan_text + "\n\n"
         "当前聚焦步骤：\n" + focus + "\n\n"
         "最近执行记录：\n" + (steps or "无") + "\n\n"
         "当前页面可点击元素（部分）：\n" + (tree or "无") + "\n\n"
@@ -311,15 +323,15 @@ def _call_vlm(messages: list[dict]) -> dict[str, Any]:
         raise VlmError(f"无法解析 VLM 响应结构: {exc}") from exc
 
 
-def generate_plan(instruction: str, screenshot_path: str, ui_tree: str | None) -> list[dict]:
-    """根据首屏生成语义级步骤计划。
+def generate_plan(instruction: str, screenshot_path: str, ui_tree: str | None) -> "TaskPlan":
+    """根据首屏生成一份计划（`TaskPlan{goal, constraints, success_condition, steps}`）。
 
-    返回 `[{"goal": …, "expected_state": …}, …]`。
+    归一化放在这里而不是让每个调用方自己判类型（v4.2 §三 P1 / v4.3 §1）：
+    `Task.set_plan` 要能吃「完整 dict」「纯步骤列表」「TaskPlan」三种形状，
+    而那三种形状的解析只该有一份（`TaskPlan.from_payload`）。
 
-    两种形状都收（v4.2 §三 P1）：模型给纯字符串列表（最常见，也是历史行为）时，
-    `expected_state` 补空串；给对象时原样取用。**归一化放在这里**而不是让每个调用方
-    自己判类型——`Task.set_plan` 与 `build_steps` 都得能吃这两种形状，而它们不该
-    各自写一遍「这到底是不是 dict」。
+    模型不按 prompt 给（只给步骤数组、或干脆只给字符串）时**降级而不是报错**：
+    计划缺失只影响提示质量，不该让任务直接失败。
     """
     image_b64 = _encode_image(screenshot_path)
     prompt = build_plan_prompt(instruction, screenshot_path, ui_tree)
@@ -339,16 +351,21 @@ def generate_plan(instruction: str, screenshot_path: str, ui_tree: str | None) -
     try:
         content = _call_vlm(messages)["content"]
         data = _extract_json(content)
-        plan = data.get("plan", [])
-        if isinstance(plan, list):
-            return [_normalize_plan_item(item) for item in plan if _normalize_plan_item(item)["goal"]]
+        if isinstance(data, dict):
+            return TaskPlan.from_payload(data)
+        if isinstance(data, list):
+            return TaskPlan.from_payload(data)
     except (VlmError, json.JSONDecodeError, KeyError):
         pass
-    return []
+    return TaskPlan()
 
 
 def _normalize_plan_item(item: Any) -> dict:
-    """计划里的一项 → `{"goal": …, "expected_state": …}`（模型给字符串也认）。"""
+    """计划里的一项 → `{"goal": …, "expected_state": …}`（模型给字符串也认）。
+
+    保留给旧调用点与用例；新代码走 `TaskPlan.from_payload` →
+    `models.task_step.build_steps`（同一条归一化路径）。
+    """
     if isinstance(item, dict):
         return {
             "goal": str(item.get("goal") or item.get("description") or "").strip(),
@@ -364,11 +381,17 @@ def decide_next_action(
     history: list[dict[str, Any]] | None = None,
     plan: list[str] | None = None,
     current_step_goal: str = "",
+    plan_context: str = "",
 ) -> Action:
-    """根据截图与任务历史，调用 VLM 返回下一步 Action。"""
+    """根据截图与任务历史，调用 VLM 返回下一步 Action。
+
+    `plan_context` 是任务级的目标/约束/完成条件（v4.3 §1），
+    由 `Task.plan_context_lines()` 渲染——每一步决策都看得到「别跑偏、别越约束」。
+    """
     image_b64 = _encode_image(screenshot_path)
     prompt = build_decision_prompt(
-        instruction, screenshot_path, ui_tree, history or [], plan or [], current_step_goal
+        instruction, screenshot_path, ui_tree, history or [], plan or [], current_step_goal,
+        plan_context,
     )
     messages = [
         {

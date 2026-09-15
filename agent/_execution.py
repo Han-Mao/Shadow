@@ -553,14 +553,16 @@ class ExecutionMixin:
         """生成一份全新计划（首次执行、恢复点失效、对账要求重规划都会走到这里）。"""
         try:
             state.model_call_count += 1
-            goals = planner.generate_plan(
+            plan = planner.generate_plan(
                 task.instruction, observation.screenshot_path, observation.ui_tree
             )
         except Exception as exc:  # noqa: BLE001 - 计划只是提示，失败不阻塞执行
             logger.warning("生成计划失败，按无计划执行: %s", exc)
-            goals = []
+            plan = None
 
-        task.set_plan(goals)
+        # `set_plan` 自己收 `TaskPlan` / 纯步骤列表 / None（归一化在
+        # `TaskPlan.from_payload`），所以这里不用为失败路径再分一次支。
+        task.set_plan(plan)
         self._persist(task)
         logger.info("任务 %s 计划：%s", task.id, task.plan_progress())
 
@@ -711,6 +713,9 @@ class ExecutionMixin:
                 history,
                 task.plan,
                 step,
+                # 任务级上下文（目标 / 约束 / 完成条件，v4.3 §1）：
+                # 步骤列表只回答「走到哪了」，这三样回答「为什么走、不许怎么走」。
+                planner.format_plan_context(task),
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("任务 %s 规划失败: %s", task.id, exc)

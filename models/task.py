@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 
 from .budget import TaskBudget
 from .exceptions import InvalidTransitionError
+from .task_plan import TaskPlan
 from .task_step import StepStatus, TaskStep, build_steps
 
 logger = logging.getLogger(__name__)
@@ -231,6 +232,18 @@ class Task(BaseModel):
 
     plan: list[TaskStep] = Field(default_factory=list)
 
+    # 任务级的「计划三要素」（v4.3 §1 / v4.4 §五）：模型对这次任务的复述。
+    # 它们与 plan 同生共死（都在 `set_plan` 里写），进决策 prompt 与 `/tasks/{id}`，
+    # 但**不参与完成裁定**——裁决只认独立证据（`agent/goal_verifier`）。
+    plan_goal: str = ""
+    """这一趟到底要干什么。写在 prompt 里，让每一步决策都看得到「别跑偏」。"""
+
+    plan_constraints: list[str] = Field(default_factory=list)
+    """不许做什么（「不要点广告」「只用微信不要跳浏览器」）。"""
+
+    success_condition: str = ""
+    """什么算完成——**给人看**的验收口径，不是裁决依据（v4.3 §1）。"""
+
     # 计划版本（V2.1 §二十一）。与 version 的区别：
     #   version      = **任务目标**的版本（SUPER_TASK 改写目标才 +1）
     #   plan_version = **计划**的版本（每次重建/插入步骤都 +1）
@@ -380,17 +393,35 @@ class Task(BaseModel):
 
     # ---- 步骤 ----
 
-    def set_plan(self, goals: list) -> None:
-        """用语义级目标重建计划。计划一变，plan_version 就 +1。
+    def set_plan(self, plan) -> None:
+        """用一份计划重建计划相关字段。计划一变，plan_version 就 +1。
 
-        列表元素可以是字符串，也可以是 `{"goal": …, "expected_state": …}`
-        （v4.2 §三 P1：模型可以顺带说出「这步做完页面该是什么样」）。
+        ``plan`` 收四种形状（归一化在 `TaskPlan.from_payload`）：
+        `TaskPlan` / 步骤列表（历史形状：`["打开微信", …]` 或带
+        `expected_state` 的 dict 列表）/ 模型返回的完整 dict（含任务级的
+        `goal` / `constraints` / `success_condition`）/ `None`（空计划）。
+
+        **任务级三要素只在这一处写入**：它们是「模型对这次任务的复述」，
+        与 `plan` 同生共死（重新规划时一起换），否则会出现
+        「新计划配旧约束」这种没人能解释的组合。
         """
-        self.plan = build_steps(goals)
+        parsed = TaskPlan.from_payload(plan)
+        self.plan = list(parsed.steps)
+        self.plan_goal = parsed.goal
+        self.plan_constraints = list(parsed.constraints)
+        self.success_condition = parsed.success_condition
         self.plan_version += 1
         self.active_step_id = None
         self.sync_current_step()
         self.updated_at = datetime.now()
+
+    def plan_context_lines(self) -> list[str]:
+        """任务级计划上下文（目标 / 约束 / 完成条件），给决策 prompt 与界面用。"""
+        return TaskPlan(
+            goal=self.plan_goal,
+            constraints=tuple(self.plan_constraints),
+            success_condition=self.success_condition,
+        ).context_lines()
 
     def step_states(self) -> dict[str, StepStatus]:
         return {step.id: step.status for step in self.plan}
