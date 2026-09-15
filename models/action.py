@@ -101,6 +101,10 @@ MUTATING_ACTION_TYPES = frozenset(
 )
 
 # 命中即升级为 DANGEROUS：这类动作在真实 App 里往往不可撤销（下单 / 转账 / 删除）
+#
+# V3 M2 起**降级为遗留材料**：风险/幂等的判定已统一走 `models.semantic` 的语义角色
+# （`infer_role` → `ROLE_SEMANTICS`），不再直接 grep 本表。保留它只为 `policy_risk_hits()`
+# 的日志/审计用途与历史兼容；新增语义动作请在 `models.semantic.ROLE_KEYWORDS` 里归类。
 DANGEROUS_KEYWORDS = (
     # 交易与资金
     "支付", "付款", "下单", "购买", "结算", "转账", "汇款", "提现", "充值", "退款", "扣款",
@@ -143,6 +147,9 @@ class SideEffectClass(str, Enum):
     """不可撤销：支付、转账、下单、删除、注销、解绑。"""
 
 
+# V3 M2 起这两个词表已**零引用**：副作用幂等判定改走 `models.semantic.infer_role`，
+# 语义角色（purchase/delete/submit/like…）→ `ROLE_SEMANTICS` 查表。保留定义仅为
+# 历史兼容与可读性（它们是 `ROLE_KEYWORDS` 的原始材料），新增词请改 `models/semantic`。
 IRREVERSIBLE_KEYWORDS = (
     "支付", "付款", "下单", "购买", "结算", "转账", "汇款", "提现", "扣款", "退款",
     "删除", "移除", "注销", "解绑", "解约", "退订", "清空", "格式化", "免密",
@@ -209,17 +216,24 @@ class Action(BaseModel):
         return [keyword for keyword in DANGEROUS_KEYWORDS if keyword in haystack]
 
     def policy_risk(self) -> ActionRisk:
-        """服务端规则推断的风险等级（类型 + 文本关键词），**不采纳**模型声明。
+        """服务端规则推断的风险等级（类型 + 文本语义），**不采纳**模型声明。
 
         这是「没有上下文时」的版本：只看动作自身。完整策略风险（含 UI 节点文本、
         当前页面）在 `ActionRiskGate.policy_risk`——它会把这些信息一起算进来。
+
+        V3 M2 起文本风险改走 `models.semantic.infer_role`：从「语义角色」查表派生，
+        不再只认 `DANGEROUS_KEYWORDS`。这补上了一个真实漏洞——「点赞 / 关注 / 分享」
+        这些动作副作用非幂等（不能重做），但旧逻辑判 SAFE（不在危险词表里），
+        导致「不能重做」却「不危险」的矛盾。现在它们判 CAUTION。
         """
-        if self.policy_risk_hits():
-            return ActionRisk.DANGEROUS
+        from .semantic import SemanticRole, infer_role, semantic_for
+
+        role = infer_role(self._policy_haystack())
+        if role is not SemanticRole.UNKNOWN:
+            return semantic_for(role).risk
+        # 认不出语义 → 按动作类型兜底
         if self.type in SAFE_ACTION_TYPES:
             return ActionRisk.SAFE
-        if self.type in CAUTION_ACTION_TYPES:
-            return ActionRisk.CAUTION
         return ActionRisk.CAUTION
 
     def model_risk(self) -> ActionRisk:
@@ -261,12 +275,18 @@ class Action(BaseModel):
         做一次」。派生规则刻意保守（拿不准就往重里判）：不可逆关键词 → IRREVERSIBLE；
         非幂等关键词 → NON_IDEMPOTENT_WRITE；只读 / 导航动作类型 → READ_ONLY；
         其余会改页面的动作 → IDEMPOTENT_WRITE。
+
+        V3 M2 起改走 `models.semantic`：副作用与风险都从同一个「语义角色」查表派生，
+        不再各自 grep 一套关键词（消灭旧 `IRREVERSIBLE_KEYWORDS` /
+        `NON_IDEMPOTENT_KEYWORDS` 与 `DANGEROUS_KEYWORDS` 三表并存的矛盾）。
+        函数内延迟 import 以避免 `semantic` ↔ `action` 的循环依赖。
         """
-        haystack = self._policy_haystack()
-        if any(keyword in haystack for keyword in IRREVERSIBLE_KEYWORDS):
-            return SideEffectClass.IRREVERSIBLE
-        if any(keyword in haystack for keyword in NON_IDEMPOTENT_KEYWORDS):
-            return SideEffectClass.NON_IDEMPOTENT_WRITE
+        from .semantic import SemanticRole, infer_role, semantic_for
+
+        role = infer_role(self._policy_haystack())
+        if role is not SemanticRole.UNKNOWN:
+            return semantic_for(role).side_effect
+        # 认不出语义 → 按动作类型兜底（BACK/HOME/WAIT 只读，其余会改页面的幂等写）
         if self.type in READ_ONLY_ACTION_TYPES:
             return SideEffectClass.READ_ONLY
         return SideEffectClass.IDEMPOTENT_WRITE

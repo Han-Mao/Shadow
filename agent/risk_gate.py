@@ -28,7 +28,6 @@ import logging
 from dataclasses import dataclass, field
 
 from models.action import (
-    DANGEROUS_KEYWORDS,
     SAFE_ACTION_TYPES,
     SENSITIVE_PACKAGE_MARKERS,
     Action,
@@ -36,6 +35,7 @@ from models.action import (
     risk_rank,
     strictest,
 )
+from models.semantic import SemanticRole, infer_role, semantic_for
 from vision import target as target_evidence
 
 logger = logging.getLogger(__name__)
@@ -149,7 +149,10 @@ class ActionRiskGate:
         # 1) 动作类型
         type_risk = ActionRisk.SAFE if action.type in SAFE_ACTION_TYPES else ActionRisk.CAUTION
 
-        # 2) 文本关键词 —— 动作自身 + **目标元素**在 UI 树里的真实文本
+        # 2) 语义角色 —— 动作自身 + **目标元素**在 UI 树里的真实文本，统一进
+        #    `infer_role` 判「这个动作到底在做什么」，再从角色查表派生风险。
+        #    V3 M2 起取代旧的关键词 grep：不再只认 DANGEROUS_KEYWORDS，而是
+        #    语义角色（purchase / delete / authorize / submit / like / …）。
         resolved = target_evidence.resolve_target(
             action,
             context.ui_tree if context else None,
@@ -161,14 +164,20 @@ class ActionRiskGate:
             for part in (action._policy_haystack(), node_text.lower(), resolved.resource_id.lower())
             if part
         )
-        hits = [keyword for keyword in DANGEROUS_KEYWORDS if keyword in haystack]
-        if hits:
-            reasons.append(f"命中不可撤销关键词：{'/'.join(dict.fromkeys(hits))}")
-            if node_text and any(keyword in node_text.lower() for keyword in hits):
+        role = infer_role(haystack)
+        text_risk = semantic_for(role).risk
+
+        if role is not SemanticRole.UNKNOWN:
+            reasons.append(f"语义角色 {role.value}（判定风险 {text_risk.value}）")
+            if node_text and role in (
+                SemanticRole.PURCHASE,
+                SemanticRole.DELETE,
+                SemanticRole.AUTHORIZE,
+                SemanticRole.SUBMIT,
+            ):
                 # 这一条是 V2.2 新增的关键能力：动作描述里没有危险词，
                 # 但被点到的那个控件本身叫「立即购买」——只有查 UI 树才知道
                 reasons.append(f"目标元素实为「{node_text}」")
-        text_risk = ActionRisk.DANGEROUS if hits else ActionRisk.SAFE
 
         # 3) 页面敏感度下限：支付/银行类 App 里会改页面的动作至少 CAUTION
         page_risk = ActionRisk.SAFE
