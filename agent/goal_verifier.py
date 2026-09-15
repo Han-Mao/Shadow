@@ -45,7 +45,7 @@ from models.action import Action
 from models.state import Observation
 from vision import parser
 
-from . import goal_policy
+from . import goal_oracle, goal_policy
 
 logger = logging.getLogger(__name__)
 
@@ -168,11 +168,31 @@ def verify_goal(
         )
 
     # ---- L6-a：计划跑完了（计划状态是本地事实，不是模型自述）----
+    # V3 M1：计划跑完只是「执行系统内部状态」，不是「真实世界目标状态」。
+    # 计划是模型自己拆的——它漏了「进入详情页」这一步，计划照样能跑完，
+    # 但目标没达成。所以 strict 画像（navigation / side_effect）下，
+    # 「计划跑完」必须叠加世界证据（页面推进过）才算完成；只有纯查询
+    # （advisory 画像）才允许计划跑完单独构成完成。
     if pending_steps == 0:
+        if goal_oracle.achieved_by_plan_alone(profile):
+            return decided(
+                GoalVerdict.CONFIRMED,
+                "计划中没有未完成步骤，且本任务为纯查询，计划跑完即视为完成",
+                independent_evidence=True,
+            )
+        # strict 画像：计划跑完是门槛，不是依据。页面推进过 → 世界状态确实变了，
+        # 才构成独立证据；否则只有内部状态，如实记为不确定。
+        if page_seen_changed:
+            return decided(
+                GoalVerdict.CONFIRMED,
+                "计划跑完且观察到页面推进（世界状态确实变了），独立证据支持完成",
+                independent_evidence=True,
+            )
         return decided(
-            GoalVerdict.CONFIRMED,
-            "计划中没有未完成步骤，独立证据支持完成",
-            independent_evidence=True,
+            GoalVerdict.UNCERTAIN,
+            f"计划虽已跑完，但本任务为 {profile.value} 画像，"
+            "计划跑完只是执行系统内部状态，且未观察到页面推进，"
+            "缺少独立于模型计划的世界证据",
         )
 
     # ---- strict：计划没做完就不认 ----
