@@ -1,4 +1,4 @@
-"""事件日志（V2.1 §二十三）。
+"""事件日志（V2.1 §二十三 · V4 §四）。
 
 轨迹（`TrajectoryStore`）记的是「每一步看到了什么」——为**下一步决策**服务，
 所以只保留最近几条，而且会被裁剪。
@@ -7,38 +7,40 @@
 所以只追加、不裁剪，并且要能事后回答「它为什么会被抢占」「为什么会失败」。
 两者用途不同，不要合并成一个。
 
-格式选 JSONL 而不是单个 JSON 数组：追加不需要「读出来改完再整个写回」，
-进程在写一半时被杀也只丢最后一行，不会损坏已有记录。
+## 为什么从 JSONL 换到 SQLite（V4 §四）
 
-## 一致性模型（V3.3 修复轮 §一/§二：写清楚它到底保证什么）
+V3.3 §一 给 JSONL 补上了 `write → fsync`（**落盘可靠性**），但审核列的那一串它给不了：
 
-这份日志**不是**一个数据库，能力边界必须写明白，否则「durable」会被理解错：
+    多进程全序 · 查询 · 筛选 · 分页 · 关联 · 事务
 
-| 保证 | 成立吗 | 靠什么 |
-|---|---|---|
-| 单条事件不撕裂（不会读到半行） | ✅ | `O_APPEND` + **单次 `os.write`** |
-| 安全关键事件落盘（掉电后仍在） | ✅ | `emit_critical` 里 `fsync(文件)` |
-| 同进程内多条事件顺序 = 调用顺序 | ✅ | 进程内 `threading.Lock` + 单次 write |
-| **跨进程**事件顺序（全局单调 id） | ❌ | 没有跨进程锁；多进程各写各的行 |
-| 跨进程互斥（同一 jti 只用一次那种语义） | ❌ | 那类语义由 SQLite 承担（confirmation / lease） |
+现在这些由表结构与数据库本身提供：
 
-也就是说：**多进程部署下这里保证的是「不撕裂」，不是「串行化」**。
-事件流里不要假设「先写的一定排在前面」——需要跨进程全序时，正解是换
-SQLite 的 `events` 表（见 README 的 V4 Storage Refactor），
-而不是继续在这个文件格式上加锁。
+| 保证 | 靠什么 |
+|---|---|
+| 每条事件有**每任务连续**的序号（1、2、3…） | `UNIQUE(task_id, sequence)` + 同事务内算序号 |
+| 多进程同时写不丢、序号不重 | `BEGIN IMMEDIATE` + `busy_timeout` + 唯一约束 |
+| commit 返回即落盘 | `PRAGMA synchronous=FULL`（替代手写 fsync） |
+| 按 `execution_id` 串起一次执行的全链条（V4 §五） | 索引 `idx_events_execution` |
+
+**接口刻意保持不变**（`emit` / `emit_critical` / `read` / `kinds`）：它有三四十个调用点，
+这次要换的是**存储**而不是用法。分级（安全关键事件 fail-closed）也原样保留——
+那是 V3.1 P0-1 的成果，与存储实现无关。
+
+旧的 `<task_id>.jsonl` 会在首次打开时**一次性导入**（见 `_import_legacy_jsonl`），
+所以升级不会丢掉已有的事件流。
 """
 from __future__ import annotations
 
 import json
 import logging
-import os
-import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
 from models.exceptions import PersistenceError
+
+from .event_store import EventStore
 
 logger = logging.getLogger(__name__)
 
@@ -121,50 +123,42 @@ class Event:
     # 秒级粒度会把这类分析糊掉
     at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="milliseconds"))
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
+    # V4 §四：每个任务独立的序号。它才是「先后」的权威依据——
+    # 毫秒时间戳在两个进程同时写时可能相同，序号不会。
+    sequence: int | None = None
 
     def to_dict(self) -> dict:
-        return {
+        payload = {
             "id": self.id,
             "task_id": self.task_id,
             "kind": self.kind,
             "at": self.at,
             "data": self.data,
         }
-
-
-def _encode(event: Event) -> bytes:
-    """一行 JSONL（含换行），**一次编码完**。
-
-    先编码再写，是为了让「写」这一步只有一次 `os.write`——见 `_append_line`。
-    """
-    return (json.dumps(event.to_dict(), ensure_ascii=False) + "\n").encode("utf-8")
-
-
-def _fsync_dir_best_effort(directory: Path) -> None:
-    """把目录项本身刷盘，失败就算了。
-
-    与 `JsonStore._fsync_directory` 同义，但**刻意不复用**：两者的失败策略不同。
-    那边任何时候都吞异常（降级是可接受的），这里只在「新建了日志文件」这一种情形
-    下调用——文件内容已经由 `os.fsync(fd)` 兜住，目录项丢失只影响「名字可见性」。
-    """
-    try:
-        fd = os.open(directory, os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(fd)
-    except OSError:
-        pass
-    finally:
-        os.close(fd)
+        if self.sequence is not None:
+            payload["sequence"] = self.sequence
+        return payload
 
 
 class EventLog:
-    """追加式事件日志，每个任务一个 `.jsonl` 文件。"""
+    """追加式事件日志（SQLite 表 `events`）。"""
 
     def __init__(self, root: str | Path) -> None:
-        self._root = Path(root)
-        self._lock = threading.Lock()
+        """`root` 可以是**目录**（历史用法：库落在 `<root>/events.db`）或一个 `.db` 路径。
+
+        保留「传目录」这种用法是有意的：三十多个调用点都在传
+        `STORAGE_DIR / "events"`，而这次改的是存储不是用法。
+        """
+        target = Path(root)
+        self._legacy_root = target if target.suffix != ".db" else target.parent
+        db_path = target if target.suffix == ".db" else target / "events.db"
+        self.path = str(db_path)
+        self._store = EventStore(db_path)
+        imported = self._import_legacy_jsonl()
+        if imported:
+            logger.info("已把 %d 条历史 JSONL 事件导入 SQLite（%s）", imported, self.path)
+
+    # ---- 写 ----
 
     def emit(self, task_id: str, kind: str, **data) -> Event:
         """写一条事件。**按 kind 自动分级**（V3.1 P0）。
@@ -179,21 +173,14 @@ class EventLog:
         的 fail-open 分支——常量表说它们是「丢失即审计链断裂」，真实行为却是
         「写不进去也照跑」。「约定调用方记得选对方法」这种事早晚会漏，
         所以让唯一的写入口自己按 kind 决定。
-
-        报错方式（`PersistenceError`）与 `Runtime._degrade` / TaskManager 的失败分流
-        完全一致：安全事件写不进 = durable state 落后于现实，任务停在 DEGRADED，
-        而不是带着「转账了但没有授权记录」继续跑。
         """
         if is_safety_critical(kind):
             return self.emit_critical(task_id, kind, **data)
 
         event = Event(task_id=task_id, kind=kind, data=data)
         try:
-            with self._lock:
-                # durable=False：普通事件是**旁路**。它是审计的补充，不是副作用的
-                # 前置条件，所以不为它付 fsync 的代价（那会把热路径拖慢，
-                # 而且没有任何东西会因为这条事件没落盘而变危险）。
-                self._append_line(task_id, _encode(event), durable=False)
+            row = self._store.append(task_id, kind, data)
+            event.sequence = int(row["sequence"])
         except Exception as exc:  # noqa: BLE001 - 普通事件是旁路，不能成为故障源
             logger.warning("写事件日志失败（任务 %s / %s）：%s", task_id, kind, exc)
         return event
@@ -205,92 +192,119 @@ class EventLog:
         也可以被显式调用，用来强制让一个**不在** `SAFETY_CRITICAL_KINDS` 里的事件
         走 fail-closed（例如未来新增的审计关键事件先上线、再补进常量表）。
 
-        与 `emit` 的区别：`emit` 是旁路（fail-open，写不进不挡执行）；
-        安全关键事件（危险动作已 dispatch、风险判定、人工批准、完成认定）一旦
-        丢失，审计链就断了——「手机转账了但没记录」不可接受。所以这里写失败要
-        **抛出去**，由调用方（runtime）把任务降级、副作用不继续。
+        为什么写失败要**抛出去**：安全关键事件（危险动作已 dispatch、风险判定、
+        人工批准、完成认定）一旦丢失，审计链就断了——「手机转账了但没记录」不可接受。
+        调用方（runtime / API 的手工路径）据此把任务降级、副作用不继续。
 
-        V3.3 §一：`durable` 的含义也是在这里被写实的。以前这里只做到「`write` 返回」，
-        而 `write` 返回只代表「进了内核 page cache」——「手机已经点了付款 + 进程认为
-        事件已记录 + 掉电」这三件事叠起来，日志可能根本不在盘上。现在这条路是
-        `单次 write → fsync → 返回`，`fsync` 失败即抛（不 durable 就不放行）。
-
-        注意：普通事件仍走 `emit`（fail-open），只有明确的安全关键事件才走这里。
-        分级而不是一刀切，避免「审计日志抖动就把所有任务都降级」。
+        V3.3 §一 补的落盘语义在 V4 §四 之后由数据库给：`synchronous=FULL` 之下
+        **commit 返回即落盘**，所以「写成功」这次真的等于 durable——
+        不再需要我们逐条记住该不该 fsync。
         """
         event = Event(task_id=task_id, kind=kind, data=data)
         try:
-            with self._lock:
-                self._append_line(task_id, _encode(event), durable=True)
+            row = self._store.append(task_id, kind, data)
+            event.sequence = int(row["sequence"])
         except Exception as exc:  # noqa: BLE001 - 转换后重新抛出
             raise PersistenceError(task_id, f"安全关键事件 {kind} 写盘失败：{exc}") from exc
         return event
 
-    # ---- 写入原语 ----
-
-    def _append_line(self, task_id: str, payload: bytes, *, durable: bool) -> None:
-        """把一行追加进 `<task_id>.jsonl`。
-
-        为什么不用 `path.open("a")` 那套文本层写法：`write` 返回只说明「进了用户态
-        缓冲」，离「持久」还差两层（Python 缓冲 + 内核 page cache）；而且文本层无法
-        保证跨进程时一次 append 不被切开。这里改成：
-
-            os.open(O_APPEND | O_CREAT | O_WRONLY) → 单次 os.write → （可选）os.fsync
-
-        - `O_APPEND` + **单次** `write`：内核把「定位到文件尾」与「写入」做成一次原子
-          操作，所以多进程同时追加时行与行不会交错（一行远小于一次 write 的原子粒度）。
-          它给的是**不撕裂**，不是**串行化**——跨进程的先后顺序仍不做承诺，
-          详见模块 docstring 的一致性模型表。
-        - `durable=True`：再 `fsync`，把内核页缓存压到盘上。
-        - `fsync` 失败**必须抛**：它意味着这次写入不 durable，而安全关键事件的契约
-          就是「不 durable 就不放行」。这与 `JsonStore` 那边「fsync 失败就降级为
-          升级前行为」是**相反**的取舍，因为状态写入迟早会再发生一次，
-          而「已发生的副作用」没有第二次机会。
-        """
-        path = self._root / f"{task_id}.jsonl"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        existed = path.exists()
-        fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o644)
-        try:
-            os.write(fd, payload)
-            if durable:
-                os.fsync(fd)
-        finally:
-            os.close(fd)
-        if durable and not existed:
-            # 新建文件时目录项也值得刷一次（掉电可能「内容在、名字没了」）。
-            # 文件本来就存在时目录项早已稳定，跳过。
-            _fsync_dir_best_effort(path.parent)
+    # ---- 读 ----
 
     def read(self, task_id: str, limit: int = 200) -> list[Event]:
-        """按时间顺序读取最近的事件。"""
-        path = self._root / f"{task_id}.jsonl"
-        if not path.exists():
-            return []
+        """按顺序读取最近 `limit` 条事件。"""
         try:
-            lines = path.read_text(encoding="utf-8").splitlines()
-        except Exception as exc:  # noqa: BLE001
+            rows = self._store.read(task_id, limit=limit)
+        except Exception as exc:  # noqa: BLE001 - 读失败不该把 500 带给调用方
             logger.warning("读事件日志失败（任务 %s）：%s", task_id, exc)
             return []
-
-        events: list[Event] = []
-        for line in lines[-limit:]:
-            if not line.strip():
-                continue
-            try:
-                raw = json.loads(line)
-            except json.JSONDecodeError:
-                continue  # 被截断的最后一行，跳过即可
-            events.append(
-                Event(
-                    task_id=raw.get("task_id", task_id),
-                    kind=raw.get("kind", ""),
-                    data=raw.get("data", {}),
-                    at=raw.get("at", ""),
-                    id=raw.get("id", ""),
-                )
-            )
-        return events
+        return [self._to_event(row) for row in rows]
 
     def kinds(self, task_id: str) -> list[str]:
-        return [event.kind for event in self.read(task_id)]
+        try:
+            return self._store.kinds(task_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("读事件类型失败（任务 %s）：%s", task_id, exc)
+            return []
+
+    def read_by_execution(self, execution_id: str, limit: int = 200) -> list[Event]:
+        """按 `execution_id` 取事件（V4 §五：一次执行的完整链条）。"""
+        try:
+            rows = self._store.read_by_execution(execution_id, limit=limit)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("按执行读事件失败（%s）：%s", execution_id, exc)
+            return []
+        return [self._to_event(row) for row in rows]
+
+    def task_ids(self) -> list[str]:
+        """出现过事件的任务 id（回放脚本用它列出可回放的对象）。"""
+        try:
+            return self._store.task_ids()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("列出事件任务失败：%s", exc)
+            return []
+
+    def count(self, task_id: str | None = None) -> int:
+        return self._store.count(task_id)
+
+    def close(self) -> None:
+        self._store.close()
+
+    # ---- 内部 ----
+
+    @staticmethod
+    def _to_event(row: dict) -> Event:
+        try:
+            data = json.loads(row["payload"])
+        except (TypeError, json.JSONDecodeError):
+            # 结构坏掉的 payload 不让整条读路径失败：留一个空 dict，事件本身还在
+            data = {}
+        return Event(
+            task_id=row["task_id"],
+            kind=row["kind"],
+            data=data if isinstance(data, dict) else {},
+            at=row["created_at"],
+            id=row["event_id"],
+            sequence=int(row["sequence"]),
+        )
+
+    def _import_legacy_jsonl(self) -> int:
+        """把旧的 `<task_id>.jsonl` 一次性搬进表里，返回导入条数（V4 §四）。
+
+        两种情况直接跳过：
+        - 表里已经有事件（说明已经在用新存储，不该再往里灌历史）；
+        - 目录里没有 `.jsonl`。
+
+        导入保留**原来的 event_id 与时间戳**：否则搬过来的事件会看起来
+        「全都发生在升级那一刻」，而回放与审计正是要看它们之间隔了多久。
+        被截断的坏行照旧跳过（与 JSONL 版的行为一致）。
+        """
+        if not self._legacy_root.exists():
+            return 0
+        legacy_files = sorted(self._legacy_root.glob("*.jsonl"))
+        if not legacy_files or self._store.count() > 0:
+            return 0
+
+        imported = 0
+        for path in legacy_files:
+            task_id = path.stem
+            for line in path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    raw = json.loads(line)
+                except json.JSONDecodeError:
+                    continue  # 被截断的最后一行
+                kind = raw.get("kind") or ""
+                if not kind:
+                    continue
+                data = raw.get("data")
+                self._store.append(
+                    raw.get("task_id") or task_id,
+                    kind,
+                    data if isinstance(data, dict) else {},
+                    event_id=raw.get("id") or None,
+                    created_at=raw.get("at") or None,
+                )
+                imported += 1
+        return imported
