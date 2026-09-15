@@ -117,9 +117,14 @@ def build_plan_prompt(instruction: str, screenshot_path: str, ui_tree: str | Non
         "你正在控制一部 Android 模拟器。请根据当前页面截图与可点击元素列表，"
         f"为以下任务制定一个简洁的语义级执行计划（3-8 步）：\n{instruction}\n\n"
         "可点击元素（部分）：\n" + (tree or "无") + "\n\n"
+        "每一步请给出两样：`goal`（这一步要达成什么）与 "
+        "`expected_state`（做完之后页面上应该能看到什么，用于事后核对）。\n"
         "请仅返回 JSON：\n"
         "{\n"
-        '  "plan": ["步骤1", "步骤2", ...]\n'
+        '  "plan": [\n'
+        '    {"goal": "步骤1", "expected_state": "页面上应出现…"},\n'
+        '    {"goal": "步骤2", "expected_state": "…"}\n'
+        "  ]\n"
         "}"
     )
 
@@ -306,8 +311,16 @@ def _call_vlm(messages: list[dict]) -> dict[str, Any]:
         raise VlmError(f"无法解析 VLM 响应结构: {exc}") from exc
 
 
-def generate_plan(instruction: str, screenshot_path: str, ui_tree: str | None) -> list[str]:
-    """根据首屏生成语义级步骤计划。"""
+def generate_plan(instruction: str, screenshot_path: str, ui_tree: str | None) -> list[dict]:
+    """根据首屏生成语义级步骤计划。
+
+    返回 `[{"goal": …, "expected_state": …}, …]`。
+
+    两种形状都收（v4.2 §三 P1）：模型给纯字符串列表（最常见，也是历史行为）时，
+    `expected_state` 补空串；给对象时原样取用。**归一化放在这里**而不是让每个调用方
+    自己判类型——`Task.set_plan` 与 `build_steps` 都得能吃这两种形状，而它们不该
+    各自写一遍「这到底是不是 dict」。
+    """
     image_b64 = _encode_image(screenshot_path)
     prompt = build_plan_prompt(instruction, screenshot_path, ui_tree)
     messages = [
@@ -328,10 +341,20 @@ def generate_plan(instruction: str, screenshot_path: str, ui_tree: str | None) -
         data = _extract_json(content)
         plan = data.get("plan", [])
         if isinstance(plan, list):
-            return [str(p) for p in plan]
+            return [_normalize_plan_item(item) for item in plan if _normalize_plan_item(item)["goal"]]
     except (VlmError, json.JSONDecodeError, KeyError):
         pass
     return []
+
+
+def _normalize_plan_item(item: Any) -> dict:
+    """计划里的一项 → `{"goal": …, "expected_state": …}`（模型给字符串也认）。"""
+    if isinstance(item, dict):
+        return {
+            "goal": str(item.get("goal") or item.get("description") or "").strip(),
+            "expected_state": str(item.get("expected_state") or item.get("expect") or "").strip(),
+        }
+    return {"goal": str(item).strip(), "expected_state": ""}
 
 
 def decide_next_action(

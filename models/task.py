@@ -380,8 +380,12 @@ class Task(BaseModel):
 
     # ---- 步骤 ----
 
-    def set_plan(self, goals: list[str]) -> None:
-        """用语义级目标重建计划。计划一变，plan_version 就 +1。"""
+    def set_plan(self, goals: list) -> None:
+        """用语义级目标重建计划。计划一变，plan_version 就 +1。
+
+        列表元素可以是字符串，也可以是 `{"goal": …, "expected_state": …}`
+        （v4.2 §三 P1：模型可以顺带说出「这步做完页面该是什么样」）。
+        """
         self.plan = build_steps(goals)
         self.plan_version += 1
         self.active_step_id = None

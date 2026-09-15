@@ -26,10 +26,17 @@ def format_plan(plan: list[TaskStep] | None) -> list[str]:
 
     这是 V2 计划从 `list[str]` 升级成 `list[TaskStep]` 的实际收益：
     模型能看到「哪几步已经做完」，而不是每次都面对一份一模一样的静态清单。
+
+    v4.2 §三 P1 起顺带把模型的 `expected_state` 也带进去：下一步决策时能读到
+    「上一步本来预期看到什么」，而不是只看到一个步骤名。
     """
     if not plan:
         return []
-    return [f"[{step.status.value}] {step.goal}" for step in plan]
+    return [
+        f"[{step.status.value}] {step.goal}"
+        + (f"（预期：{step.expected_state}）" if step.expected_state else "")
+        for step in plan
+    ]
 
 
 class ReplanContext(BaseModel):
@@ -63,8 +70,12 @@ def generate_plan(
     instruction: str,
     screenshot_path: str | Path,
     ui_tree: str | None = None,
-) -> list[str]:
-    """根据首屏生成语义级步骤目标（§4.2）。调用方用 `Task.set_plan` 转成 TaskStep。"""
+) -> list[dict]:
+    """根据首屏生成语义级步骤目标（§4.2）。调用方用 `Task.set_plan` 转成 TaskStep。
+
+    返回 `[{"goal": …, "expected_state": …}, …]`（v4.2 §三 P1 起带预期状态）。
+    形状归一化在 `vision.vlm.generate_plan` 里做，这一层只负责透传。
+    """
     return vlm.generate_plan(instruction, str(screenshot_path), ui_tree)
 
 

@@ -37,7 +37,28 @@ def new_step_id(index: int) -> str:
     return f"s{index}"
 
 
-def build_steps(goals: list[str], *, max_retries: int | None = None) -> list["TaskStep"]:
+def _normalize_goal(item: "str | dict") -> tuple[str, str]:
+    """把「计划里的一项」摊成 `(目标, 预期状态)`。
+
+    两种写法都要收：
+      - 纯字符串（模型最常给的形状，也是所有历史用例的形状）→ 预期状态为空；
+      - 对象 `{"goal": …, "expected_state": …}`（v4.2 §三 P1 起模型可以给）。
+
+    `expected_state` 只是一个**说明性字段**，不参与完成裁定——裁定仍然由
+    `agent/goal_verifier` 用**独立证据**（页面结构 / 目标元素 / 导航变化）作出。
+    把模型自己写的「预期」当证据，等于让「模型说它成了」变成「它成了」，
+    那正是这个仓库花了 V2.2 一整轮拆掉的东西。
+    """
+    if isinstance(item, dict):
+        goal = str(item.get("goal") or item.get("description") or "").strip()
+        expected = str(item.get("expected_state") or item.get("expect") or "").strip()
+        return goal, expected
+    return str(item).strip(), ""
+
+
+def build_steps(
+    goals: list, *, max_retries: int | None = None
+) -> list["TaskStep"]:
     """把语义级目标列表转成带状态与依赖的步骤序列。
 
     默认串行依赖（s2 依赖 s1）：手机 GUI 任务的步骤几乎都是顺序的，
@@ -45,15 +66,24 @@ def build_steps(goals: list[str], *, max_retries: int | None = None) -> list["Ta
 
     ``max_retries`` 不传时取 `DEFAULT_POLICY.step_max_retries`——步骤级重试上限
     与 Runtime 共用同一份策略，不再各处硬编码（V2.1 §十二）。
+
+    列表元素可以是字符串，也可以是 `{"goal": …, "expected_state": …}`
+    （见 `_normalize_goal`）。**空目标的项会被跳过**：给不出目标的「步骤」
+    进了计划只会变成一条永远卡住的 pending。
     """
     retries = DEFAULT_POLICY.step_max_retries if max_retries is None else max_retries
     steps: list[TaskStep] = []
-    for i, goal in enumerate(goals, start=1):
+    for raw in goals:
+        goal, expected = _normalize_goal(raw)
+        if not goal:
+            continue
+        index = len(steps) + 1
         steps.append(
             TaskStep(
-                id=new_step_id(i),
-                goal=str(goal).strip(),
-                depends_on=[new_step_id(i - 1)] if i > 1 else [],
+                id=new_step_id(index),
+                goal=goal,
+                expected_state=expected,
+                depends_on=[new_step_id(index - 1)] if index > 1 else [],
                 max_retries=retries,
             )
         )
@@ -65,6 +95,20 @@ class TaskStep(BaseModel):
 
     id: str = Field(default_factory=lambda: f"s{uuid.uuid4().hex[:4]}")
     goal: str
+
+    expected_state: str = ""
+    """**这一步做完之后，页面应该是什么样**（v4.2 §三 P1，模型可选填）。
+
+    补的是「计划只有步骤名、没有成功标准」这个缺口。它与 `depends_on` 一起让计划
+    从「一串待办」变成「一张有依赖、有验收口径的清单」，也让人在 `/tasks/{id}`
+    里一眼看出模型当时以为自己在干什么。
+
+    **刻意不参与裁定**：`agent/goal_verifier` 仍然只认独立证据（页面结构变了没、
+    目标元素还在不在、有没有成功标志）。把模型写的预期当证据，
+    会让「模型说它成了」等价于「它成了」——V2.2 §四 整轮就是在拆这个。
+    真要让它参与，前提是它能被验成机器可判的谓词（`agent/goal_oracle` 那套），
+    那是独立一轮的工作量。
+    """
 
     status: StepStatus = StepStatus.PENDING
 
