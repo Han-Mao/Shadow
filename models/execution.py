@@ -15,8 +15,9 @@
 `Task` 是「任务级执行」，`ActionExecution` 是「动作级执行」；两者都属于更高一级的
 `Execution`（V4 §二）——将来手工点击、Agent 自动执行、Android 真机操作可以共用同一张表。
 
-刻意用 dataclass 而不是 pydantic `BaseModel`：这是**事实记录**，不需要校验魔法，
-落盘复用 `JsonStore`（已经有 tmp + fsync + os.replace 的原子写），改动面最小。
+刻意用 dataclass 而不是 pydantic `BaseModel`：这是**事实记录**，不需要校验魔法；
+落盘由 `storage/execution_store.py` 负责（v4.1 §二 起是 SQLite 表 `executions`，
+不再是「一执行一个 JSON 文件」）。
 """
 from __future__ import annotations
 

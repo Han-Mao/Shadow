@@ -167,9 +167,13 @@ db = Database(STORAGE_DIR)
 event_log = EventLog(db)
 task_store = TaskStore(db, event_log=event_log)
 checkpoint_store = CheckpointStore(db)
-# 执行记录（V4 §一）：手工端点每次调用一条，`execution_id` 同时是它的事件流所有者。
-# 它仍然是「一执行一文件」——每条记录彼此无关，没有跨记录事务的需求。
-execution_store = ExecutionStore(STORAGE_DIR / "executions")
+# 执行记录（V4 §一 · v4.1 §二）：手工端点每次调用一条，`execution_id` 同时是它的事件流所有者。
+#
+# v4.1 §二 起它也在**同一个库**里（此前是一执行一个 JSON 文件，是最后一个还没收敛的
+# 存储）。搬进来的实际收益有三条：状态成为可查询的列（§六 的恢复扫描靠它）、
+# 状态迁移可以用一条带 `WHERE status=?` 的语句做守卫（§七 的「同一条执行不能派发两次」）、
+# 与它的事件流在同一个库里（§八 那条「Task → Execution → Events」的链）。
+execution_store = ExecutionStore(db)
 
 # ---- 确认令牌的「已消费」记录（V3.2 §二）----
 #
