@@ -1,0 +1,8 @@
+# 开发/测试依赖（V4 §9）。
+#
+# 与 `requirements.txt` 分开的理由很直接：生产环境不需要 pytest。
+# 版本同样钉死——测试跑不起来和功能跑不起来一样致命，只是发现得晚一点。
+#
+#     pip install -r requirements-dev.txt
+-r requirements.txt
+pytest==9.1.1
