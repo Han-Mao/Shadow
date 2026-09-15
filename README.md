@@ -104,7 +104,7 @@ V3.3 起 `Vision / Device` 这一层的左边是 `DeviceController` **协议**�
 ├── scripts/
 │   ├── demo_preemption.py  # 抢占恢复演示（离线可跑）
 │   └── replay_task.py      # 命令行回放一个任务的事件流
-└── tests/                  # 672 个离线用例
+└── tests/                  # 675 个离线用例
 ```
 
 ## 职责边界
@@ -1565,8 +1565,12 @@ V4 之后「唯一写者」可以落在**数据库事务**上（地基已铺好�
 
 - **Commit 5 的 Task Actor 化**：触发条件见 `agent/task_manager.py` 注释——多路注入成常态、
   CAS conflict 成规模、或跨进程写同一 Task 成常态时，把 mutation 收口到「数据库事务里的唯一写者」。
-- **Policy Engine（v3.3 §八 的延期项）**：缺的是「App 敏感状态」（现在只有包名静态词表）
-  与「风险历史回路」（完全没有），补记在 `models/semantic.py`。
+- **Policy Engine 的剩余两步**（v3.3 §八 的延期项）：
+  ① 「App 敏感状态」已经补了一半——V4 起除了包名静态词表，还从 UI 树认出「确认支付/转账金额/
+  验证码」等**敏感屏特征**（`SENSITIVE_SCREEN_MARKERS`）；还缺的是把 `infer_role` 从关键词升级成
+  真正的 model classifier。
+  ② 「风险历史回路」完全没有（`RISK_ASSESSED` 有落库但无回路）。
+  两项的触发条件都写在 `models/semantic.py`：`UNKNOWN` 成为高频角色、人工确认被刷屏时做。
 
 ### 八、行为变化提醒
 
@@ -1583,7 +1587,7 @@ V4 之后「唯一写者」可以落在**数据库事务**上（地基已铺好�
 
 ### 八、验证
 
-`python -m pytest -q` → **672 passed**（上轮 669 → +3，零回归）。
+`python -m pytest -q` → **675 passed**（上轮 672 → +3，零回归）。
 
 | 新增用例 | 覆盖 |
 |---|---|
@@ -1593,6 +1597,7 @@ V4 之后「唯一写者」可以落在**数据库事务**上（地基已铺好�
 | `test_api_authz.py`（+1 条） | 执行记录也受设备范围约束 |
 | `test_database.py`（9 条） | 持久化 PRAGMA 真的生效、迁移版本可查、事务回滚一切/提交一切、**事务可重入**、共享库、两种旧目录传法、坏行隔离、写失败可见 |
 | `test_scheduler.py`（+3 条） | **`wait_terminal` 事件驱动**：及时返回终态任务、一直跑则超时返回 None、**先落盘再通知**（醒来时磁盘必已终态） |
+| `test_risk_gate.py`（+3 条） | **敏感屏**：普通 App 弹出的收银台页 + 目标不确定 → DANGEROUS、敏感屏上会改页面动作至少 CAUTION、无敏感文案的普通屏不升级 |
 | `test_task_store.py` / `test_checkpoint_store.py` / `test_event_log.py` | 旧 JSON/JSONL 迁移保留 revision 与时间戳、坏文件迁移后仍隔离、序号连续、两写者不丢不重、重启可读 |
 
 ---
@@ -1726,7 +1731,7 @@ pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 
-**672 个用例，全部离线**：不需要 adb、模拟器或 API Key。
+**675 个用例，全部离线**：不需要 adb、模拟器或 API Key。
 
 | 文件 | 覆盖 |
 |---|---|

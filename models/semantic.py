@@ -52,11 +52,12 @@ v2.9 指出的核心问题：风险（`DANGEROUS_KEYWORDS`）与幂等
 |---|---|---|
 | 动作语义（role） | ✅ 关键词 → role（弱，见上） | 本模块 `infer_role` |
 | 目标接地（target grounding） | ✅ | `vision/target.py` + `agent/risk_gate.py` |
-| **App 敏感状态** | ⚠️ 只有包名标记 | `SENSITIVE_PACKAGE_MARKERS`（静态词表，不含「当前这屏是不是支付确认页」） |
+| **App 敏感状态** | ◑ 包名静态词表 + **敏感屏文案**（V4 起） | `SENSITIVE_PACKAGE_MARKERS`（静态）+ `SENSITIVE_SCREEN_MARKERS`（动态：UI 树里出现「确认支付/转账金额/验证码」等即视为敏感屏） |
 | **风险历史（risk history）** | ❌ | 无——`EventLog` 里有 `RISK_ASSESSED`，但没有回路 |
 
-也就是说：真正缺的是后两项。做 Policy Engine 时它们才是新增能力，
-**继续扩 `SemanticRole` 词表不是**——那只是把同一个方法的边界再推远一点。
+也就是说：V4 补上了「敏感状态」的一半（从「只有包名」到「包名 + 屏幕内容」）；
+真正还缺的只剩**风险历史回路**，以及把 `infer_role` 从关键词升级成真正的
+model classifier。继续扩 `SemanticRole` 词表不是解法——那只是把同一个方法的边界再推远一点。
 """
 from __future__ import annotations
 

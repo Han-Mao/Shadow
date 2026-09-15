@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 from models.action import (
     SAFE_ACTION_TYPES,
     SENSITIVE_PACKAGE_MARKERS,
+    SENSITIVE_SCREEN_MARKERS,
     Action,
     ActionRisk,
     risk_rank,
@@ -219,22 +220,30 @@ class ActionRiskGate:
         #
         #   - 普通应用：抬到 CAUTION。不动它现在的等级，但审计里必须看得出「这是盲点」，
         #     而且它不能再被当成「命中文案之外的 SAFE」静默放行。
-        #   - **敏感应用**（支付/银行/证券…）：直接抬到 DANGEROUS → 转人工。
+        #   - **敏感应用 / 敏感屏**（支付/银行/证券…，或这一屏就是支付确认/转账/验证码）：
+        #     直接抬到 DANGEROUS → 转人工。
         #     审核给的例子正是最坏那个：「付款 App + 目标找不到 + TAP」——
         #     我们不知道该点在哪、也不知道那底下是什么按钮，而这一下可能就是付款。
         #     这种不确定性在支付页上不该由系统自己承担。
+        #     V4 起「敏感」不只认包名，也认**屏幕内容**（`_screen_sensitivity_hint`）：
+        #     普通 App 里弹出的收银台页，同样满足「代价不对称」。
         #
         # 为什么不在所有应用上转人工：那会让门禁变成噪声（每次「按钮没文字/树读不到」
-        # 都要问人），然后被人绕过——V3.1 P0-3 的教训。敏感应用是「代价不对称」的那一侧，
+        # 都要问人），然后被人绕过——V3.1 P0-3 的教训。敏感侧是「代价不对称」的那一侧，
         # 所以只在那一侧取最保守的判断。
         evidence_risk = ActionRisk.SAFE
         if action.is_mutating and resolved.resolution.is_evidence_gap:
-            if _is_sensitive_package(context):
+            screen_hint = _screen_sensitivity_hint(context)
+            if _is_sensitive_package(context) or screen_hint:
                 evidence_risk = ActionRisk.DANGEROUS
+                scope = (
+                    f"敏感应用（{context.package if context else ''}）"
+                    if _is_sensitive_package(context)
+                    else f"敏感屏（命中特征「{screen_hint}」）"
+                )
                 reasons.append(
-                    f"敏感应用（{context.package if context else ''}）里目标解析失败"
-                    f"（{resolved.resolution.value}）：点在哪、点的是什么都不知道，"
-                    "不能自动执行"
+                    f"{scope}里目标解析失败（{resolved.resolution.value}）："
+                    "点在哪、点的是什么都不知道，不能自动执行"
                 )
             else:
                 evidence_risk = ActionRisk.CAUTION
@@ -255,11 +264,16 @@ class ActionRiskGate:
         #   - `Action.side_effect()` 对 TAP/LONG_PRESS/TYPE 的类型兜底已改成非幂等，
         #     所以 EFFECT_UNKNOWN 之后**不会自动再点一次**，而是走对账 / 人工。
 
-        # 4) 页面敏感度下限：支付/银行类 App 里会改页面的动作至少 CAUTION
+        # 4) 页面敏感度下限：支付/银行类 App（或敏感屏）里会改页面的动作至少 CAUTION
         page_risk = ActionRisk.SAFE
-        if action.is_mutating and _is_sensitive_package(context):
-            page_risk = ActionRisk.CAUTION
-            reasons.append(f"当前页面属敏感应用（{context.package if context else ''}）")
+        if action.is_mutating:
+            screen_hint = _screen_sensitivity_hint(context)
+            if _is_sensitive_package(context):
+                page_risk = ActionRisk.CAUTION
+                reasons.append(f"当前页面属敏感应用（{context.package if context else ''}）")
+            elif screen_hint:
+                page_risk = ActionRisk.CAUTION
+                reasons.append(f"当前屏幕属敏感屏（命中特征「{screen_hint}」）")
 
         return strictest(type_risk, text_risk, evidence_risk, page_risk), reasons, resolved.resolution
 
@@ -304,3 +318,22 @@ def _is_sensitive_package(context: RiskContext | None) -> bool:
         return False
     package = context.package.lower()
     return any(marker in package for marker in SENSITIVE_PACKAGE_MARKERS)
+
+
+def _screen_sensitivity_hint(context: RiskContext | None) -> str:
+    """这一屏是不是「敏感屏」（支付确认 / 转账 / 绑卡 / 验证码……）（V4 · Policy Engine）。
+
+    与 `_is_sensitive_package` 的分工：包名是**静态身份**，这个是**动态屏幕内容**——
+    普通 App 里也能弹起收银台，支付 App 首页也不一定在敏感操作上。真正该抬级的是
+    「这一屏正在做敏感事」。
+
+    返回命中的特征文案（空串 = 不是敏感屏）。纯函数：只读 `context.ui_tree`，
+    不破坏门禁无状态的判定性质。
+    """
+    if context is None or not context.ui_tree:
+        return ""
+    haystack = context.ui_tree.lower()
+    for marker in SENSITIVE_SCREEN_MARKERS:
+        if marker in haystack:
+            return marker
+    return ""
