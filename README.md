@@ -78,7 +78,7 @@ V3.3 起 `Vision / Device` 这一层的左边是 `DeviceController` **协议**�
 │   ├── retry.py            # ErrorClass + RetryPolicy：错误分类与重试的唯一真相源
 │   ├── verification.py     # ActionDispatch / ActionEffect / GoalVerification 三概念
 │   └── state.py            # Observation / StepOutcome
-├── storage/                # TaskStore / CheckpointStore / TrajectoryStore / EventLog / AuditLog
+├── storage/                # 各 store + SQLite 地基（database / migrations / event_store）
 ├── device/
 │   ├── controller.py       # DeviceController 端口 + DeviceError 家族（V3.3 §1：核心只依赖它）
 │   ├── factory.py          # 按 SHADOW_DEVICE_BACKEND 装配后端（adb / android）
@@ -104,7 +104,7 @@ V3.3 起 `Vision / Device` 这一层的左边是 `DeviceController` **协议**�
 ├── scripts/
 │   ├── demo_preemption.py  # 抢占恢复演示（离线可跑）
 │   └── replay_task.py      # 命令行回放一个任务的事件流
-└── tests/                  # 632 个离线用例
+└── tests/                  # 654 个离线用例
 ```
 
 ## 职责边界
@@ -1430,11 +1430,140 @@ commit(jti)        # 成功才把票据永久作废；业务失败（返回 None
 
 ---
 
+## V4 落地（依据 `v4审查建议.md`）
+
+审核这轮给的不是缺陷清单，而是一份**十阶段重构计划**：统一执行模型 → 存储事务化 →
+审计关联 → 工程化收尾。它自己写着「**不要一次全部重写**」，建议按 8 个 commit 推进、
+优先 1–4。本仓库按那个顺序做，已完成其中 4 项：
+
+| 审核的 commit | 本仓库落地 | 状态 |
+|---|---|---|
+| Commit 1 `refactor: introduce Execution model` | `models/execution.py` + `storage/execution_store.py` + 手工端点接线 + `GET /executions/{id}` | ✅ |
+| Commit 4 `refactor: replace JSONL EventLog with SQLite EventStore` | `storage/database.py` + `storage/migrations/` + `storage/event_store.py`；`EventLog` 变成兼容层，旧 `.jsonl` 一次性导入 | ✅ |
+| Commit 7 `chore: lock dependencies` | `pyproject.toml` / `requirements.txt` 钉死版本、`requirements-dev.txt`、`uv.lock`（29 包） | ✅ |
+| Commit 8 `test: crash/concurrency regression suite` | 并发确认、并发手工动作、设备忙落定、旧库导入、序号唯一……（见「验证」） | ◑ 部分（崩溃恢复那几条上一轮已在） |
+| Commit 2 `refactor: unify task/checkpoint/event storage` | events 已进 SQLite；tasks / checkpoints 还在 JSON | ⏸ 见「三」 |
+| Commit 3 `fix: transactional confirmation` | 需要 Task 与 Confirmation 同库才可能真正成立 | ⏸ 依赖 Commit 2 |
+| Commit 5 `refactor: single-writer task mutation` | 出口路径与触发条件已写在 `agent/task_manager.py` | ⏸ 见「三」 |
+
+### 一、Commit 1：手工操作有了自己的身份（§1 / §5）
+
+改之前：所有手工操作都记在固定假任务 id `__manual__` 下，于是不同请求的记录**混在一条流**里，
+事后只能靠逐条字段去拼「这次是哪个请求」。改之后每次调用一个 `execution_id`：
+
+    POST /tap  →  execution_id = exe_xxx
+        ├── principal / device_id / action / risk / request_id / created_at / finished_at / result
+
+- **一执行一个文件**（不是共享文件）：手工请求会并发进来，共享文件就要跨请求读-改-写，
+  而那正是本仓库花了好几轮才收敛掉的坑；写走 `JsonStore`（tmp + fsync + os.replace）。
+- **`REFUSED` 也是一等事实**：被风险门禁拦下的操作同样留一条记录，状态是 `REFUSED`。
+  它回答的正是审核最关心的问题——「有没有过一次没被记录的点击尝试」。
+  它与 `FAILED`（设备层没成）刻意分开：事后追责里两者含义完全不同。
+- **`UNVERIFIED` 单独一档**：「发出去了但效果没确认（dispatched / navigated / ui_changed）」
+  绝不能被记成成功——那正是审核最担心的那一类状态。
+- **设备锁的 owner 没有跟着改**：`_MANUAL_OWNER = "__manual__"` 仍然是设备锁身份
+  （「手工路径整体占用设备」），它不随请求变化；换掉的是**执行归属**。这两件事容易一起改错，
+  所以常量注释里写明了。
+- `GET /executions/{id}` 把执行记录与它的事件流拼在一起（靠 `execution_id`），
+  `/executions` 列出最近若干条；两者都过鉴权与**设备范围**——`execution_id` 是可枚举的短 id，
+  范围外的统一 404（与损坏任务同口径，不泄露存在性）。
+
+### 二、Commit 4：事件日志进 SQLite（§4）
+
+V3.3 给 JSONL 补的是**落盘可靠性**（`write → fsync`），审核列的这一串它给不了：
+多进程全序、查询、筛选、分页、关联、事务。现在：
+
+```sql
+CREATE TABLE events (
+    event_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, execution_id TEXT NOT NULL DEFAULT '',
+    principal TEXT NOT NULL DEFAULT '', device_id TEXT NOT NULL DEFAULT '',
+    kind TEXT NOT NULL, created_at TEXT NOT NULL, sequence INTEGER NOT NULL, payload TEXT NOT NULL,
+    UNIQUE (task_id, sequence)
+)
+```
+
+- **序号而不是时间戳**：`UNIQUE(task_id, sequence)` 让「谁先谁后」有权威依据。
+  毫秒级 `datetime.now()` 在两个进程同时写时可能相同，而回放与审计要回答的恰恰是顺序问题。
+  序号在同事务内用 `MAX(sequence)+1` 算，唯一约束是最后一道保险（撞了就重算一次）。
+- **落盘强度交给数据库**：`PRAGMA synchronous=FULL` 之下 **commit 返回即落盘**，
+  与 JSONL 版的 `fsync` 是同一个语义，但覆盖整条事务——不必再逐条记住哪条路径该 fsync。
+  `journal_mode=WAL` 让读写不互相阻塞，`busy_timeout=5000` 让多进程写**等待**而不是立刻报错。
+- **旧数据不丢**：首次打开时把同目录的 `<task_id>.jsonl` 一次性导入，且**保留原来的
+  event_id 与时间戳**（都盖成「导入那一刻」的话，回放就再也看不出事件之间的间隔）。
+- 接口一个字没改（`emit` / `emit_critical` / `read` / `kinds`）——它有三十多个调用点，
+  这次要换的是**存储**不是用法；分级语义（安全关键事件 fail-closed）也原样保留。
+- 运维注意：WAL 模式下数据可能在 `events.db-wal` 里，备份要连 `-wal` / `-shm` 一起拷，
+  或者用 `VACUUM INTO 'backup.db'`。
+
+### 三、Commit 7：依赖锁定（§9）
+
+- `pyproject.toml` 与 `requirements.txt` 的直接依赖从 `>=` 改成 `==`（取本机实际安装版本：
+  fastapi 0.141.1 / uvicorn 0.52.4 / pydantic 2.13.5 / httpx 0.28.1）。
+  理由很实际：这个仓库跑的是会操作真实手机的 Agent，「上周能跑、这周复现不出来」的代价
+  远高于偶尔手动升级一次。
+- 完整依赖图（29 个包）锁进 `uv.lock`：`uv sync` 装出同一套环境；升级走
+  `uv lock --upgrade` → 跑全量测试 → 与 lock 一起提交。
+- **pytest 移出生产依赖**：新增 `requirements-dev.txt`（`-r requirements.txt` + `pytest==9.1.1`），
+  `pyproject` 里放 `[project.optional-dependencies] dev`。
+
+### 四、Commit 8：并发与故障用例（§10）
+
+审核点名要的那几类，现在都有了：
+
+| 场景 | 用例 | 断言 |
+|---|---|---|
+| 并发 `POST /confirm` × 2 | `test_concurrent_confirms_only_one_succeeds` | 恰好一个 200，另一个 403/409；同一张票据不能再放行 |
+| 并发 `/tap` + `/text` | `test_concurrent_manual_actions_get_their_own_records` | 两条记录、执行 id 不串号、**不留 RUNNING 幽灵** |
+| 设备被占用 | `test_busy_device_is_recorded_as_failed_not_running` | 409 之后记录落定 `FAILED`，不是悬着的 RUNNING |
+| 两个写者写事件 | `test_two_writers_do_not_lose_events_or_duplicate_sequences` | 一条不丢、序号 1..10 连续不重复 |
+| `ACTION_DISPATCHED` 后崩溃 | `test_dangerous_effect_unknown_never_auto_retries`（上一轮已有） | 效果未知 → **绝不自动重复点击** |
+
+### 五、还没做的（按审核的 commit 顺序，附触发条件）
+
+- **Commit 2（Task / Checkpoint 进 SQLite）**：`storage/database.py` + `storage/migrations/`
+  已经在位，events 是第一个搬过去的存储；下一步是把 `tasks` / `checkpoints` 也搬过去，
+  之后 **Commit 3（确认票据 + Task 状态 + 事件同一事务）** 才可能真正成立——
+  现在那三步仍然是「两库两写」，靠 `reserve → commit` 把窗口缩到很小，但不是事务。
+  **触发条件：多进程部署，或需要跨文件事务**（与 MEMORY [59] 同一个触发条件）。
+- **Commit 5（single-writer state machine）**：出口路径与触发条件写在
+  `agent/task_manager.py` 的 `_mutation_lock` 注释里（多路注入成为常态、CAS conflict 成规模时做）。
+- **Commit 8 的事件驱动 `/wait`**：现在是「按 `revision` 取最新事实 + 轮询」，
+  多 worker 常态时要换成条件变量 / Redis pub-sub。
+- **Policy Engine（v3.3 §八 的延期项）**：缺的是「App 敏感状态」（现在只有包名静态词表）
+  与「风险历史回路」（完全没有），补记在 `models/semantic.py`。
+
+### 六、行为变化提醒
+
+1. 手工端点（`/tap` `/text` `/back` `/actions`）的响应**新增** `execution_id` / `execution_status`
+   （只加字段，不删不改名）。
+2. 手工操作的事件流**所有者**从 `__manual__` 换成每次请求的 `execution_id`。
+   `MANUAL_ACTION_TASK_ID` 仍保留，但已标注废弃——只为兼容旧引用。
+3. 新增 `GET /executions`、`GET /executions/{id}`（都需要鉴权，受设备范围约束）。
+4. 事件存储从 `<root>/<task_id>.jsonl` 换成 `<root>/events.db`；旧文件首次打开时自动导入。
+   `scripts/replay_task.py --list` 改为问存储（不再 glob 文件）。
+5. 依赖钉死版本：`pip install -r requirements.txt` 装运行依赖，测试用 `requirements-dev.txt`。
+
+### 七、验证
+
+`python -m pytest -q` → **654 passed**（上轮 632 → +22，零回归）。
+
+| 新增用例 | 覆盖 |
+|---|---|
+| `test_execution.py`（13 条） | 执行 id 唯一、落定不改身份字段、拒绝保留依据、落定走原子读改写、跨实例可见、坏记录读成缺失、未来字段可读、写失败抛 `PersistenceError` |
+| `test_api.py`（+4 条） | 一次执行的完整链条（记录 + 事件）、被拒也留痕且 `REFUSED`、并发手工动作各自成记录、设备忙落定 `FAILED` |
+| `test_api_auth.py`（+3 条） | 执行记录带调用方身份、`/executions` 需鉴权且未知 id 一律 404、**并发确认只有一个成功** |
+| `test_api_authz.py`（+1 条） | 执行记录也受设备范围约束 |
+| `test_event_log.py`（净 +1 条） | 序号每任务连续、两个写者不丢不重、重启后仍可读且连接确为 `synchronous=FULL`、按 `execution_id` 查、旧 JSONL 导入保留原时间戳、坏 payload 不影响读 |
+
+---
+
 ## 快速开始
 
 ```powershell
-# 方式一：只装依赖
+# 方式一：只装运行依赖
 pip install -r requirements.txt
+# 要跑测试再装 dev 依赖（V4 §9：pytest 不在生产依赖里）
+pip install -r requirements-dev.txt
 
 # 方式二（推荐）：装成可编辑包，之后从任意目录都能运行
 pip install -e .
@@ -1550,11 +1679,14 @@ curl http://127.0.0.1:8010/scheduler
 > 需要取回某一轮的测试基线：`git checkout <commit> -- tests scripts`。
 
 ```powershell
+# 运行依赖（钉死版本；完整依赖图见 uv.lock，可用 `uv sync` 复现）
 pip install -r requirements.txt
+# 测试依赖（V4 §9：pytest 已移出生产依赖）
+pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 
-**632 个用例，全部离线**：不需要 adb、模拟器或 API Key。
+**654 个用例，全部离线**：不需要 adb、模拟器或 API Key。
 
 | 文件 | 覆盖 |
 |---|---|
