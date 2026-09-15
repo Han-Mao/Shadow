@@ -51,6 +51,62 @@ _AUDIT = os.getenv("SHADOW_AUDIT", "1").strip().lower() not in {"0", "false", "n
 # 单步调试端点占用设备时，用它作为 DeviceSession 的 owner 标识
 _MANUAL_OWNER = "__manual__"
 
+# ---- 单进程前提的硬闸（V3.1 §七 / §八）----
+#
+# `TaskStore` 的 revision CAS（`JsonStore.update_atomic`）与 `TaskManager._mutation_lock`
+# 都只在**同一个 Python 进程内**成立：`threading.RLock` 锁不住跨进程，CAS 比较的又是
+# 同一份磁盘 revision——两个 worker 各自持各自进程的锁、都通过比较、后写覆盖先写，
+# 中间那次改写**静默丢失**。
+#
+# 跨进程的「一个任务同一时刻最多一个执行者」已经由 TaskLease 兜住（V3 M3，SQLite
+# 原子 claim），但那只保证**不双执行**，保证不了 Task 文档不被互相覆盖。所以多 worker
+# 不是「有风险但能用」，而是明确不支持。
+#
+# 审核意见这一点说得很对：代码里到处是 thread-safe / atomic / CAS 这些词，很容易被
+# 读成「支持多 worker」。这种前提写在 README 里没人看，所以做成**拒绝启动**。
+_MULTI_PROCESS_OPT_IN_VALUES = {"1", "true", "yes", "on"}
+
+
+def _multi_process_opted_in() -> bool:
+    """是否已显式声明「自行承担多进程的状态一致性风险」。
+
+    刻意在**调用时**读环境变量而不是在导入时固化成常量——这样运维改完环境重启即可，
+    也让这条硬闸可被单测直接驱动。
+    """
+    return (
+        os.getenv("SHADOW_ALLOW_MULTI_PROCESS", "").strip().lower()
+        in _MULTI_PROCESS_OPT_IN_VALUES
+    )
+
+
+def _guard_single_process() -> None:
+    """检测到多 worker 时拒绝启动，而不是静默地丢状态（V3.1 §七/§八）。"""
+    raw = (
+        os.getenv("WEB_CONCURRENCY", "")
+        or os.getenv("UVICORN_WORKERS", "")
+        or os.getenv("GUNICORN_WORKERS", "")
+    ).strip()
+    if not raw:
+        return
+    try:
+        workers = int(raw)
+    except ValueError:
+        # 配置值不是数字不在这里拦——那属于部署配置错误，交给启动脚本自己报
+        logger.warning("无法解析的 worker 数量配置 %r，跳过单进程检查", raw)
+        return
+    if workers <= 1 or _multi_process_opted_in():
+        return
+    raise RuntimeError(
+        f"检测到 {workers} 个 worker（WEB_CONCURRENCY/UVICORN_WORKERS={raw}），"
+        "但 Shadow 目前只支持单进程：TaskStore 的 revision CAS 与写锁都只在进程内有效，"
+        "多 worker 下任务文档会互相覆盖（跨进程 TaskLease 只保证不双执行，不保证不丢写）。"
+        "请用 --workers 1 启动；若确有需要并已自行承担状态一致性风险，"
+        "可显式设置 SHADOW_ALLOW_MULTI_PROCESS=1 跳过本检查。"
+    )
+
+
+_guard_single_process()
+
 # ---- 依赖装配 ----
 
 adb = AdbController(serial=resolve_serial())
@@ -106,7 +162,7 @@ async def lifespan(_: FastAPI):
         scheduler.stop()
 
 
-app = FastAPI(title="BlueWhale Shadow Phone Agent", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="BlueWhale Shadow Phone Agent", version="0.3.1", lifespan=lifespan)
 
 
 @app.middleware("http")

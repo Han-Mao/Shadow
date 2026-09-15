@@ -8,6 +8,7 @@ Observe → Think → Act → Verify → Checkpoint 的主循环骨架，连同�
 from __future__ import annotations
 
 import logging
+import os
 
 from device.pool import storage_hint
 from device.session import DeviceBusyError, DeviceSession
@@ -21,7 +22,7 @@ from models.retry import (
     classify_error,
     classify_result,
 )
-from models.state import Observation, StepOutcome
+from models.state import Observation, ObservationEpoch, StepOutcome
 from models.task import TERMINAL_STATUSES, Task, TaskEvent, TaskStatus
 from models.task_step import StepStatus, TaskStep
 from models.verification import ActionDispatch, ActionEffect, DispatchStatus, GoalVerification
@@ -31,6 +32,7 @@ from storage.event_log import (
     DONE,
     EFFECT_UNKNOWN,
     FAILED,
+    OBSERVATION_STALE,
     RISK_ASSESSED,
     STARTED,
     SUSPENDED,
@@ -46,6 +48,24 @@ logger = logging.getLogger(__name__)
 
 # 重试行为只由这一份策略决定（V2.1 §十二），不再硬编码次数
 RETRY_POLICY = DEFAULT_POLICY
+
+# ---- TOCTOU 门禁（V3.1 P1-6）----
+#
+# 执行前比对「决策所依据的那一屏」与「此刻的页面」。`session.generation` 是免费的，
+# 一定检查——但它只记 Shadow 自己的写入，看不到用户手动点击 / 通知栏 / App 异步刷新 /
+# 另一个 adb client。要拦那些，必须额外读一次页面身份（`current_focus`）。
+# 那次读是一次 `dumpsys window`，比一次完整观察（截图 + dump）便宜得多，所以默认开；
+# 设备很慢或要极致吞吐时可置 SHADOW_TOCTOU_GUARD=0，代价是外部改动拦不住。
+TOCTOU_RECHECK_FOCUS = os.getenv("SHADOW_TOCTOU_GUARD", "1").strip().lower() not in {
+    "0", "false", "no", "off",
+}
+
+# 连续这么多次「决策时看到的页面在执行前已经变了」就按瞬时故障处理，不再空转。
+# 必须有上界：判 stale 就 continue 重新观察，若这个判定本身抖动就会变成死循环。
+MAX_STALE_OBSERVATIONS = 3
+
+# TOCTOU 复查读焦点的超时预算。比一次完整采集短得多——它只是 dumpsys window。
+TOCTOU_TIMEOUT_SECONDS = 4.0
 
 
 class ExecutionMixin:
@@ -185,6 +205,9 @@ class ExecutionMixin:
                     return outcome
                 continue
             last_observation = observation
+            # V3.1 P1-6：把「这一屏」记成这一轮决策的依据。Think 段可能包含一次几秒的
+            # 模型调用，真正 dispatch 之前会拿它再比对一次（见 `_toctou_guard`）。
+            state.decision_epoch = ObservationEpoch.capture(observation, session.generation)
 
             # ---- 未知效果对账（V2.2 §三）----
             # 上一步动作发出去了、但拿不到验证观察（EFFECT_UNKNOWN）。
@@ -251,7 +274,11 @@ class ExecutionMixin:
                 action, context=RiskContext.from_observation(observation, instruction=task.instruction)
             )
             if assessment.downgrade_blocked or assessment.effective is ActionRisk.DANGEROUS:
-                self._emit(
+                # V3.1 P0：RISK_ASSESSED 是安全关键事件——「这一级风险是谁定的、模型有
+                # 没有试图把它说低、目标证据够不够」都必须留痕。写不进 durable store 就
+                # 不能继续往下走：继续意味着危险动作可能在没有判定记录的情况下被放行，
+                # 事后审计无法回答「为什么让它过了」。
+                failed = self._emit_critical_or(
                     task.id,
                     RISK_ASSESSED,
                     action=action.type.value,
@@ -261,10 +288,26 @@ class ExecutionMixin:
                     downgrade_blocked=assessment.downgrade_blocked,
                     reason=assessment.describe(),
                     target=self._action_target(action),
+                    # V3.1 P1-4：目标证据状态进审计。事件流能回答「这次点击是不是在盲点」，
+                    # 而不是只留一句「effective=caution」让人猜。
+                    target_resolution=assessment.target_resolution,
+                    unresolved_target=assessment.unresolved_target,
                 )
+                if failed is not None:
+                    return self._degrade(
+                        task, state, f"风险判定事件写盘失败，停止副作用：{failed}"
+                    )
 
             if assessment.requires_confirmation:
-                if state.approval is not None and state.approval.matches(action, task, state):
+                if state.approval is not None and state.approval.matches(
+                    action,
+                    task,
+                    state,
+                    # V3.1 P2-9：放行凭据绑「动作 + 页面」。这里把**放行那一刻**的页面
+                    # 传进去，与批准时记下的页面比对——批准之后页面被换掉，凭据作废。
+                    package=observation.package,
+                    activity=observation.activity,
+                ):
                     # 一次性：放行即消费，绝不复用（V2.7 P0-2）
                     logger.info(
                         "任务 %s 的危险动作已获人工放行，本次放行即消费：%s",
@@ -274,8 +317,8 @@ class ExecutionMixin:
                     state.approval = None
                 else:
                     if state.approval is not None:
-                        # 批准的不是这个动作（动作本身 / 目标版本 / 计划版本任一变过）
-                        # → 凭证作废，重新请求确认（V2.7 P0-2）
+                        # 批准的不是这个动作（动作本身 / 页面 / 目标版本 / 计划版本 /
+                        # 执行序号任一变过）→ 凭证作废，重新请求确认（V2.7 P0-2）
                         logger.warning(
                             "任务 %s 的人工放行凭证与本动作不匹配（%s），作废并重新请求确认",
                             task.id,
@@ -285,6 +328,10 @@ class ExecutionMixin:
                     state.pending_confirmation = action
                     state.pending_task_version = task.version
                     state.pending_plan_version = task.plan_version
+                    # V3.1 P2-9：记下「请求确认时在哪一屏」。人工批准走的是
+                    # `_confirm_locked`，那里没有观察可用，所以页面必须在这里快照下来，
+                    # 否则凭据只能绑裸动作指纹——那样 `tap(500,800)` 在哪个 App 里都算同一个。
+                    state.pending_page = (observation.package, observation.activity)
                     self._save_checkpoint(task, state, observation)
                     task.apply_event(TaskEvent.AWAITING_CONFIRMATION, source="runtime")
                     self._persist(task)
@@ -300,6 +347,36 @@ class ExecutionMixin:
                         why=assessment.describe(),
                     )
                     return RunOutcome.AWAITING_CONFIRMATION
+
+            # ---- TOCTOU 门禁（V3.1 P1-6）----
+            # 走到这里，决策（含一次可能几秒的模型调用）已经完成，但动作还没发出去。
+            # 这中间的窗口里，用户可能自己点了按钮、通知栏可能弹出来、App 可能异步刷新——
+            # 那些变化**不会**推进 `session.generation`，所以只靠代次是看不见的。
+            # 页面已经不是决策时那一屏的话，宁可丢掉这一步决策重新观察，
+            # 也不要把旧坐标点到新页面上。
+            stale = self._toctou_guard(task, state, session, observation)
+            if stale is not None:
+                state.stale_observations += 1
+                self._emit(
+                    task.id,
+                    OBSERVATION_STALE,
+                    reason=stale,
+                    consecutive=state.stale_observations,
+                    action=action.type.value,
+                    step=state.execution_step,
+                )
+                logger.warning("任务 %s 的决策已过期（%s），放弃本次动作重新观察", task.id, stale)
+                if state.stale_observations >= MAX_STALE_OBSERVATIONS:
+                    # 连续多次都稳不下来：说明页面正在被别人/别的东西持续改动，
+                    # 这时候硬等没有意义，按瞬时故障处理（计入熔断）。
+                    state.stale_observations = 0
+                    outcome = self._settle_failure(
+                        task, state, ErrorClass.TRANSIENT, f"页面在决策期间持续变化：{stale}"
+                    )
+                    if outcome is not None:
+                        return outcome
+                continue
+            state.stale_observations = 0
 
             # ---- Act ----
             state.execution_step += 1
@@ -533,6 +610,65 @@ class ExecutionMixin:
             logger.warning("任务 %s 第 %d 次观察失败: %s", task.id, state.observation_count, exc)
             return None
 
+    def _toctou_guard(
+        self,
+        task: Task,
+        state: RuntimeState,
+        session: DeviceSession,
+        observation: Observation,
+    ) -> str | None:
+        """执行前的「页面还是不是决策时那一屏」检查（V3.1 P1-6）。
+
+        返回 None 表示可以执行；返回字符串表示**不能执行**、原因是什么。
+
+        为什么需要它——`session.generation` 回答的是「Shadow 自己有没有动过设备」：
+
+            观察到 A 屏（generation=10）→ 模型想几秒 → 用户自己点了按钮 → B 屏
+                ↓
+            仍然按 A 屏算出来的坐标 dispatch          ← 典型 TOCTOU
+
+        用户手点、通知栏弹出、App 异步刷新、后台 WebView 加载、另一个 adb client
+        操作，**都不会**推进 generation。所以除了代次，还要比一次页面身份。
+
+        两档证据，强度刻意不同：
+        - 设备代次变了、或 package/activity 变了 → 硬拦，重新观察；
+        - 只有同一 Activity 内的 UI 结构变了 → 这里**不拦**。滚动列表、时钟刷新都会改
+          结构，硬拦会把正常任务卡死；那种情况的风险由 Act 之后的效果判定
+          （`EFFECT_UNKNOWN` → 在线对账）兜住。
+
+        读焦点失败 / 读不到焦点时**不阻断**——那是设备抖动或 dumpsys 没给出
+        mCurrentFocus，不构成「页面变了」的证据。把「没有证据」当成「有反证」，
+        只会让任务在设备颤抖时反复空转。
+        """
+        epoch = state.decision_epoch
+        if epoch is None:
+            return None
+
+        if session.generation != epoch.generation:
+            return f"设备代次已从 {epoch.generation} 变为 {session.generation}（这期间设备被动过）"
+
+        if not TOCTOU_RECHECK_FOCUS:
+            return None
+
+        try:
+            with session.controller.deadline_budget(TOCTOU_TIMEOUT_SECONDS):
+                package, activity = session.controller.current_focus()
+        except Exception as exc:  # noqa: BLE001 - 复查失败不能变成任务失败
+            logger.warning(
+                "任务 %s 的 TOCTOU 复查读不到当前焦点，本次跳过该检查：%s", task.id, exc
+            )
+            return None
+
+        if not package and not activity:
+            # dumpsys 没给出焦点窗口：没有可比对的证据，不做判断
+            return None
+
+        if (package, activity) != (epoch.package, epoch.activity):
+            return (
+                f"页面已从 {epoch.package}/{epoch.activity} 变为 {package}/{activity}"
+                "（决策所依据的那一屏已经不在了）"
+            )
+        return None
 
     def _think(
         self,

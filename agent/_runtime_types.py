@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from models.action import Action, ActionEffectStatus
+from models.state import ObservationEpoch
 from models.task import Task
 
 # 最近 LOOP_WINDOW 个动作里，同一个指纹出现 LOOP_REPEAT_THRESHOLD 次即判定死循环
@@ -95,6 +96,23 @@ class RuntimeState:
     # 请求确认那一刻的目标 / 计划版本，用来构造上面的放行凭据
     pending_task_version: int = 0
     pending_plan_version: int = 0
+    # 请求确认那一刻所在的那一屏（package, activity）（V3.1 P2-9）。
+    # 放行凭据要绑「动作 + 页面」，所以得把页面记下来——`_confirm_locked` 里没有观察。
+    pending_page: tuple[str, str] = ("", "")
+
+    decision_epoch: "ObservationEpoch | None" = None
+    """做出当前决策所依据的那一屏（V3.1 P1-6）。
+
+    `DeviceSession.generation` 只记 Shadow 自己的写入，看不到用户手动点击、通知栏、
+    App 异步刷新。决策（可能包含一次几秒的模型调用）与执行之间必须能比对「页面还是
+    不是那一屏」，否则就是典型 TOCTOU：拿 A 屏的坐标去点 B 屏。
+    """
+
+    stale_observations: int = 0
+    """连续几次在「决策 → 执行」之间发现页面已变。
+
+    必须计数：判 stale 就 `continue` 重新观察，如果 stale 判定本身有抖动，
+    不加计数就会变成死循环。连续多次都稳不下来 → 按瞬时故障处理。"""
 
 
 @dataclass
@@ -111,27 +129,53 @@ class ApprovalGrant:
     - `attempt_seq`：批准那一刻的执行序号。放行时校验它没变——若批准后模型已经
       执行过别的动作（attempt_seq 前进过），这张凭证就作废。这是「绑定具体动作尝试」
       的等价物：真正的 attempt_id 要到 Act 阶段才分配（批准时还不存在），
-      用 attempt_seq 快照同样能锁住「批准的到底是哪一次」。
+      用 attempt_seq 快照同样能锁住「批准的到底是哪一次」；
+    - `page_bound_fingerprint`（V3.1 P2-9）：动作 + 批准时所在的那一屏。
+      裸动作指纹在跨页面时不可比，授权必须绑页面。
     """
 
     task_id: str
     action_fingerprint: str
+    """**动作身份**（类型 + 目标量化 + 取值）。用于审计「批的是哪一个动作」。"""
+
+    page_bound_fingerprint: str
+    """**动作 + 当时那一屏**（V3.1 P2-9）。这是放行时真正比对的字段。
+
+    裸 `action_fingerprint` 表达不了「在哪一屏」：`tap((500, 800))` 在微信、淘宝、
+    设置里是三个完全不同的动作。授权凭据必须绑页面，否则「批准微信里的发送」
+    在别处恰好有同坐标按钮时会被误用。
+    """
+
     task_version: int
     plan_version: int
     attempt_seq: int
 
-    def matches(self, action: Action, task: Task, state) -> bool:
-        return (
-            self.task_id == task.id
-            and self.action_fingerprint == action.fingerprint
-            and self.task_version == task.version
-            and self.plan_version == task.plan_version
-            and self.attempt_seq == state.attempt_seq
-        )
+    def matches(self, action: Action, task: Task, state, *, package: str = "", activity: str = "") -> bool:
+        """放行前逐项比对。任何一项对不上 → 凭证作废，重新请求确认。
+
+        `package` / `activity` 是**放行那一刻**的当前页面（由调用方从最新观察里传进来）。
+        与凭据里记录的页面不一致时作废——这正好覆盖「批准之后页面被换掉了」这种
+        TOCTOU 场景（V3.1 P1-6 / P2-9）。
+        """
+        if (
+            self.task_id != task.id
+            or self.action_fingerprint != action.fingerprint
+            or self.task_version != task.version
+            or self.plan_version != task.plan_version
+            or self.attempt_seq != state.attempt_seq
+        ):
+            return False
+        # 拿不到页面信息时（凭据或当前观察任一为空）不做页面比对：不能凭空造证据，
+        # 也不能因为「读不到页面」就把一张本来正确的凭据永久作废。
+        if self.page_bound_fingerprint and (package or activity):
+            if self.page_bound_fingerprint != action.page_bound_fingerprint(package, activity):
+                return False
+        return True
 
     def describe(self) -> str:
         return (
             f"task={self.task_id} fingerprint={self.action_fingerprint} "
+            f"page_bound={self.page_bound_fingerprint} "
             f"task_version={self.task_version} plan_version={self.plan_version} "
             f"attempt_seq={self.attempt_seq}"
         )

@@ -62,6 +62,14 @@ EFFECT_UNKNOWN = "effect_unknown"
 RISK_ASSESSED = "risk_assessed"
 """风险门禁的判定结论，含「模型试图降级被拒」这种要留痕的情况。"""
 
+OBSERVATION_STALE = "observation_stale"
+"""V3.1 P1-6：决策所依据的那一屏在执行前已经变了，本次动作被放弃、改为重新观察。
+
+它记录的是**一次被避免的 TOCTOU**：拿 A 屏算出来的坐标去点 B 屏。
+刻意**不**放进 `SAFETY_CRITICAL_KINDS`——这条事件丢失只会少一条解释，
+而它对应的行为（拒绝执行）本身仍然是最安全的那一侧。
+"""
+
 
 # ---- V3 M4：安全关键事件 fail-safe ----
 #
@@ -114,7 +122,26 @@ class EventLog:
         self._lock = threading.Lock()
 
     def emit(self, task_id: str, kind: str, **data) -> Event:
-        """写一条事件。**永不抛异常**——审计日志写失败不该影响任务执行。"""
+        """写一条事件。**按 kind 自动分级**（V3.1 P0）。
+
+        - 普通事件 → fail-open：审计是旁路，写失败只 warning，不挡执行。
+        - 安全关键事件（`is_safety_critical(kind)` 为真）→ fail-closed：
+          写失败抛 `PersistenceError`，调用方必须中止后续副作用。
+
+        分派刻意放在 `emit` **内部**，而不是靠调用方自觉去选 `emit_critical`。
+        V3 M4 定义了 `SAFETY_CRITICAL_KINDS` 却只让 `ACTION_DISPATCHED` 一处走
+        `emit_critical`，`RISK_ASSESSED` / `CONFIRMED` / `GOAL_CONFIRMED` 仍走这里
+        的 fail-open 分支——常量表说它们是「丢失即审计链断裂」，真实行为却是
+        「写不进去也照跑」。「约定调用方记得选对方法」这种事早晚会漏，
+        所以让唯一的写入口自己按 kind 决定。
+
+        报错方式（`PersistenceError`）与 `Runtime._degrade` / TaskManager 的失败分流
+        完全一致：安全事件写不进 = durable state 落后于现实，任务停在 DEGRADED，
+        而不是带着「转账了但没有授权记录」继续跑。
+        """
+        if is_safety_critical(kind):
+            return self.emit_critical(task_id, kind, **data)
+
         event = Event(task_id=task_id, kind=kind, data=data)
         try:
             path = self._root / f"{task_id}.jsonl"
@@ -122,12 +149,16 @@ class EventLog:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 with path.open("a", encoding="utf-8") as handle:
                     handle.write(json.dumps(event.to_dict(), ensure_ascii=False) + "\n")
-        except Exception as exc:  # noqa: BLE001 - 审计是旁路，不能成为故障源
+        except Exception as exc:  # noqa: BLE001 - 普通事件是旁路，不能成为故障源
             logger.warning("写事件日志失败（任务 %s / %s）：%s", task_id, kind, exc)
         return event
 
     def emit_critical(self, task_id: str, kind: str, **data) -> Event:
         """写一条**安全关键**事件。写失败抛 `PersistenceError`（V3 M4）。
+
+        这是 `emit` 在 `is_safety_critical(kind)` 为真时的实际执行体；
+        也可以被显式调用，用来强制让一个**不在** `SAFETY_CRITICAL_KINDS` 里的事件
+        走 fail-closed（例如未来新增的审计关键事件先上线、再补进常量表）。
 
         与 `emit` 的区别：`emit` 是旁路（fail-open，写不进不挡执行）；
         安全关键事件（危险动作已 dispatch、风险判定、人工批准、完成认定）一旦

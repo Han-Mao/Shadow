@@ -17,6 +17,32 @@ v2.9 指出的核心问题：风险（`DANGEROUS_KEYWORDS`）与幂等
 
 关键词表**保留**，但降级为「role 推断的原始材料」，不再是判定结果本身。
 这样新增一个词 / 换一种说法，只需改 role 推断，risk 与幂等自动跟着一致。
+
+
+**有理由的延期（V3.1 §四）：本层目前仍然是「关键词 → role」，不是真正的语义理解。**
+
+审核意见对这一点的判断是准确的：把 `DANGEROUS_KEYWORDS` 升级成 `SemanticRole`
+是正确方向，但 `infer_role()` 的实现仍然是 `any(keyword in text ...)`，所以它只是
+把「关键词黑名单」换成了「关键词 → 角色映射」。举个它挡不住的例子：
+
+    「帮我把这个东西处理掉」   → 不命中 删除/delete/remove → UNKNOWN（保守处理）
+    「给他回一下」             → 不命中 发送/send        → UNKNOWN（保守处理）
+
+因为 V3.1 P0-3 把 UNKNOWN 改成了保守（CAUTION + 非幂等），这类漏判现在的后果是
+「多问一次人 / 不自动重试」，而不是「静默放行一个删除」。**这是刻意的取舍**：
+在没有真正的分类器之前，宁可让认不出的动作走人工。
+
+目标形态（审核建议的链路）：
+
+    Rule → UI semantic metadata → Model semantic classifier → Policy fusion
+
+延期的原因不是「做不了」，而是它会引入一个新的判定来源，而模型输出必须同样
+受「只能抬不能降」的约束（与 `risk_hint` 一致），还要有可解释性与离线可测性。
+那是一轮的独立工作量，不适合塞进修复轮。
+
+**必须做的触发条件**：当 `UNKNOWN` 在真实轨迹里成为高频角色（即大量动作认不出、
+人工确认被这些动作刷屏）时，就必须把 model classifier 接进来——
+否则本层会从「安全保障」退化成「噪声源」，然后被绕过。
 """
 from __future__ import annotations
 
@@ -104,8 +130,25 @@ ROLE_SEMANTICS: dict[SemanticRole, ActionSemantic] = {
     SemanticRole.SETTINGS: ActionSemantic(
         SemanticRole.SETTINGS, ActionRisk.CAUTION, SideEffectClass.IDEMPOTENT_WRITE
     ),
+    # V3.1 P0-3：UNKNOWN 必须是**保守**的，不能是 SAFE + IDEMPOTENT_WRITE。
+    #
+    # 原来的取值让「不知道这是什么动作」等价于「随便做、还能自动重试」：
+    #
+    #     按钮 resource-id/text/content-desc 全为空 → VLM 给 tap(540,1600)
+    #         ↓ infer_role 认不出 → UNKNOWN
+    #         ↓ 查表 SAFE + IDEMPOTENT_WRITE
+    #         ↓ is_safe_to_retry() == True
+    #         ↓ 第一次 tap 之后进程崩溃（EFFECT_UNKNOWN）→ 自动再点一次
+    #
+    # 而那个坐标完全可能是「确认支付」「删除账户」「提交订单」。这跟本层自己声明的
+    # 「拿不准就往重里判」是直接矛盾的——**认不出 ≠ 无害**。
+    #
+    # 所以：风险抬到 CAUTION（不再伪装成 SAFE），副作用判 NON_IDEMPOTENT_WRITE
+    # （「做过但不知道结果」时绝不自动重做，交给人或走对账）。
+    # 注意这里**刻意不抬到 DANGEROUS**：认不出就走 HITL 会把每一步都卡住，
+    # 门禁会立刻变成噪声然后被绕过——保守要保守在「不自动重试」这件事上。
     SemanticRole.UNKNOWN: ActionSemantic(
-        SemanticRole.UNKNOWN, ActionRisk.SAFE, SideEffectClass.IDEMPOTENT_WRITE
+        SemanticRole.UNKNOWN, ActionRisk.CAUTION, SideEffectClass.NON_IDEMPOTENT_WRITE
     ),
 }
 

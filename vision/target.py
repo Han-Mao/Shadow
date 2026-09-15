@@ -46,6 +46,43 @@ class TargetState(str, Enum):
         return self in (TargetState.GONE, TargetState.CHANGED)
 
 
+class TargetResolution(str, Enum):
+    """目标解析的**结果类别**（V3.1 P1-4）。
+
+    以前只有一个 `node is None`，它把四件完全不同的事混成一件：
+
+        没给我 UI 树          → node=None → 「没有证据」
+        树给了我但解析不了    → node=None → 「没有证据」
+        树好好的但没有这个节点 → node=None → 「没有证据」
+        动作本来就没有目标元素 → node=None → 「没有证据」
+
+    前两种是**证据缺失**，第三种是**大概率说明目标不在这屏**，第四种是正常情况。
+    全混成 None 的后果是风险门禁无法区分「这个点击没有目标证据」与「LAUNCH 不需要
+    目标证据」，于是只能对两者都放行——证据缺失被当成了「没有反证」。
+    """
+
+    OK = "ok"
+    """解析到了真实节点。"""
+
+    NO_TREE = "no_tree"
+    """调用方没提供 UI 树（单步调试 / 只给截图时会出现）。"""
+
+    PARSE_ERROR = "parse_error"
+    """UI 树存在但解析失败（截断、格式损坏）。证据缺失，且是我们自己没读到。"""
+
+    NOT_FOUND = "not_found"
+    """树可以解析，但目标既匹配不到文本节点、坐标下也没有节点。"""
+
+    NO_TARGET = "no_target"
+    """动作本来就没有目标元素（LAUNCH / WAIT / BACK / HOME / DONE）。正常，不是缺口。"""
+
+    @property
+    def is_evidence_gap(self) -> bool:
+        """是不是「本该有目标证据、但没拿到」。"""
+        return self in (TargetResolution.NO_TREE, TargetResolution.PARSE_ERROR,
+                        TargetResolution.NOT_FOUND)
+
+
 @dataclass(frozen=True)
 class ResolvedTarget:
     """动作目标在某一屏上的落地结果。"""
@@ -55,6 +92,8 @@ class ResolvedTarget:
     """节点身份键（class|text|content-desc|resource-id），不含 bounds。"""
 
     label: str = ""
+
+    resolution: "TargetResolution" = TargetResolution.NO_TARGET
 
     @property
     def found(self) -> bool:
@@ -86,14 +125,23 @@ def resolve_target(
     ui_tree: str | None,
     screen_size: tuple[int, int] | None = None,
 ) -> ResolvedTarget:
-    """把动作目标还原成节点。拿不到不是错误——很多动作本来就没有目标元素。"""
+    """把动作目标还原成节点。拿不到不是错误——很多动作本来就没有目标元素。
+
+    V3.1 P1-4：拿不到时**要说清楚是哪一种拿不到**。这里不再返回一个含义模糊的
+    `node=None`，而是带上 `TargetResolution`，让风险门禁能回答
+    「这次点击是没有目标证据，还是本来就不需要目标证据」。
+    """
     if not ui_tree:
-        return ResolvedTarget(node=None)
+        # 没有 UI 树：如果这个动作本来就不带目标（LAUNCH / BACK / WAIT），
+        # 那就不是缺口；带了目标才是「我们没读到证据」。
+        return ResolvedTarget(node=None, resolution=_no_tree_resolution(action))
 
     try:
         root = parser.parse(ui_tree)
     except Exception:  # noqa: BLE001 - 树坏了退化为「无目标信息」，不能让验证/门禁中断
-        return ResolvedTarget(node=None)
+        # 单独成一类：树在但读不出来，是有信息量的事实（值得告警），
+        # 不能和平静的「本来就没目标」共用一个返回值。
+        return ResolvedTarget(node=None, resolution=TargetResolution.PARSE_ERROR)
 
     target = action.target
     if isinstance(target, Point):
@@ -105,12 +153,23 @@ def resolve_target(
         node = None
 
     if node is None:
-        return ResolvedTarget(node=None)
+        return ResolvedTarget(node=None, resolution=_missing_resolution(action))
     return ResolvedTarget(
         node=node,
         key=parser.node_identity(node),
         label=parser.node_label(node),
+        resolution=TargetResolution.OK,
     )
+
+
+def _no_tree_resolution(action: Action) -> TargetResolution:
+    """没有 UI 树时，这次解析算「缺口」还是「本来就不需要」。"""
+    return TargetResolution.NO_TARGET if action.target is None else TargetResolution.NO_TREE
+
+
+def _missing_resolution(action: Action) -> TargetResolution:
+    """树可解析但没匹配到节点：动作带目标才算缺口。"""
+    return TargetResolution.NO_TARGET if action.target is None else TargetResolution.NOT_FOUND
 
 
 def target_state(action: Action, pre_tree: str | None, post_tree: str | None,

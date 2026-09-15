@@ -67,6 +67,9 @@ LOOP_REPEAT_THRESHOLD = 3
 # 所以给一个上界，超了就交给人（V2.2 §三）。
 MAX_EFFECT_RECONCILIATIONS = 2
 
+# 注：`SHADOW_TOCTOU_GUARD` 与 `MAX_STALE_OBSERVATIONS` 定义在 `_execution.py`
+# ——它们只在执行循环里用，放在 mixin 同一模块可避免 `runtime` ↔ `_execution` 循环导入。
+
 
 
 from ._confirm import ConfirmationMixin
@@ -192,17 +195,40 @@ class AgentRuntime(
 
 
     def _emit(self, task_id: str, kind: str, **data) -> None:
+        """写一条事件。**按 kind 自动分级**（V3.1 P0）。
+
+        安全关键事件（`ACTION_DISPATCHED` / `RISK_ASSESSED` / `CONFIRMED` /
+        `GOAL_CONFIRMED`）会**抛出** `PersistenceError`——这是刻意的，调用方必须
+        决定「记不下这条，副作用还能不能继续」。要写成「失败返回原因」的形式，
+        用 `_emit_critical_or`；要自己 try/except 也行，但别把安全事件当旁路吞掉。
+        """
         if self._event_log is not None:
             self._event_log.emit(task_id, kind, **data)
 
     def _emit_critical(self, task_id: str, kind: str, **data) -> None:
-        """写安全关键事件，失败抛 `PersistenceError`（V3 M4）。
+        """**强制** fail-closed 地写一条事件，失败抛 `PersistenceError`（V3 M4）。
 
-        与 `_emit`（旁路，永不抛）分工：危险动作 dispatch、风险判定、人工批准、
-        完成认定这些「丢失即审计链断裂」的事件必须落盘成功，副作用才继续。
+        `_event_log.emit` 已经会按 `is_safety_critical(kind)` 自动分派，所以这里
+        主要是把「我要求这条必须落盘」这个意图写在调用点——同时它也是给未来
+        不在 `SAFETY_CRITICAL_KINDS` 里的关键事件留的显式入口。
         """
         if self._event_log is not None:
             self._event_log.emit_critical(task_id, kind, **data)
+
+    def _emit_critical_or(self, task_id: str, kind: str, **data) -> str | None:
+        """写安全关键事件，把「失败」变成可判定的返回值（V3.1 P0）。
+
+        成功返回 None；失败返回原因字符串，调用方据此**拒绝放行**副作用。
+        危险动作 dispatch、人工批准、完成认定这三处的共同点是：它们一旦没被记录，
+        就不能让对应的事情真的发生——所以需要的是「先写、再决定」，而不是
+        「先做、顺手记一下」。
+        """
+        try:
+            self._emit_critical(task_id, kind, **data)
+        except PersistenceError as exc:
+            logger.error("任务 %s 的安全关键事件 %s 写盘失败：%s", task_id, kind, exc.reason)
+            return exc.reason
+        return None
 
     # ---- 阶段 ----
 

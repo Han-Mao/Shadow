@@ -83,6 +83,19 @@ class RiskAssessment:
     reasons: tuple[str, ...] = field(default_factory=tuple)
     """判定依据，逐条可读。事件流与日志直接用它回答「为什么拦」。"""
 
+    target_resolution: str = "no_target"
+    """本次判定的**目标证据状态**（`vision.target.TargetResolution` 的值）。
+
+    V3.1 P1-4：门禁必须能回答「这次点击是有目标证据、没有目标证据、还是本来就不需要
+    目标证据」。把三种情况都混成「没有节点」，后果是审计看不出「我们其实是在盲点」，
+    而盲点时对危险的估算是偏低的。
+    """
+
+    @property
+    def unresolved_target(self) -> bool:
+        """本该有目标证据、但没拿到（UI 树缺失 / 解析失败 / 匹配不到）。"""
+        return self.target_resolution in ("no_tree", "parse_error", "not_found")
+
     @property
     def requires_confirmation(self) -> bool:
         """危险动作必须经人工确认，不能静默执行。"""
@@ -94,6 +107,8 @@ class RiskAssessment:
             parts.append(f"model={self.model.value}")
         if self.downgrade_blocked:
             parts.append("模型降级被拒")
+        if self.unresolved_target:
+            parts.append(f"目标证据缺失（{self.target_resolution}）")
         if self.reasons:
             parts.append("；".join(self.reasons))
         return " · ".join(parts)
@@ -107,7 +122,7 @@ class ActionRiskGate:
     @staticmethod
     def assess(action: Action, *, context: RiskContext | None = None) -> RiskAssessment:
         """算出动作的有效风险（effective_risk = max(policy_risk, model_risk)）。"""
-        policy, reasons = ActionRiskGate.policy_risk(action, context=context)
+        policy, reasons, resolution = ActionRiskGate.policy_risk(action, context=context)
         model = action.model_risk()
         declared = action.declared_risk()
         effective = strictest(policy, model)
@@ -137,13 +152,14 @@ class ActionRiskGate:
             model=model,
             downgrade_blocked=downgrade_blocked,
             reasons=tuple(reasons),
+            target_resolution=resolution.value,
         )
 
     @staticmethod
     def policy_risk(
         action: Action, *, context: RiskContext | None = None
-    ) -> tuple[ActionRisk, list[str]]:
-        """服务端策略风险（含上下文），返回 (等级, 依据列表)。"""
+    ) -> tuple[ActionRisk, list[str], "target_evidence.TargetResolution"]:
+        """服务端策略风险（含上下文），返回 (等级, 依据列表, 目标解析结果)。"""
         reasons: list[str] = []
 
         # 1) 动作类型
@@ -165,9 +181,9 @@ class ActionRiskGate:
             if part
         )
         role = infer_role(haystack)
-        text_risk = semantic_for(role).risk
 
         if role is not SemanticRole.UNKNOWN:
+            text_risk = semantic_for(role).risk
             reasons.append(f"语义角色 {role.value}（判定风险 {text_risk.value}）")
             if node_text and role in (
                 SemanticRole.PURCHASE,
@@ -178,14 +194,52 @@ class ActionRiskGate:
                 # 这一条是 V2.2 新增的关键能力：动作描述里没有危险词，
                 # 但被点到的那个控件本身叫「立即购买」——只有查 UI 树才知道
                 reasons.append(f"目标元素实为「{node_text}」")
+        elif action.type in SAFE_ACTION_TYPES:
+            # V3.1 P0-3：认不出语义时的保守下限**只对会碰设备的动作成立**。
+            #
+            # `DONE` / `DONE_REQUEST` 根本不发 adb 命令，`BACK` / `HOME` / `WAIT` 的
+            # 效果由动作类型就完全确定。对它们说「不知道这是什么动作」是不成立的——
+            # 按类型判定才是对的，抬到 CAUTION 只会让「申请完成」看起来像个危险动作。
+            text_risk = ActionRisk.SAFE
+            reasons.append("语义角色未知，但该动作类型本身不改设备（按类型判 SAFE）")
+        else:
+            # 会改页面的动作认不出语义 → 保守下限（V3.1 P0-3）。
+            # 以前这种情况 `reasons` 是空的，审计看到的是一条「没有任何理由」的判定，
+            # 而它当时的结论是 SAFE——「不知道这是什么按钮」被当成了「它是安全的」。
+            text_risk = semantic_for(role).risk
+            reasons.append(f"语义角色未知（按保守下限 {text_risk.value} 处理）")
 
-        # 3) 页面敏感度下限：支付/银行类 App 里会改页面的动作至少 CAUTION
+        # 3) 目标证据缺失的下限（V3.1 P1-4）
+        #
+        # 「没有证据」不等于「没有反证」。UI 树读不到 / 解析失败 / 目标匹配不到时，
+        # 我们对这次点击其实一无所知——那就不该因为「没抓到危险词、也没抓到目标文本」
+        # 而把它留在 SAFE。
+        #
+        # 说清楚这一层实际拦住了什么：今天 TAP / LONG_PRESS / TYPE / SWIPE / LAUNCH
+        # 的动作类型下限已经是 CAUTION，所以这条下限**不改动它们现在的等级**，它是
+        # 一条结构性保证——任何将来被标成「类型安全」的会改页面动作（或新增类型忘了
+        # 归类），只要目标解析不出来就会被抬起来，而不会因为「没命中文案」静默放行。
+        #
+        # 真正让「按钮无文字 + 解析不到节点 → tap(540,1600)」变安全的是另外两件事，
+        # 别把功劳记在这一行上：
+        #   - `models.semantic` 的 UNKNOWN 已改成 CAUTION + 非幂等（V3.1 P0-3）；
+        #   - `Action.side_effect()` 对 TAP/LONG_PRESS/TYPE 的类型兜底已改成非幂等，
+        #     所以 EFFECT_UNKNOWN 之后**不会自动再点一次**，而是走对账 / 人工。
+        evidence_risk = ActionRisk.SAFE
+        if action.is_mutating and resolved.resolution.is_evidence_gap:
+            evidence_risk = ActionRisk.CAUTION
+            reasons.append(
+                f"目标解析失败（{resolved.resolution.value}）："
+                f"{_TARGET_GAP_HINTS[resolved.resolution]}，按最坏情况对待"
+            )
+
+        # 4) 页面敏感度下限：支付/银行类 App 里会改页面的动作至少 CAUTION
         page_risk = ActionRisk.SAFE
         if action.is_mutating and _is_sensitive_package(context):
             page_risk = ActionRisk.CAUTION
             reasons.append(f"当前页面属敏感应用（{context.package if context else ''}）")
 
-        return strictest(type_risk, text_risk, page_risk), reasons
+        return strictest(type_risk, text_risk, evidence_risk, page_risk), reasons, resolved.resolution
 
     @staticmethod
     def model_risk(action: Action) -> ActionRisk:
@@ -212,6 +266,15 @@ class ActionRiskGate:
             context.screen_size if context else None,
         )
         return resolved.node
+
+
+# 目标证据缺口的可读解释（V3.1 P1-4）。审计要能区分「我们没读到树」和
+# 「树读到了但没有这个节点」——前者是我们自己的观测问题，后者可能是页面已经变了。
+_TARGET_GAP_HINTS = {
+    target_evidence.TargetResolution.NO_TREE: "本次没有 UI 树，看不到点击落在哪个控件上",
+    target_evidence.TargetResolution.PARSE_ERROR: "UI 树存在但解析失败，目标元素无法确认",
+    target_evidence.TargetResolution.NOT_FOUND: "UI 树里找不到该目标（页面可能已变）",
+}
 
 
 def _is_sensitive_package(context: RiskContext | None) -> bool:

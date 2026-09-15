@@ -70,7 +70,10 @@ class GoalControllerMixin:
         )
 
         if not check.blocks_completion:
-            self._emit(
+            # V3.1 P0：GOAL_CONFIRMED 是安全关键事件——「谁认定任务完成、依据什么」
+            # 写不进 durable store，就**不能真的把任务落成 DONE**。否则会出现
+            # 「任务显示完成，但审计链里没有完成认定」，事后无从核对。
+            failed = self._emit_critical_or(
                 task.id,
                 GOAL_CONFIRMED,
                 verdict=check.verdict.value,
@@ -79,6 +82,10 @@ class GoalControllerMixin:
                 profile=check.profile,
                 layer=check.independent_evidence and "l6_goal" or "planner",
             )
+            if failed is not None:
+                return self._degrade(
+                    task, state, f"完成认定事件写盘失败，任务不落 DONE：{failed}"
+                )
             self._close_step(task, step)
             self._finish(task, state, observation, action)
             return RunOutcome.DONE
@@ -150,10 +157,20 @@ class GoalControllerMixin:
         """
         state.awaiting_goal_decision = False
         state.pending_confirmation = None
+        # V3.1 P0：先把「是谁裁定的」写进 durable store，再让裁定生效。
+        # 顺序反过来（先改状态再记事件）时，一次写不进去的批准会先生效——
+        # 于是「人工批准了任务完成」这件事真实发生了，却没有对应的授权记录。
+        # 记不下来就不放行：API 会拿到 False，用户重试即可。
+        failed = self._emit_critical_or(
+            task_id, CONFIRMED, approved=approved, action="done", risk="", reason="goal"
+        )
+        if failed is not None:
+            logger.error("任务 %s 的完成裁定事件写盘失败，裁定不生效：%s", task_id, failed)
+            return False
+
         if approved:
             logger.info("任务 %s 的完成申请被人工批准", task_id)
             state.goal_approved_by_human = True
-            self._emit(task_id, CONFIRMED, approved=True, action="done", risk="", reason="goal")
             return True
 
         logger.info("任务 %s 的完成申请被人工否决，任务继续执行", task_id)
@@ -161,12 +178,4 @@ class GoalControllerMixin:
         state.goal_rejections = 0
         state.pending_replan_reason = "人工确认任务尚未完成，请基于当前页面继续实际执行"
         state.failed_strategies.append("人工否决了完成申请：任务尚未完成")
-        self._emit(
-            task_id,
-            CONFIRMED,
-            approved=False,
-            action="done",
-            risk="",
-            reason="goal",
-        )
         return True

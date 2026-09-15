@@ -27,6 +27,28 @@ v2.9 审核点出的「闭环自证」：
     strict   计划跑完 + 页面推进过     → 完成（计划跑完 + 世界状态确实变了）
     strict   计划跑完 + 无页面推进     → 不确定（只有内部状态，没有世界证据）
     advisory 计划跑完                  → 完成（纯查询，计划跑完就够了）
+
+
+**有理由的延期（V3.1 §九 P2）：`page_seen_changed` 仍是「页面变过」，不是「目标状态成立」。**
+
+审核这条说得对，并且给的例子很具体：
+
+    任务：在淘宝搜索 iPhone 并进入详情页
+    模型点了「搜索」→ 页面变成搜索结果页 → 模型错误地给出 DONE
+    pending_steps 恰好是 0 → page_seen_changed = True → CONFIRMED
+
+也就是说「页面变过」是一个**弱于目标**的证据：它排除了「什么都没发生」，但没有
+验证「发生的是用户要的那件事」。真正强的形态是目标谓词：
+
+    package == taobao AND page_type == product_detail AND target_title contains iPhone
+
+延期的原因：上面这行谓词需要两样现在没有的东西——① 页面类型识别
+（`product_detail` 不是现成字段，要另建一套分类）；② 把自然语言目标**编译**成
+谓词的可信链路（谁来生成、怎么验证它没被模型带偏）。两者都不属于修复轮的范围。
+
+**必须做的触发条件**：`MAX_GOAL_REJECTIONS` 被真实轨迹频繁打满（即自动验证既不敢
+确认也推不翻、只能转人工）时，说明 `page_seen_changed` 这条证据已经不够分辨，
+届时应优先补目标谓词而不是放宽驳回次数。
 """
 from __future__ import annotations
 

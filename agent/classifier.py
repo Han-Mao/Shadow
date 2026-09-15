@@ -109,6 +109,67 @@ def shared_terms(left: str, right: str) -> set[str]:
     return {token for token in (_tokens(left) & _tokens(right)) if len(token) >= 2}
 
 
+# ---- 实体冲突（V3.1 P1-7）----
+#
+# 审核意见把这一层为什么必须存在讲得很准：
+#
+#     「给妈妈发微信」+「给爸爸发微信」
+#         ↓ 字面相似度很高、语义相似度更高（几乎同一句话）
+#         ↓ 于是被判成 SUBTASK / DUPLICATE
+#         ↓ 合并或者当成重复而跳过 —— 但这是**两条要发的消息**
+#
+# 这类任务之间最要紧的差异不是语义，而是**主体 / 对象**。相似度天然表达不了它：
+# 越相似的句子，恰恰越可能是「同一件事换了个对象」。所以要单独看「有没有互斥实体」。
+#
+# 表按**同维度**分组：同一组内出现不同成员 = 冲突（妈妈 vs 爸爸、淘宝 vs 京东）；
+# 两句话都提同一个成员 = 不冲突。分组刻意收窄——把「淘宝」和「微信」放进同一个
+# 大组会让「在淘宝下单」+「然后用微信支付」被判成互斥，那是真的递进关系。
+ENTITY_GROUPS: tuple[frozenset[str], ...] = (
+    # 联系人 / 亲属：不同收件人就是不同的事
+    frozenset({
+        "妈妈", "母亲", "妈", "爸爸", "父亲", "爸", "老婆", "妻子", "老公", "丈夫",
+        "姐姐", "妹妹", "哥哥", "弟弟", "爷爷", "奶奶", "外公", "外婆", "外公",
+        "儿子", "女儿", "女朋友", "男朋友", "女友", "男友", "老师", "老板", "客户",
+    }),
+    # 电商 / 购物平台：不同商户就是不同的订单
+    frozenset({
+        "淘宝", "天猫", "京东", "拼多多", "唯品会", "苏宁", "亚马逊", "得物", "闲鱼",
+        "taobao", "tmall", "jingdong", "pinduoduo", "vipshop", "amazon",
+    }),
+    # 通讯渠道：发微信 ≠ 发短信 ≠ 打电话
+    frozenset({
+        "微信", "短信", "电话", "邮件", "邮箱", "qq", "钉钉", "飞书", "whatsapp",
+        "wechat", "sms", "telegram",
+    }),
+    # 支付渠道：换一个渠道就是另一笔支付
+    frozenset({
+        "支付宝", "云闪付", "银行卡", "信用卡", "花呗", "余额", "零钱", "alipay",
+    }),
+    # 银行：换一张卡就是另一个账户
+    frozenset({
+        "招商", "工商", "建设银行", "农业银行", "中国银行", "交通银行", "邮储",
+        "浦发", "中信", "民生", "兴业", "平安银行",
+    }),
+)
+
+
+def conflicting_entities(left: str, right: str) -> frozenset[str]:
+    """两句话里「同一维度、但取值不同」的实体（V3.1 P1-7）。
+
+    返回冲突到的实体集合；没有冲突返回空集。「两句话都提到同一个成员」不算冲突
+    ——那反而说明指的是同一个对象。
+    """
+    text_left = (left or "").lower()
+    text_right = (right or "").lower()
+    conflicts: set[str] = set()
+    for group in ENTITY_GROUPS:
+        hits_left = {entity for entity in group if entity in text_left}
+        hits_right = {entity for entity in group if entity in text_right}
+        if hits_left and hits_right and not (hits_left & hits_right):
+            conflicts |= hits_left | hits_right
+    return frozenset(conflicts)
+
+
 class TaskClassifier:
     def __init__(
         self,
@@ -146,15 +207,24 @@ class TaskClassifier:
         # ---- 1. 与已有任务重复？ ----
         for task in candidates:
             similarity = instruction_similarity(text, task.instruction)
-            if similarity >= DUPLICATE_SIMILARITY:
-                signals["duplicate_similarity"] = round(similarity, 3)
-                return TaskRelationResult(
-                    relation=TaskRelation.DUPLICATE,
-                    confidence=min(0.95, 0.5 + similarity / 2),
-                    reason=f"与任务 {task.id} 的指令高度相似（{similarity:.2f}），不重复执行",
-                    affected_task_id=task.id,
-                    signals=signals,
-                )
+            if similarity < DUPLICATE_SIMILARITY:
+                continue
+            # V3.1 P1-7：字面高度相似、但对象互斥 → 是两件事，不是重复。
+            # 这一条比「判错关系」更要紧：判成 DUPLICATE 的后果是**静默不执行**
+            # （「与已有任务重复，不再重复执行」）。「给妈妈发微信」和「给爸爸发微信」
+            # 的 Jaccard 并不低，纯比字面会把第二条真实指令当成重复丢掉。
+            conflicts = conflicting_entities(text, task.instruction)
+            if conflicts:
+                signals["duplicate_entity_conflict"] = float(len(conflicts))
+                continue
+            signals["duplicate_similarity"] = round(similarity, 3)
+            return TaskRelationResult(
+                relation=TaskRelation.DUPLICATE,
+                confidence=min(0.95, 0.5 + similarity / 2),
+                reason=f"与任务 {task.id} 的指令高度相似（{similarity:.2f}），不重复执行",
+                affected_task_id=task.id,
+                signals=signals,
+            )
 
         # ---- 2. 规则层 ----
         rule_scores = self._rule_scores(text)
@@ -229,6 +299,27 @@ class TaskClassifier:
         signals["shared_terms"] = float(len(shared))
 
         if relation in RELATION_NEEDS_AFFINITY and current is not None:
+            # V3.1 P1-7：**实体冲突优先于一切相关性证据**。
+            #
+            # 这一条必须放在「共享实词 / 明确语言标记」豁免之前，否则挡不住真正的坑：
+            # 「给妈妈发微信」+「先给爸爸发微信」里「先」命中 SUBTASK_LEADERS（0.75），
+            # 两句又共享「发微 / 微信」（shared_terms 非空），两条豁免全中 → 判 SUBTASK
+            # → 并进当前计划。可它们要发的是**两条不同的消息**。
+            #
+            # 相似度表达不了这件事：越相似的两句话，越可能只是「同一件事换了个对象」。
+            conflicts = conflicting_entities(text, current.instruction)
+            if conflicts:
+                signals["entity_conflict"] = float(len(conflicts))
+                return TaskRelationResult(
+                    relation=TaskRelation.UNRELATED,
+                    confidence=round(min(0.85, 0.5 + best_rule_score * 0.3), 3),
+                    reason=(
+                        f"倾向判为 {relation.value}，但两句话指向互斥对象"
+                        f"（{'/'.join(sorted(conflicts))}），是两件独立的事"
+                    ),
+                    signals=signals,
+                )
+
             llm_says_dependent = (
                 llm_result is not None
                 and llm_result.relation in RELATION_NEEDS_AFFINITY

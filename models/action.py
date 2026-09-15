@@ -280,16 +280,24 @@ class Action(BaseModel):
         不再各自 grep 一套关键词（消灭旧 `IRREVERSIBLE_KEYWORDS` /
         `NON_IDEMPOTENT_KEYWORDS` 与 `DANGEROUS_KEYWORDS` 三表并存的矛盾）。
         函数内延迟 import 以避免 `semantic` ↔ `action` 的循环依赖。
+
+        V3.1 P0-3：**角色未知时的类型兜底也必须是保守的**。原来「认不出 → 会改页面的
+        动作一律 IDEMPOTENT_WRITE」意味着 `tap((540,1600))` 这种「按钮无文字、UI 解析
+        也找不到节点」的动作被允许自动重试——而那个坐标可能是「确认支付」。现在：
+        TAP / LONG_PRESS / TYPE 判非幂等（落点未知就不许自动重做）；SWIPE 例外，
+        它只是改变页面位置，没有「点中某个按钮」这回事，重做等价。
         """
         from .semantic import SemanticRole, infer_role, semantic_for
 
         role = infer_role(self._policy_haystack())
         if role is not SemanticRole.UNKNOWN:
             return semantic_for(role).side_effect
-        # 认不出语义 → 按动作类型兜底（BACK/HOME/WAIT 只读，其余会改页面的幂等写）
+        # 认不出语义 → 按动作类型分档兜底
         if self.type in READ_ONLY_ACTION_TYPES:
             return SideEffectClass.READ_ONLY
-        return SideEffectClass.IDEMPOTENT_WRITE
+        if self.type is ActionType.SWIPE:
+            return SideEffectClass.IDEMPOTENT_WRITE
+        return SideEffectClass.NON_IDEMPOTENT_WRITE
 
     def is_safe_to_retry(self) -> bool:
         """效果未知时，能不能自动再执行一次（V2.7 P1-2）。
@@ -343,6 +351,26 @@ class Action(BaseModel):
 
         raw = f"{self.type.value}|{target_key}|{self.value or ''}"
         return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+
+    def page_bound_fingerprint(self, package: str = "", activity: str = "") -> str:
+        """**页面绑定**指纹：动作身份 + 它被执行时所在的那一屏（V3.1 P2-9）。
+
+        为什么安全授权不能用裸 `fingerprint`：`tap((500, 800))` 在微信、淘宝、
+        设置里是三个完全不同的动作，裸指纹把它们算成同一个。用它做放行凭据，
+        「批准了微信里的发送」在页面上恰好有同坐标按钮时就可能放行别的东西。
+
+        为什么是**独立方法**而不是把页面塞进 `fingerprint`：`fingerprint` 的语义是
+        「做的是不是同一个动作」，页面维度会让 `denied_fingerprints`（用户否决过的
+        动作黑名单）跨页失效——同一屏上的同一个按钮被否决后，换个页面再出现就被
+        当成新动作重问一遍，那正是 [65] 要避免的骚扰。两个用途需要两种粒度，
+        所以分成两个函数，而不是拿一个字段冒充两种语义。
+
+        `package` / `activity` 都为空时退化为裸指纹（拿不到页面信息时不能凭空造证据）。
+        """
+        if not package and not activity:
+            return self.fingerprint
+        basis = f"{self.fingerprint}|{package.lower()}|{activity.lower()}"
+        return hashlib.sha1(basis.encode("utf-8")).hexdigest()[:12]
 
     def is_same_as(self, other: "Action", *, tolerance: float = 24.0) -> bool:
         """语义上是不是同一个动作：类型与取值一致，且落点足够接近。

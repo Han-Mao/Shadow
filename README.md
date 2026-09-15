@@ -938,6 +938,89 @@ executor ASCII 输入仍走 input text），零回归。
 
 ---
 
+## V3 M1–M4：从「功能实现」进入「正确性工程」
+
+| 里程碑 | 内容 |
+|---|---|
+| **M1 GoalOracle** | 把「计划跑完」与「目标达成」拆成两个判断：计划跑完只是完成的门槛，真正的信号是**独立于模型计划的世界证据** |
+| **M2 ActionSemanticLayer** | 风险与副作用幂等统一从一个 `SemanticRole` 派生，消灭 `DANGEROUS_KEYWORDS` / `IRREVERSIBLE_KEYWORDS` / `NON_IDEMPOTENT_KEYWORDS` 三表各判一个维度的矛盾 |
+| **M3 TaskLease** | 跨进程「一个任务同一时刻最多一个执行者」：独立 `lease.db` 上的 SQLite 原子 `claim` / `heartbeat`，JSON 存储保持不变 |
+| **M4 EventLog fail-safe** | 定义 `SAFETY_CRITICAL_KINDS`；危险动作的 dispatch 记录写不进 durable store 就不继续 |
+
+## V3.1 修复轮（依据 `v3.1审核建议.md`）
+
+这份文档有 **12 个审查项**。逐条拿它引用的代码片段去核对 HEAD 之后：**7 项成立并已修**、
+**3 项早前几轮已经修掉**（审核基于更早的提交）、**2 项属有理由的延期**（触发条件已就地标注）。
+
+### 一、本轮修掉的 7 项
+
+| 审查项 | 现状核对（HEAD 上的事实） | 改动 | 落点 |
+|---|---|---|---|
+| **一（P0）** EventLog 的 fail-safe 没落地 | **成立**。`emit_critical` 与 `SAFETY_CRITICAL_KINDS` 都在，但只有 `ACTION_DISPATCHED` 一处走 `emit_critical`；`RISK_ASSESSED` / `CONFIRMED` / `GOAL_CONFIRMED` 仍走 fail-open 的 `emit`——常量表说它们「丢失即审计链断裂」，真实行为却是「写不进去也照跑」 | 把分级**搬进唯一的写入口**：`emit()` 按 `is_safety_critical(kind)` 自动分派，安全关键事件写失败抛 `PersistenceError`。三处调用点改为「先落盘、再生效」：风险判定写不下 → 不继续；人工批准写不下 → **不放行**（`confirm` 返回 False）；完成认定写不下 → **不落 DONE** | `storage/event_log.py`、`agent/runtime.py`（`_emit_critical_or`）、`agent/_execution.py`、`agent/_goal.py`、`agent/_confirm.py` |
+| **三（P0）** `UNKNOWN` 语义仍是 SAFE + 可重做 | **成立**。`ROLE_SEMANTICS[UNKNOWN] = (SAFE, IDEMPOTENT_WRITE)`，配合「角色未知 → 会改页面的动作一律 `IDEMPOTENT_WRITE`」的类型兜底，`tap(540,1600)` 这种「按钮无文字、UI 也找不到节点」的动作被允许**自动重试**——而那个坐标可能是「确认支付」 | `UNKNOWN` → `(CAUTION, NON_IDEMPOTENT_WRITE)`；类型兜底改成「只读类型 → READ_ONLY，SWIPE → 幂等，TAP/LONG_PRESS/TYPE → **非幂等**」。另加一条边界：`DONE`/`WAIT`/`BACK`/`HOME` 的效果由**动作类型**就完全确定，保守下限不适用于它们，否则「申请完成」会被显示成需要确认的动作 | `models/semantic.py`、`models/action.py`、`agent/risk_gate.py` |
+| **五（P1）** Target Resolution 失败仍 fail-open | **成立**。`except Exception: return ResolvedTarget(node=None)` 把「没给树 / 树坏了 / 树里没这个节点 / 动作本就没有目标元素」四种情况压成一个 `node=None`，门禁分不清，只能一律当「没有证据」放行 | 新增 `TargetResolution`（`ok` / `no_tree` / `parse_error` / `not_found` / `no_target`）让失败原因成为一等事实；风险门禁把「会改页面的动作 + 目标证据缺口」抬到 CAUTION 并写进 `reasons`；`RiskAssessment` 暴露 `target_resolution` / `unresolved_target`，并进入 `RISK_ASSESSED` 审计 | `vision/target.py`、`agent/risk_gate.py`、`agent/_execution.py` |
+| **六（P1）** `generation` 是设备代次，不是 UI 版本 | **成立**。`DeviceSession.generation` 只记 Shadow **自己**的写入；用户手点、通知栏、App 异步刷新、另一个 adb client 都不推进它 → 「用 A 屏的坐标点 B 屏」的 TOCTOU 窗口一直开着（而且 Think 段可能包含一次几秒的模型调用） | 新增 `ObservationEpoch`（设备代次 + package/activity + UI 结构指纹 + 时刻），决策时快照、**执行前复查**。代次或页面身份对不上 → 放弃本次动作、记 `observation_stale`、重新观察；连续 3 次稳不下来按瞬时故障结算（必须有上界，否则判定抖动会变成死循环）。结构指纹只比结构不比文本，避免时钟/未读数把检查退化成「永远 stale」 | `models/state.py`、`agent/_execution.py`、`storage/event_log.py` |
+| **八（P1）** 单进程 CAS 边界没有锁死 | **成立**。`TaskStore` 的 revision CAS 与 `_mutation_lock` 都只在同一进程内成立，但没有任何东西阻止 `--workers 4`，而代码里到处是 `thread-safe` / `atomic` / `CAS` | 启动期硬闸：检测到 `WEB_CONCURRENCY` / `UVICORN_WORKERS` / `GUNICORN_WORKERS` > 1 时**拒绝启动**（M3 的 TaskLease 只保证不双执行，保证不了 Task 文档不被互相覆盖）。显式 `SHADOW_ALLOW_MULTI_PROCESS=1` 可跳过 | `api/server.py` |
+| **十（P1）** 关系判定仍是「相似度过强」 | **部分成立**。`shared_terms` / 语言标记 / LLM 置信度已在，但**没有实体冲突**这一层 | 新增 `conflicting_entities()`（按「同维度、不同取值」分组的实体表）。实体互斥时**优先于一切相关性证据**否决：`「给妈妈发微信」+「先给爸爸发微信」` 里「先」命中规则（0.75）、两句又共享「发微 / 微信」，两条豁免会同时放过它——但它们要发的是**两条不同的消息**。DUPLICATE 分支同样加这道闸（判重复的后果是静默不执行） | `agent/classifier.py` |
+| **十二（P2）** `fingerprint` 不适合安全授权 | **成立**。`tap(500,800)` 在微信 / 淘宝 / 设置里是三个不同动作，而裸指纹把它们算成同一个 | 新增 `Action.page_bound_fingerprint(package, activity)`；`ApprovalGrant` 用它做放行比对（`matches(..., package, activity)`），批准的页面换掉 → 凭据作废。**裸 `fingerprint` 语义刻意不变**：`denied_fingerprints` 依赖它做「同一屏内的动作身份」，掺进页面维度会让被否决的按钮换个页面出现时又被重问一遍 | `models/action.py`、`agent/_runtime_types.py`、`agent/_confirm.py`、`agent/_execution.py` |
+
+### 二、代码里已经做好的（审核基于更早的提交，本轮不动）
+
+| 审查项 | HEAD 上的事实 |
+|---|---|
+| **二（P0）** Agent 的 `TYPE` 不走 `InputProvider` | **V2.9 那轮已修**。`agent/executor.py` 的 TYPE 分支已改为 `build_default_input(adb).input(value)`，与 `/text` 端点同一条链路（ASCII → `input text`、非 ASCII → ADB Keyboard 广播）。仍未做的是「允许注入 provider **实例**」（现在每次现构一个），接口层面无害，暂不改 |
+| **七（P1）** Task Lease / Fencing 缺失 | **V3 M3 已实现**。`storage/lease_store.py` 用 SQLite 的 `INSERT ... ON CONFLICT ... DO UPDATE ... WHERE expires_at <= ?` 做单条事务内的原子 claim，`heartbeat` 用 `WHERE task_id=? AND token=?`（token 不匹配即必须停止执行）。`Scheduler` 的 lease 为 None 时保持单进程旧行为 |
+| **十一（P2）** `Action.side_effect()` 与语义层两套真相 | **V3 M2 已消除**。`policy_risk()` 与 `side_effect()` 都走 `infer_role` → `ROLE_SEMANTICS` 查表；`IRREVERSIBLE_KEYWORDS` / `NON_IDEMPOTENT_KEYWORDS` 已零引用，并就地标注为「遗留材料，新增词请改 `models/semantic`」 |
+
+### 三、有理由的延期（触发条件已就地写进代码）
+
+| 审查项 | 为什么本轮不做 | 触发条件（写在哪） |
+|---|---|---|
+| **四（P1）** 语义层本质仍是「关键词 → role」 | 把 UNKNOWN 改成保守之后，漏判的后果是「多问一次人 / 不自动重试」而不是「静默放行一个删除」——这是刻意取舍。真正的分类器会引入一个新的判定来源，必须同样受「只能抬不能降」约束、还要可解释可离线测，属独立一轮 | `UNKNOWN` 在真实轨迹里成为高频角色、人工确认被它刷屏时（`models/semantic.py` 模块 docstring） |
+| **九（P1 §九）** `page_seen_changed` 仍是「页面变过」而非「目标状态成立」 | 「页面变成了详情页」这种断言需要页面类型识别 + 把自然语言目标编译成谓词的可信链路，两样都不属于修复轮 | `MAX_GOAL_REJECTIONS` 被真实轨迹频繁打满时（`agent/goal_oracle.py` 模块 docstring） |
+
+### 行为变化提醒
+
+- **`EventLog.emit()` 现在会抛异常**——但只对 `SAFETY_CRITICAL_KINDS` 里的 kind。普通事件仍是旁路（写失败只 warning）。自定义调用方如果传的是这四个 kind，需要自己 catch 并决定「记不下还能不能继续」。
+- **认不出语义的点击/长按/输入不再自动重试**。`EFFECT_UNKNOWN` 之后从「自动再来一次」变成「转人工」。人工确认的次数会上升——这是拿「多问一次」换「不重复扣款」，是刻意的。
+- **`DONE` / `WAIT` / `BACK` / `HOME` 不受影响**，仍判 SAFE：它们的效果由动作类型就完全确定，「不知道这是什么动作」对它们不成立。
+- **每步多一次 `dumpsys window`**（TOCTOU 复查）。验证过的设备很慢、或压测吞吐时可用 `SHADOW_TOCTOU_GUARD=0` 关掉，代价是外部改动拦不住。
+- **多 worker 现在会拒绝启动**。用 `uvicorn ... --workers 1`；确实要跑多进程且自行承担状态一致性风险时设 `SHADOW_ALLOW_MULTI_PROCESS=1`。
+- **人工批准之后页面被换掉，凭据会作废**，需要重新确认（这是 P2-9 的目的）。转人工时若手上没有观察（`_ask_human` / `_settle_failure` 这两条路径），凭据**不绑页面**——否则会造出一张永远匹配不上的凭据，任务卡在「请求确认 → 凭据失效 → 再请求确认」的空转里。
+- 内部接口变更：`ActionRiskGate.policy_risk()` 的返回值从 `(risk, reasons)` 变成 `(risk, reasons, resolution)`；`ApprovalGrant` 新增必填字段 `page_bound_fingerprint`。
+
+### 新环境变量
+
+| 变量 | 说明 | 默认值 |
+|---|---|---|
+| `SHADOW_TOCTOU_GUARD` | 置 0 关闭执行前的页面身份复查（设备代次检查始终生效） | `1`（开启） |
+| `SHADOW_ALLOW_MULTI_PROCESS` | 置 1 时跳过「多 worker 拒绝启动」的硬闸（自行承担状态一致性风险） | 未设置 |
+| `WEB_CONCURRENCY` / `UVICORN_WORKERS` / `GUNICORN_WORKERS` | 现在会被**读取并检查**：> 1 时拒绝启动 | 未设置 |
+
+### 事件流变更
+
+- 新增事件类型 `observation_stale`：记下一次**被避免的 TOCTOU**（附 `reason` 与连续次数）。刻意**不**放进 `SAFETY_CRITICAL_KINDS`——它丢失只会少一条解释，而它对应的行为（拒绝执行）本身就是最安全的那一侧。
+- `risk_assessed` 新增 `target_resolution` / `unresolved_target` 两个字段，审计可以直接回答「这次点击是不是在盲点」。
+
+### API 变更
+
+**没有新增端点。** 行为变化只有一处：`POST /tasks/{id}/confirm` 在「安全事件写盘失败」时不再返回成功——批准 / 否决 / 完成裁定 / 恢复裁定四类确认都是「先留痕、再生效」，记不下来就不放行，返回失败让用户重试。
+
+### 验证
+
+`python -m pytest -q` → **503 passed（11.9s）**，较上轮 482 新增 **21** 条，零回归。
+其中 **3 条既有用例随语义变更同步更新**（不是回归，是预期）：
+
+| 用例 | 为什么要改 |
+|---|---|
+| `test_models.py::test_approval_grant_binds_task_and_attempt` | `ApprovalGrant` 新增页面绑定字段，并补一条「换了页面 → 凭据作废」的断言 |
+| `test_runtime.py::test_reconcile_retries_action_when_it_never_took_effect` | 原来用裸坐标 `tap(100,200)`，现在它是**非幂等**的（P0-3），不会自动重做。改用带可识别语义的 `replayable_tap` 保持「重做等价」这一档的覆盖，裸坐标那一档由新用例 `test_unknown_target_tap_effect_unknown_goes_to_human` 覆盖 |
+| `test_runtime.py::test_effect_unknown_reconcile_redoes_the_action_once` | 同上 |
+
+新增的 21 条按审查项分布：P0-1（2）、P0-3（6）、P1-4（3）、P1-6（3）、P1-7（3）、P1-8（2）、P2-9（2）。
+
+---
+
 ## 快速开始
 
 ```powershell
@@ -1059,10 +1142,11 @@ pip install -r requirements.txt
 python -m pytest -q
 ```
 
-**450 个用例，全部离线**：不需要 adb、模拟器或 API Key。
+**503 个用例，全部离线**：不需要 adb、模拟器或 API Key。
 
 | 文件 | 覆盖 |
 |---|---|
+| `test_semantic.py` | **动作语义层**：语义角色优先级（最危险优先）、同一 role 派生 risk 与幂等、`UNKNOWN` 的保守下限 |
 | `test_models.py` | 任务状态机、**故障/恢复态（DEGRADED / DEVICE_UNAVAILABLE）回归**、步骤依赖、动作风险（策略下限）/指纹、Checkpoint、预算、版本号、**尝试历史** |
 | `test_device.py` | ADB 封装、输入通道（含中文）、设备会话所有权与并发、**命令超时分级与总预算**、**多设备 serial 解析** |
 | `test_device_pool.py` | **DevicePool**：注册/查找、未知设备报错、空闲筛选、产物按设备分目录 |

@@ -55,40 +55,65 @@ class ConfirmationMixin:
             return self._confirm_goal_locked(task_id, state, approved)
 
         if not approved:
-            logger.info("任务 %s 的危险动作被人工否决", task_id)
             denied = state.pending_confirmation
-            state.pending_confirmation = None
-            # 记住这个动作被否决过：下次决策再给出它就直接换策略，
-            # 否则任务会在「请求确认 → 被否决 → 再次请求确认」之间空转
-            state.denied_fingerprints.add(denied.fingerprint)
-            state.failed_strategies.append(f"危险动作被人工否决：{self._describe_action(denied)}")
-            self._emit(
+            # V3.1 P0：先留痕，再改动内存状态。写不进去就什么都不做——
+            # 「用户否决过某个危险动作」同样是必须可追溯的事实（它解释了后续策略为什么
+            # 绕开这个动作），记不下来就别假装收到过。
+            failed = self._emit_critical_or(
                 task_id,
                 CONFIRMED,
                 approved=False,
                 action=denied.type.value,
                 risk=denied.resolved_risk().value,
             )
+            if failed is not None:
+                logger.error("任务 %s 的否决事件写盘失败，否决不生效：%s", task_id, failed)
+                return False
+            logger.info("任务 %s 的危险动作被人工否决", task_id)
+            state.pending_confirmation = None
+            # 记住这个动作被否决过：下次决策再给出它就直接换策略，
+            # 否则任务会在「请求确认 → 被否决 → 再次请求确认」之间空转
+            state.denied_fingerprints.add(denied.fingerprint)
+            state.failed_strategies.append(f"危险动作被人工否决：{self._describe_action(denied)}")
             return True
+
         pending = state.pending_confirmation
         if pending is None:
             return False
-        # 记下「批准的到底是哪一个任务、哪一个动作、哪一版目标与计划、哪一次尝试」
-        # （V2.7 P0-2）：放行时逐项比对，任务 / 动作 / 目标 / 计划 / 执行序号任一变过
-        # 就作废——绝不拿来放行别的危险动作。
-        state.approval = ApprovalGrant(
-            task_id=task_id,
-            action_fingerprint=pending.fingerprint,
-            task_version=state.pending_task_version,
-            plan_version=state.pending_plan_version,
-            attempt_seq=state.attempt_seq,
-        )
-        self._emit(
+        # V3.1 P0：这条 CONFIRMED 写不进去就**绝不能装出「已批准」**——批准会立刻
+        # 放行一个真实副作用，而它没有对应的授权记录，正是「转账了但查不到谁批的」。
+        # 严格先写后放行：`state.approval` 只在留痕成功之后才被设置。
+        failed = self._emit_critical_or(
             task_id,
             CONFIRMED,
             approved=True,
             action=pending.type.value,
             risk=pending.resolved_risk().value,
+            # 记下批准时所在的那一屏，放行时会再比对一次（V3.1 P2-9）
+            page="/".join(part for part in state.pending_page if part),
+        )
+        if failed is not None:
+            logger.error("任务 %s 的批准事件写盘失败，放行不生效：%s", task_id, failed)
+            return False
+        # 记下「批准的到底是哪一个任务、哪一个动作、哪一版目标与计划、哪一次尝试」
+        # （V2.7 P0-2）：放行时逐项比对，任务 / 动作 / 目标 / 计划 / 执行序号任一变过
+        # 就作废——绝不拿来放行别的危险动作。
+        #
+        # V3.1 P2-9：再加一层页面绑定。但**只在真的知道「在哪一屏」时才绑**：
+        # `_ask_human` / `_settle_failure` 这两条转人工路径手上没有观察，页面是空的；
+        # 那时如果拿空页面去算一个「绑定指纹」，放行时必然比对不上，凭据会被永久作废，
+        # 任务就卡在「请求确认 → 凭据失效 → 再请求确认」的空转里。
+        # 拿不到页面信息时不绑页面，而不是绑一个假页面。
+        has_page = any(state.pending_page)
+        state.approval = ApprovalGrant(
+            task_id=task_id,
+            action_fingerprint=pending.fingerprint,
+            page_bound_fingerprint=(
+                pending.page_bound_fingerprint(*state.pending_page) if has_page else ""
+            ),
+            task_version=state.pending_task_version,
+            plan_version=state.pending_plan_version,
+            attempt_seq=state.attempt_seq,
         )
         return True
 
@@ -103,11 +128,16 @@ class ConfirmationMixin:
         否决 = 不再自动重跑，落 DEGRADED 等人工处置。两边都不在这里改任务状态：
         状态统一由 TaskManager 落，避免又出现「两处各写一半」。
         """
-        self._recovery_notes.pop(task_id, None)
-        logger.info("任务 %s 的崩溃恢复待办已被人工处理（approved=%s）", task_id, approved)
-        self._emit(
+        # V3.1 P0：同样是「先落盘、再生效」。清掉恢复待办 = 批准重跑，
+        # 而重跑可能产生第二条消息 / 第二笔订单——没有裁决记录就不能放行。
+        failed = self._emit_critical_or(
             task_id, CONFIRMED, approved=approved, action="recovery", risk="", reason="recovery"
         )
+        if failed is not None:
+            logger.error("任务 %s 的恢复裁定事件写盘失败，裁定不生效：%s", task_id, failed)
+            return False
+        self._recovery_notes.pop(task_id, None)
+        logger.info("任务 %s 的崩溃恢复待办已被人工处理（approved=%s）", task_id, approved)
         return True
 
     def forget(self, task_id: str) -> None:
