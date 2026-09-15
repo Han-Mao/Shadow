@@ -43,6 +43,20 @@ v2.9 指出的核心问题：风险（`DANGEROUS_KEYWORDS`）与幂等
 **必须做的触发条件**：当 `UNKNOWN` 在真实轨迹里成为高频角色（即大量动作认不出、
 人工确认被这些动作刷屏）时，就必须把 model classifier 接进来——
 否则本层会从「安全保障」退化成「噪声源」，然后被绕过。
+
+**V3.3 §八 补记了两件事**：审核指出「危险操作远多于有限角色表能覆盖的」（转账/提现/
+充值/发送验证码/绑定银行卡/分享位置/注销…，中文还有隐喻、缩写、图标、无文本按钮），
+并建议不要再无限扩表，而是做 Policy Engine。这个判断成立，所以把**还缺的输入**记在这里：
+
+| 输入 | 现在有吗 | 落在哪 |
+|---|---|---|
+| 动作语义（role） | ✅ 关键词 → role（弱，见上） | 本模块 `infer_role` |
+| 目标接地（target grounding） | ✅ | `vision/target.py` + `agent/risk_gate.py` |
+| **App 敏感状态** | ⚠️ 只有包名标记 | `SENSITIVE_PACKAGE_MARKERS`（静态词表，不含「当前这屏是不是支付确认页」） |
+| **风险历史（risk history）** | ❌ | 无——`EventLog` 里有 `RISK_ASSESSED`，但没有回路 |
+
+也就是说：真正缺的是后两项。做 Policy Engine 时它们才是新增能力，
+**继续扩 `SemanticRole` 词表不是**——那只是把同一个方法的边界再推远一点。
 """
 from __future__ import annotations
 

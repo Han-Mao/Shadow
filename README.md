@@ -104,7 +104,7 @@ V3.3 起 `Vision / Device` 这一层的左边是 `DeviceController` **协议**�
 ├── scripts/
 │   ├── demo_preemption.py  # 抢占恢复演示（离线可跑）
 │   └── replay_task.py      # 命令行回放一个任务的事件流
-└── tests/                  # 611 个离线用例
+└── tests/                  # 632 个离线用例
 ```
 
 ## 职责边界
@@ -1267,6 +1267,169 @@ for Chaquopy*，chaquo/chaquopy#1160；另一份专门为 Chaquopy 构建它的�
 
 ---
 
+## V3.3 修复轮（依据 `v3.3审查建议.md`）
+
+审核这轮给了 11 条（P0×1、P0/P1×1、P1×6、P2×2，外加一条架构评估）。照例**先核对再动手**，
+核对结论是：**7 条成立且本轮已修、4 条属架构级延期**（触发条件已就地写进代码）。
+
+### 一、逐条核对与处置
+
+| 审核条目 | 现状核对（改前的真实代码） | 本轮处置 |
+|---|---|---|
+| §一 P0 安全关键事件不 durable | **成立**。`emit_critical` 只 `handle.write(...)` 就返回，没有 `flush`/`fsync`——它保证的是「write 返回」，不是「durable on disk」 | ✅ 见下「二」 |
+| §二 P0/P1 多进程 EventLog 不一致 | **成立**。只有 `threading.Lock`（进程内） | ✅ 部分修 + 写清边界，见「二」 |
+| §三 P1 Checkpoint 只是顺序一致 | **已在 V3.2 承认并写全**（`agent/runtime.py:277-291`：成立的只有①写入顺序②单文件原子可见，代价是孤儿恢复点） | ⏸ 无代码改动，出口路径已指向 V4 |
+| §四 P1 `/wait` 看不到别的进程的推进 | **成立**。`_wait_for` 用 `manager.get()`，而它**优先返回本进程内存对象** | ✅ 见下「三」 |
+| §五 P1 CAS 只覆盖一半（Runtime 不拿 `_mutation_lock`） | **成立且代码里已承认**（`_mutation_lock` 注释写明「Runtime 与 Scheduler 不经这把锁」，兜底是 revision CAS） | ⏸ 保持现状 + 写下出口路径（single-writer state machine）与触发条件 |
+| §六 P1 票据已消费但业务确认失败 | **成立**。`/confirm` 先 `consume` 再 `resolve_confirmation` | ✅ 见下「四」 |
+| §七 P1 敏感页上目标解析失败只到 CAUTION | **成立**。`requires_confirmation` 只在 `DANGEROUS` 时为真 | ✅ 见下「五」 |
+| §八 P1 语义词表覆盖度 / 建议 Policy Engine | **成立**，但其延期理由 V3.1 §四 已写（`models/semantic.py`） | ⏸ 延期，本轮补记「真正缺的两项输入」 |
+| §九 P2 `/health` 匿名泄露部署信息 | **成立**（回 `auth`/`host`/`device_backend`/`principals_error`） | ✅ 见下「六」 |
+| §十 P2 `HOST=127.0.0.1` 与手机部署 | **成立**（这是部署形态问题，不是配置错误） | ✅ 文档澄清，见「七」 |
+| §十一 该换数据库了（建议 V4 Storage Refactor） | **接受**这个判断 | ⏸ 写成本仓库的下一步计划，见「八」 |
+
+### 二、P0 那个洞：`write` 返回 ≠ durable
+
+改法是审核给的那条路，但有两个细节值得写下来：
+
+```python
+os.open(path, O_APPEND | O_CREAT | O_WRONLY)  →  单次 os.write  →  （安全关键事件才）os.fsync
+```
+
+- **单次 `os.write` + `O_APPEND`**：内核把「定位到文件尾」和「写入」做成一次原子操作，
+  所以多进程同时追加时行与行不会交错。它给的是**不撕裂**，**不是串行化**——
+  跨进程的先后顺序仍然不承诺。这一点现在写在 `storage/event_log.py` 的模块 docstring 里
+  （一张「保证 / 不保证」表），因为审核 §二 的真正要求就是**把一致性模型定义清楚**，
+  而不是假装文件日志能当数据库用。
+- **`fsync` 失败必须抛**（→ `PersistenceError` → 任务 DEGRADED）。这里与 `JsonStore`
+  的取舍**刻意相反**：那边 fsync 失败就降级为「与升级前一致」，因为状态写入迟早会再发生
+  一次；而安全关键事件守着的是**已经发生的副作用**——「不 durable 就不放行」才是它的全部意义。
+- 只有新建文件时才额外刷一次目录项（掉电可能「内容在、名字没在」），目录 fsync 允许失败
+  （Windows 根本不允许打开目录）。
+- 普通事件仍然 `fail-open` 且**不 fsync**：它是旁路，为它付热路径的代价换不到任何安全收益。
+
+### 三、`/wait` 现在看「最新事实」而不是「本进程方便的那份」
+
+新增 `TaskManager.freshest(task_id)`：在「调度器内存」与「磁盘」两份之间取 `revision`
+较大的那份。判据用写入序号而不是时间戳，因为两个方向都成立——
+
+- 内存领先磁盘（刚改完还没落盘）：revision 相同 → 取内存（这正是 V2.5 §五 要的「live 状态」）；
+- 磁盘领先内存（别的进程推进过）：取磁盘（这正是审核 §四 说的「Worker B 完成、Worker A 还在等」）。
+
+`GET /tasks` 的 `list_all()` 也顺带修正了：它的 docstring 早就写着「对齐 revision 较大的那份」，
+而实现只是 `setdefault`（内存永远赢）——**注释比实现强**，属于审核最爱抓的那类问题，
+这轮把它对齐了。
+
+### 四、确认流程从一步变两步：`reserve → resolve → commit`
+
+审核 §六 的判断是「这不是安全漏洞，反而是 fail-safe，但用户体验会比较糟」——准确。
+改法是把它拆成两阶段：
+
+```
+reserve(jti)       # 预占：jti 唯一约束保证原子；此刻**还没有**作废票据
+    ↓
+resolve_confirmation()   # 真正的副作用在这里
+    ↓
+commit(jti)        # 成功才把票据永久作废；业务失败（返回 None / 抛异常）则 release 退回
+```
+
+- 「一次性」没有变弱：`reserve` 与 `commit` 都是单条 SQL，两个并发请求不可能同时占上；
+  `commit` 之后任何 `reserve` 都会失败；`release` 只能退**预占**（`WHERE state='reserved'`），
+  退不掉已消费的记录。
+- 崩溃残留的预占不会把票据永久卡死：超过 `SHADOW_CONFIRM_RESERVE_TTL_SECONDS`（默认 60s）
+  允许被同一个 `jti` 接管。
+- 老库（V3.2 建的 6 列表）自动迁移：`state` 列的默认值是 `'consumed'`，
+  因为 V3.2 只有一种语义（消费即作废），历史行确实都是那个状态。
+- `commit` 失败不回滚业务（状态是真的改了），只把票据留在预占状态并记 warning——
+  最坏是「重试要等一会儿」，好过「票据已烧、业务没做」。
+- 内存守卫（`InMemoryConsumption`）实现了**同一套** `reserve`/`commit`/`release`：
+  否则单测跑的不是生产的那条路径。
+
+### 五、敏感页上的「一无所知的点击」
+
+审核 §七 要的是：`付款 App + 目标找不到 + TAP` 应该转人工。现在：
+
+| 场景 | 改前 | 改后 |
+|---|---|---|
+| 敏感应用 + 会改页面 + **目标证据缺口** | CAUTION（→ 自动执行） | **DANGEROUS（转人工）** |
+| 非敏感应用 + 会改页面 + 目标证据缺口 | CAUTION | CAUTION（不变） |
+| 敏感应用 + 会改页面 + 目标解析得到 | CAUTION | CAUTION（不变） |
+
+第二、三行是刻意保留的：不加这两条限制，门禁会变成噪声（每次树读不到都问人），
+然后被人绕过——V3.1 P0-3 的教训是**保守要保守在代价不对称的那一侧**。
+**没做的事**：敏感应用里「角色 UNKNOWN 但有目标」仍然只到 CAUTION，
+那部分属于 §八 的 Policy Engine（缺 App 敏感状态与风险历史输入，见 `models/semantic.py`）。
+
+### 六、`/health` 只回答「活着吗」
+
+- `GET /health`（和 `/healthz`）→ `{"ok": true}`。匿名可访问，因为探针不该带密钥；
+  但它也**不能顺带告诉匿名者**「这个实例有没有开鉴权」（＝值不值得试）、部署形态、
+  以及「配置坏了、此刻全部 401」。
+- `GET /health/detail` → 原来那些字段，**需要鉴权**。
+
+拆分的理由是读者不同：探活的是机器，诊断的是运维本人。
+
+### 七、部署形态与 HTTP 面（§十）
+
+审核提醒的是「Android App 里的 `127.0.0.1` 是手机自己，不是你的开发机」。本仓库的形态是：
+
+| 形态 | 谁提供 HTTP 面 | 与 `HOST` 的关系 |
+|---|---|---|
+| 路线 B（默认，见 `android/README.md`） | 手机只跑**设备端点**（Kotlin，自己的 `/health` 与令牌），Core 跑在 PC/服务器 | Core 的 `HOST` 保持 `127.0.0.1` 即可；Core **主动**去连手机，不需要被手机连 |
+| 手机 UI 直连 Core（未来形态） | Core 需要被局域网访问 | 必须同时配 `SHADOW_API_TOKEN`，否则启动即拒绝裸绑定（既有闸门，不是新加的） |
+
+也就是说：**手机上不需要跑 FastAPI**（方案文档 §2 与 §10 也是这个判断），
+所以 `HOST=127.0.0.1` 在这个形态下不是障碍，而是正确默认。
+
+### 八、V4 Storage Refactor（下一步，不是本轮）
+
+接受审核 §十一 的判断：JSON / JSONL / SQLite 混合方案已经到边界了。计划是让
+`tasks` / `task_steps` / `step_attempts` / `checkpoints` / `events` / `audit_events` /
+`confirmations` / `leases` 进同一个事务数据库，用事务、`revision`、唯一约束、外键
+一次性解决现在靠注释与多点检查维持的那些不变量（跨文件一致性、孤儿、事件 durability、
+多进程顺序）。
+
+**为什么不在本轮做**：那是把整套存储层同时换掉的大爆炸式改动，而本轮审核的 P0 是
+「已经不 durable」，那个洞可以在现有结构里堵住——先堵洞、再换地基，比反过来安全。
+`confirmation` 与 `lease` 已经在 SQLite 上，是这条路的两个先例。
+
+### 行为变化提醒（会影响到既有调用方与测试）
+
+1. **`/health` 返回体收窄**：只回 `{"ok": true}`；原来那些字段搬到 `/health/detail`（需鉴权）。
+   老用例 `test_health_is_public`、`test_health_reports_confirmation_consumption_backend` 已同步更新。
+2. **敏感应用 + 目标解析失败的会改页面动作 → 需人工确认**。老用例
+   `test_sensitive_app_raises_the_floor_but_not_to_dangerous` 的场景原本靠「没有 UI 树」间接表达
+   「不直接判危险」，现在**显式带上 UI 树**——因为「看不见目标」是另一条规则了。
+3. **`/confirm` 的票据在业务失败时退回**，可以拿同一张票据重试（以前是一次作废、要重新申请）。
+4. `TaskManager.freshest()` 新增；`list_all()` 的行为有一处收紧（真的按 revision 取较新的一份）。
+
+### 新环境变量
+
+| 变量 | 作用 |
+|---|---|
+| `SHADOW_CONFIRM_RESERVE_TTL_SECONDS` | 确认票据**预占**的有效期，默认 60 秒。只影响「崩溃后多久能接管这张票据」，不影响令牌自身的 TTL |
+
+### API 变更
+
+| 变更 | 说明 |
+|---|---|
+| `GET /health` | 返回体收窄为 `{"ok": true}` |
+| `GET /health/detail` | **新增**：原 `/health` 的诊断字段，需要鉴权 |
+
+### 验证
+
+`python -m pytest -q` → **632 passed**（上轮 611 → +21，零回归）。
+
+| 新增用例 | 覆盖 |
+|---|---|
+| `test_event_log.py`（+5） | 安全关键事件真的 `fsync`、普通事件不 fsync、**fsync 失败必须抛**（拦住副作用）、一行只走一次 `os.write`、`O_APPEND`、只有新文件才刷目录项 |
+| `test_confirmation_store.py`（+8） | 预占不作废票据、预占不可重复（跨实例）、提交后永久不可用、退回可重试、过期预占可接管、**老库自动迁移**、auth 两阶段接线 |
+| `test_api_auth.py`（+3） | 匿名 `/health` 只回 `ok`、`/health/detail` 需要令牌、**业务失败时票据可重试**（端到端） |
+| `test_risk_gate.py`（+3） | 敏感页 + 目标盲区 → DANGEROUS、非敏感页仍 CAUTION、敏感页但目标可解析不升级 |
+| `test_scheduler.py`（+2） | `freshest` 取磁盘上更新的一份、平局时留在内存（两个方向都钉住） |
+
+---
+
 ## 快速开始
 
 ```powershell
@@ -1391,7 +1554,7 @@ pip install -r requirements.txt
 python -m pytest -q
 ```
 
-**611 个用例，全部离线**：不需要 adb、模拟器或 API Key。
+**632 个用例，全部离线**：不需要 adb、模拟器或 API Key。
 
 | 文件 | 覆盖 |
 |---|---|

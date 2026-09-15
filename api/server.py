@@ -962,12 +962,17 @@ def execute_action(req: ActionRequest, request: Request, device_serial: str | No
 def _wait_for(task_id: str, timeout: float) -> dict:
     """`wait=true` 时的同步等待。
 
-    注意 `time.sleep` 轮询而不是事件通知：任务可能被另一个进程的 worker 推进
+    用 `time.sleep` 轮询而不是事件通知：任务可能被另一个进程的 worker 推进
     （TaskLease 允许多进程部署），进程内的 Event 收不到那种进度。
+
+    V3.3 §四：查的必须是**最新事实**（`manager.freshest`）而不是 `manager.get`。
+    `get()` 优先返回本进程内存里的对象，而多进程下磁盘可能更新——「Worker B 完成并
+    落盘、Worker A 内存还停在 RUNNING」时，用 `get()` 会一直等到 504，
+    明明任务早就完成了。`freshest` 按 `revision` 取较新的那份，两个方向都成立。
     """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        task = manager.get(task_id)
+        task = manager.freshest(task_id)
         if task is None:
             raise HTTPException(status_code=404, detail="任务不存在")
         if task.is_terminal:
@@ -1158,7 +1163,10 @@ def confirm_task(task_id: str, req: ConfirmRequest, request: Request):
         fingerprint = (
             pending.fingerprint if pending is not None else manager.confirmation_kind(task_id)
         )
-        ok, reason = auth.consume_confirmation_token(
+        # V3.3 §六：先**预占**票据，业务状态改成功之后才 commit。
+        # 老顺序是「先消费、再改状态」，遇到并发冲突时票据已经烧掉而动作没执行，
+        # 用户必须重新申请一张票据（审核原话：fail-safe，但体验糟）。
+        ok, reason, jti = auth.reserve_confirmation_token(
             req.token, principal.name, task_id, fingerprint, task.version
         )
         if not ok:
@@ -1177,11 +1185,33 @@ def confirm_task(task_id: str, req: ConfirmRequest, request: Request):
                     "申请令牌，再把返回的 token 传到这里"
                 ),
             )
+    else:
+        jti = ""
 
     # 状态写入全部收口到 TaskManager（V2.2 §九 / §十）：API 不再自己 task.mark(...)
-    resolved = manager.resolve_confirmation(task_id, approved=req.approved)
+    try:
+        resolved = manager.resolve_confirmation(task_id, approved=req.approved)
+    except Exception:
+        # 业务没做成 → 退回预占，同一张票据可以重试。**危险动作没有发生，就不该烧票据。**
+        if jti:
+            auth.release_confirmation_token(jti)
+        raise
+
     if resolved is None:
+        if jti:
+            auth.release_confirmation_token(jti)
         raise HTTPException(status_code=409, detail="该任务当前没有可处理的待确认事项")
+
+    if jti and not auth.commit_confirmation_token(jti):
+        # 状态已经改成功了，所以**不回滚业务**——只是这张票据停在「预占」状态，
+        # 直到 RESERVE_TTL_SECONDS 之后才能被重新预占。这比「票据已烧、业务没做」好：
+        # 前者最坏是「重试要等一会儿」，后者是「用户白点一次还得重新申请」。
+        logger.warning(
+            "确认令牌预占提交失败（业务状态已变更，票据将停在预占状态）：jti=%s task=%s",
+            jti,
+            task_id,
+        )
+
     return {
         "ok": True,
         "approved": req.approved,
@@ -1327,24 +1357,45 @@ def scheduler_state(request: Request):
 
 
 @app.get("/health")
+@app.get("/healthz")
 def health():
-    """探活端点。唯一不需要鉴权的入口——运维探活不该还要带密钥。
+    """探活端点：**只回 `{"ok": true}`**（V3.3 §九）。
 
-    `confirmation_consumption` 是「确认令牌已消费记录」的后端类名（V3.2 §二）。
-    **只有它不是 `InMemoryConsumption` 时**，「一次性 Token」这句话才跨重启成立。
-    把后端名字暴露出来，是因为「我们到底配的是哪个实现」应该能被查到，
-    而不是靠人记住几个月前启动时设了什么环境变量。
+    它是唯一不需要鉴权的入口——运维探活不该还要带密钥（容器探针、负载均衡、
+    systemd watchdog 都只该问「活着吗」）。所以它**不能**顺带回答别的：
+
+    - `auth`：等于告诉匿名者「这个实例有没有开鉴权」，也就告诉他值不值得试；
+    - `host` / `device_backend`：暴露部署形态（ADB 还是手机本机端点）；
+    - `principals_error`：暴露「配置坏了、此刻所有请求都 401」。
+
+    详细诊断搬到 `GET /health/detail`，**需要鉴权**。拆分的理由是读者不同：
+    探活的是机器，诊断的是运维本人。
+    """
+    return {"ok": True}
+
+
+@app.get("/health/detail")
+def health_detail():
+    """诊断端点（需要鉴权）：把「我们到底跑成什么样子」一次说清楚。
+
+    V3.3 §九 从这里拆出来的——以前这些字段挂在匿名 `/health` 上。
+
+    - `confirmation_consumption`：确认令牌消费记录的后端类名（V3.2 §二）。
+      **只有它不是 `InMemoryConsumption` 时**，「一次性 Token」才跨重启成立。
+      把名字暴露出来，是因为「我们到底配的是哪个实现」应该能被查到，
+      而不是靠人记住几个月前启动时设了什么环境变量。
+    - `device_backend`（V3.3 §1）：一句就能确认「现在是谁在控制设备」——
+      手机上部署时最常问的就是「跑的是 ADB 后端还是本机后端」，不该靠翻日志。
+    - `principals_error`：非 null 说明 `SHADOW_API_PRINCIPALS` 配错了，
+      此刻**所有请求都在被 401**。必须能查到——否则运维只看到「全部 401」，
+      原因却只在一行日志里。
     """
     return {
         "ok": True,
         "auth": "token" if auth.enabled() else "disabled",
         "host": HOST,
         "confirmation_consumption": auth.consumption_backend(),
-        # V3.3 §1：一句就能确认「现在是谁在控制设备」——手机上部署时最常问的
-        # 就是「到底跑的是 ADB 后端还是本机后端」，不该靠翻日志。
         "device_backend": describe_backend(resolve_device_serial()),
-        # 非 null 说明 SHADOW_API_PRINCIPALS 配错了，此刻**所有请求都在被 401**。
-        # 必须能从这里查到——否则运维只看到「全部 401」，原因却只在一行日志里。
         "principals_error": auth.config_error(),
     }
 

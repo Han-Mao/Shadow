@@ -9,11 +9,29 @@
 
 格式选 JSONL 而不是单个 JSON 数组：追加不需要「读出来改完再整个写回」，
 进程在写一半时被杀也只丢最后一行，不会损坏已有记录。
+
+## 一致性模型（V3.3 修复轮 §一/§二：写清楚它到底保证什么）
+
+这份日志**不是**一个数据库，能力边界必须写明白，否则「durable」会被理解错：
+
+| 保证 | 成立吗 | 靠什么 |
+|---|---|---|
+| 单条事件不撕裂（不会读到半行） | ✅ | `O_APPEND` + **单次 `os.write`** |
+| 安全关键事件落盘（掉电后仍在） | ✅ | `emit_critical` 里 `fsync(文件)` |
+| 同进程内多条事件顺序 = 调用顺序 | ✅ | 进程内 `threading.Lock` + 单次 write |
+| **跨进程**事件顺序（全局单调 id） | ❌ | 没有跨进程锁；多进程各写各的行 |
+| 跨进程互斥（同一 jti 只用一次那种语义） | ❌ | 那类语义由 SQLite 承担（confirmation / lease） |
+
+也就是说：**多进程部署下这里保证的是「不撕裂」，不是「串行化」**。
+事件流里不要假设「先写的一定排在前面」——需要跨进程全序时，正解是换
+SQLite 的 `events` 表（见 README 的 V4 Storage Refactor），
+而不是继续在这个文件格式上加锁。
 """
 from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import uuid
 from dataclasses import dataclass, field
@@ -114,6 +132,33 @@ class Event:
         }
 
 
+def _encode(event: Event) -> bytes:
+    """一行 JSONL（含换行），**一次编码完**。
+
+    先编码再写，是为了让「写」这一步只有一次 `os.write`——见 `_append_line`。
+    """
+    return (json.dumps(event.to_dict(), ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def _fsync_dir_best_effort(directory: Path) -> None:
+    """把目录项本身刷盘，失败就算了。
+
+    与 `JsonStore._fsync_directory` 同义，但**刻意不复用**：两者的失败策略不同。
+    那边任何时候都吞异常（降级是可接受的），这里只在「新建了日志文件」这一种情形
+    下调用——文件内容已经由 `os.fsync(fd)` 兜住，目录项丢失只影响「名字可见性」。
+    """
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
 class EventLog:
     """追加式事件日志，每个任务一个 `.jsonl` 文件。"""
 
@@ -144,11 +189,11 @@ class EventLog:
 
         event = Event(task_id=task_id, kind=kind, data=data)
         try:
-            path = self._root / f"{task_id}.jsonl"
             with self._lock:
-                path.parent.mkdir(parents=True, exist_ok=True)
-                with path.open("a", encoding="utf-8") as handle:
-                    handle.write(json.dumps(event.to_dict(), ensure_ascii=False) + "\n")
+                # durable=False：普通事件是**旁路**。它是审计的补充，不是副作用的
+                # 前置条件，所以不为它付 fsync 的代价（那会把热路径拖慢，
+                # 而且没有任何东西会因为这条事件没落盘而变危险）。
+                self._append_line(task_id, _encode(event), durable=False)
         except Exception as exc:  # noqa: BLE001 - 普通事件是旁路，不能成为故障源
             logger.warning("写事件日志失败（任务 %s / %s）：%s", task_id, kind, exc)
         return event
@@ -165,19 +210,57 @@ class EventLog:
         丢失，审计链就断了——「手机转账了但没记录」不可接受。所以这里写失败要
         **抛出去**，由调用方（runtime）把任务降级、副作用不继续。
 
+        V3.3 §一：`durable` 的含义也是在这里被写实的。以前这里只做到「`write` 返回」，
+        而 `write` 返回只代表「进了内核 page cache」——「手机已经点了付款 + 进程认为
+        事件已记录 + 掉电」这三件事叠起来，日志可能根本不在盘上。现在这条路是
+        `单次 write → fsync → 返回`，`fsync` 失败即抛（不 durable 就不放行）。
+
         注意：普通事件仍走 `emit`（fail-open），只有明确的安全关键事件才走这里。
         分级而不是一刀切，避免「审计日志抖动就把所有任务都降级」。
         """
         event = Event(task_id=task_id, kind=kind, data=data)
-        path = self._root / f"{task_id}.jsonl"
         try:
             with self._lock:
-                path.parent.mkdir(parents=True, exist_ok=True)
-                with path.open("a", encoding="utf-8") as handle:
-                    handle.write(json.dumps(event.to_dict(), ensure_ascii=False) + "\n")
+                self._append_line(task_id, _encode(event), durable=True)
         except Exception as exc:  # noqa: BLE001 - 转换后重新抛出
             raise PersistenceError(task_id, f"安全关键事件 {kind} 写盘失败：{exc}") from exc
         return event
+
+    # ---- 写入原语 ----
+
+    def _append_line(self, task_id: str, payload: bytes, *, durable: bool) -> None:
+        """把一行追加进 `<task_id>.jsonl`。
+
+        为什么不用 `path.open("a")` 那套文本层写法：`write` 返回只说明「进了用户态
+        缓冲」，离「持久」还差两层（Python 缓冲 + 内核 page cache）；而且文本层无法
+        保证跨进程时一次 append 不被切开。这里改成：
+
+            os.open(O_APPEND | O_CREAT | O_WRONLY) → 单次 os.write → （可选）os.fsync
+
+        - `O_APPEND` + **单次** `write`：内核把「定位到文件尾」与「写入」做成一次原子
+          操作，所以多进程同时追加时行与行不会交错（一行远小于一次 write 的原子粒度）。
+          它给的是**不撕裂**，不是**串行化**——跨进程的先后顺序仍不做承诺，
+          详见模块 docstring 的一致性模型表。
+        - `durable=True`：再 `fsync`，把内核页缓存压到盘上。
+        - `fsync` 失败**必须抛**：它意味着这次写入不 durable，而安全关键事件的契约
+          就是「不 durable 就不放行」。这与 `JsonStore` 那边「fsync 失败就降级为
+          升级前行为」是**相反**的取舍，因为状态写入迟早会再发生一次，
+          而「已发生的副作用」没有第二次机会。
+        """
+        path = self._root / f"{task_id}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        existed = path.exists()
+        fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o644)
+        try:
+            os.write(fd, payload)
+            if durable:
+                os.fsync(fd)
+        finally:
+            os.close(fd)
+        if durable and not existed:
+            # 新建文件时目录项也值得刷一次（掉电可能「内容在、名字没了」）。
+            # 文件本来就存在时目录项早已稳定，跳过。
+            _fsync_dir_best_effort(path.parent)
 
     def read(self, task_id: str, limit: int = 200) -> list[Event]:
         """按时间顺序读取最近的事件。"""

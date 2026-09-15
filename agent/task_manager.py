@@ -90,6 +90,17 @@ class TaskManager:
         # 但它**不是万能的**：Runtime 与 Scheduler 拿着同一批 Task 实例，却不经过这把锁，
         # 所以互斥只在本模块内部成立。真正的兜底是 TaskStore 的 revision CAS
         # （见 `_rewrite`）——锁只是把窗口缩到可忽略。
+        #
+        # V3.3 §五 复核了这个边界，结论是**保持现状 + 写下出口路径**：
+        # 审核指出「TaskManager 的 CAS」与「Runtime 直接改同一批对象」是两套并发模型，
+        # 高并发注入时会看到较多 CAS conflict（安全，但业务操作会被放弃重试）。
+        # 真正的修法不是再加锁，而是把 Task 变成 **single-writer state machine**：
+        # 所有 mutation 进事件队列 → 唯一写者（Task Actor / Scheduler）落地。
+        # 触发条件（到了就必须做）：
+        #   ① 一台设备同时收到多路注入（用户输入 + 系统通知 + Agent 自己 re-plan）成为常态，
+        #      且 "CAS conflict 后放弃重试" 在日志里成规模出现；
+        #   ② 需要跨进程写同一个 Task（那已经包含在 V4 Storage Refactor 里）。
+        # 与 V4 一起做最省事：那时事务边界由数据库给，写入队列可以落在同一张表上。
         self._mutation_lock = threading.RLock()
 
     # ---- 创建与查询 ----
@@ -124,23 +135,50 @@ class TaskManager:
         return task
 
     def get(self, task_id: str) -> Task | None:
-        # 调度器内存里有更实时的状态（队列/暂停区），持久化层是兜底
+        """取任务对象：**调度器内存优先**，磁盘兜底。
+
+        注意它**不保证是最新的事实**：多进程部署时另一个 worker 可能已经把任务推进到
+        DONE 并落盘，而本进程内存里那份还停在 RUNNING。要「最新事实」用 `freshest()`
+        （V3.3 §四）。
+        保持「内存优先」是因为调用方常常要的就是**本进程正在操作的那个对象**
+        （Runtime 直接就地改它），换成磁盘副本会把修改丢掉。
+        """
         task = self._scheduler.get(task_id)
         if task is not None:
             return task
         return self._store.load(task_id)
 
-    def list_all(self) -> list[Task]:
-        """列出全部任务，**live 状态优先**（V2.5 §五）。
+    def freshest(self, task_id: str) -> Task | None:
+        """取这个任务**最新的事实**：内存与磁盘两份里 `revision` 较大的那份。
 
-        磁盘只是兜底，调度器内存才是当前进程的实时真相：任务刚被判 RUNNING 但还没
-        落盘时，只读磁盘会让 `GET /tasks` 显示 queued，而 `GET /tasks/{id}`（走
-        `get()`，优先内存）显示 running —— 同一时刻两个答案，排查 Agent 时最怕这个。
-        所以这里跟 `get()` 用同一套优先级，并对齐 `revision` 较大的那份。
+        为什么需要它（V3.3 §四）：`/wait` 以前用 `get()` 轮询，于是当
+        「Worker B 已把任务推成 DONE 并落盘」而「Worker A 内存里还是 RUNNING」时，
+        等待者只会看到过期的 RUNNING，一直到 504 超时——明明任务已经完成。
+
+        判据用 `revision`（写入序号，`TaskStore.save` 每次 +1）而不是时间戳：
+        它是单调的，而且两个方向都成立——内存领先磁盘（刚改完还没存，此时 revision
+        相同 → 取内存）、磁盘领先内存（别的进程推进过 → 取磁盘）。
+        平局取内存那份：那是本进程正在使用的对象。
+        """
+        live = self._scheduler.get(task_id)
+        stored = self._store.load(task_id)
+        if live is None or stored is None:
+            return live if stored is None else stored
+        return live if live.revision >= stored.revision else stored
+
+    def list_all(self) -> list[Task]:
+        """列出全部任务，**每一条取 `revision` 较大的那份**（V2.5 §五 / V3.3 §四）。
+
+        为什么不简单地「内存优先」：任务刚被判 RUNNING 但还没落盘时，只读磁盘会让
+        `GET /tasks` 显示 queued，而 `GET /tasks/{id}` 显示 running——同一时刻两个答案，
+        排查 Agent 时最怕这个。反过来，多进程部署时磁盘也可能比本进程内存新。
+        所以两个方向都要处理：按 `revision` 取较新的那份。
         """
         merged: dict[str, Task] = {t.id: t for t in self._scheduler.tracked_tasks()}
         for task in self._store.list_all():
-            merged.setdefault(task.id, task)
+            current = merged.get(task.id)
+            if current is None or task.revision > current.revision:
+                merged[task.id] = task
         return sorted(merged.values(), key=lambda t: t.created_at)
 
     def active_task(self) -> Task | None:

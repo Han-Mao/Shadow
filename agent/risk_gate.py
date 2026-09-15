@@ -209,29 +209,51 @@ class ActionRiskGate:
             text_risk = semantic_for(role).risk
             reasons.append(f"语义角色未知（按保守下限 {text_risk.value} 处理）")
 
-        # 3) 目标证据缺失的下限（V3.1 P1-4）
+        # 3) 目标证据缺失的下限（V3.1 P1-4 · V3.3 §七）
         #
         # 「没有证据」不等于「没有反证」。UI 树读不到 / 解析失败 / 目标匹配不到时，
         # 我们对这次点击其实一无所知——那就不该因为「没抓到危险词、也没抓到目标文本」
         # 而把它留在 SAFE。
         #
-        # 说清楚这一层实际拦住了什么：今天 TAP / LONG_PRESS / TYPE / SWIPE / LAUNCH
-        # 的动作类型下限已经是 CAUTION，所以这条下限**不改动它们现在的等级**，它是
-        # 一条结构性保证——任何将来被标成「类型安全」的会改页面动作（或新增类型忘了
-        # 归类），只要目标解析不出来就会被抬起来，而不会因为「没命中文案」静默放行。
+        # 这里分两档，因为两种情形的**代价**差了一个数量级（V3.3 §七 的盲区）：
         #
-        # 真正让「按钮无文字 + 解析不到节点 → tap(540,1600)」变安全的是另外两件事，
-        # 别把功劳记在这一行上：
+        #   - 普通应用：抬到 CAUTION。不动它现在的等级，但审计里必须看得出「这是盲点」，
+        #     而且它不能再被当成「命中文案之外的 SAFE」静默放行。
+        #   - **敏感应用**（支付/银行/证券…）：直接抬到 DANGEROUS → 转人工。
+        #     审核给的例子正是最坏那个：「付款 App + 目标找不到 + TAP」——
+        #     我们不知道该点在哪、也不知道那底下是什么按钮，而这一下可能就是付款。
+        #     这种不确定性在支付页上不该由系统自己承担。
+        #
+        # 为什么不在所有应用上转人工：那会让门禁变成噪声（每次「按钮没文字/树读不到」
+        # 都要问人），然后被人绕过——V3.1 P0-3 的教训。敏感应用是「代价不对称」的那一侧，
+        # 所以只在那一侧取最保守的判断。
+        evidence_risk = ActionRisk.SAFE
+        if action.is_mutating and resolved.resolution.is_evidence_gap:
+            if _is_sensitive_package(context):
+                evidence_risk = ActionRisk.DANGEROUS
+                reasons.append(
+                    f"敏感应用（{context.package if context else ''}）里目标解析失败"
+                    f"（{resolved.resolution.value}）：点在哪、点的是什么都不知道，"
+                    "不能自动执行"
+                )
+            else:
+                evidence_risk = ActionRisk.CAUTION
+                reasons.append(
+                    f"目标解析失败（{resolved.resolution.value}）："
+                    f"{_TARGET_GAP_HINTS[resolved.resolution]}，按最坏情况对待"
+                )
+
+        # 说清楚这两档实际拦住了什么，别把功劳记错地方：
+        # TAP / LONG_PRESS / TYPE / SWIPE / LAUNCH 的动作类型下限本来就是 CAUTION，
+        # 所以对它们来说上面只是**不改动现状**（敏感应用那一档是新增的真拦截）。
+        # 它的结构性价值在于：任何将来被标成「类型安全」的会改页面动作（或新增类型
+        # 忘了归类），只要目标解析不出来就会被抬起来，而不会因为「没命中文案」静默放行。
+        #
+        # 另外两件让「按钮无文字 + 解析不到节点 → tap(540,1600)」不再危险的事，
+        # 与这一行无关：
         #   - `models.semantic` 的 UNKNOWN 已改成 CAUTION + 非幂等（V3.1 P0-3）；
         #   - `Action.side_effect()` 对 TAP/LONG_PRESS/TYPE 的类型兜底已改成非幂等，
         #     所以 EFFECT_UNKNOWN 之后**不会自动再点一次**，而是走对账 / 人工。
-        evidence_risk = ActionRisk.SAFE
-        if action.is_mutating and resolved.resolution.is_evidence_gap:
-            evidence_risk = ActionRisk.CAUTION
-            reasons.append(
-                f"目标解析失败（{resolved.resolution.value}）："
-                f"{_TARGET_GAP_HINTS[resolved.resolution]}，按最坏情况对待"
-            )
 
         # 4) 页面敏感度下限：支付/银行类 App 里会改页面的动作至少 CAUTION
         page_risk = ActionRisk.SAFE

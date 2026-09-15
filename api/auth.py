@@ -31,6 +31,12 @@ import threading
 import time
 from dataclasses import dataclass, field
 
+# 预占 TTL 的**唯一来源**是生产实现（SQLite 那个），这里 import 的是同一个常量：
+# 内存守卫只在没有存储层的场景（纯函数单测、嵌入式）用，但它的过期策略必须与生产
+# 一致——否则「测试通过、生产却是另一套语义」是最难发现的那类偏差。
+# （方向是 api → storage 的常量导入，不是反向：storage 不该知道 auth 的存在。）
+from storage.confirmation_store import RESERVE_TTL_SECONDS
+
 logger = logging.getLogger(__name__)
 
 # 进程级随机密钥：没配 API Token 时用它签名确认令牌，
@@ -304,30 +310,73 @@ class InMemoryConsumption:
     也能工作（纯函数单测、嵌入式使用），而且它把「一次性」这条语义在
     进程内表达完整了。生产部署必须在启动时 `configure_consumption()` 换成
     SQLite 实现——`api/server.py` 已经这么做了。
+
+    V3.3 §六 起它也要实现两阶段（`reserve` / `commit` / `release`），
+    与 `storage.confirmation_store.ConfirmationConsumptionStore` 保持同一套接口——
+    否则「生产用 SQLite、单测用内存」时，被测试的根本不是生产的那条路径。
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._used: dict[str, float] = {}
+        # 预占中的票据：jti → 预占时刻（超过 RESERVE_TTL_SECONDS 视为「崩溃残留」）
+        self._reserved: dict[str, float] = {}
 
     def consume(self, jti: str, *, expires_at: float = 0.0, **_evidence) -> bool:
         current = time.time()
         with self._lock:
-            # 顺手清掉过期条目，避免这个集合无限增长
-            for used_jti in [k for k, exp in self._used.items() if exp < current]:
-                self._used.pop(used_jti, None)
-            if jti in self._used:
+            self._drop_expired(current)
+            if jti in self._used or jti in self._reserved:
                 return False
             self._used[jti] = expires_at
             return True
+
+    def reserve(self, jti: str, *, expires_at: float = 0.0, now: float | None = None, **_evidence) -> bool:
+        """预占（还没消费）。已被消费 / 已被别人预占 → False。"""
+        current = time.time() if now is None else now
+        with self._lock:
+            self._drop_expired(current)
+            if jti in self._used or jti in self._reserved:
+                return False
+            self._reserved[jti] = current
+            return True
+
+    def commit(
+        self, jti: str, *, expires_at: float | None = None, now: float | None = None, **_evidence
+    ) -> bool:
+        """把预占转成已消费。没有预占 → False。"""
+        current = time.time() if now is None else now
+        with self._lock:
+            if jti not in self._reserved:
+                return False
+            self._reserved.pop(jti, None)
+            self._used[jti] = expires_at if expires_at else current + CONFIRM_TTL_SECONDS
+            return True
+
+    def release(self, jti: str) -> bool:
+        """退回预占（已消费的退不掉）。"""
+        with self._lock:
+            return self._reserved.pop(jti, None) is not None
 
     def is_consumed(self, jti: str) -> bool:
         with self._lock:
             return jti in self._used
 
+    def is_reserved(self, jti: str) -> bool:
+        with self._lock:
+            return jti in self._reserved
+
+    def _drop_expired(self, current: float) -> None:
+        """清掉过期的已消费记录与**过期的预占**（后者是崩溃残留）。"""
+        for used_jti in [k for k, exp in self._used.items() if exp < current]:
+            self._used.pop(used_jti, None)
+        for jti in [k for k, at in self._reserved.items() if at + RESERVE_TTL_SECONDS < current]:
+            self._reserved.pop(jti, None)
+
     def clear(self) -> None:
         with self._lock:
             self._used.clear()
+            self._reserved.clear()
 
 
 _consumption: object = InMemoryConsumption()
@@ -336,9 +385,18 @@ _consumption: object = InMemoryConsumption()
 def configure_consumption(guard) -> None:
     """换掉消费记录的后端（V3.2 §二）。
 
-    接受任何实现 `consume(jti, *, expires_at, **evidence) -> bool` /
-    `is_consumed(jti)` / `clear()` 的对象——`storage.confirmation_store.
-    ConfirmationConsumptionStore` 就是生产用的那个。
+    接受任何实现下面这套接口的对象——`storage.confirmation_store.
+    ConfirmationConsumptionStore` 就是生产用的那个：
+
+        consume(jti, *, expires_at, **evidence) -> bool     # 一步式：校验即作废
+        reserve(jti, *, expires_at, now=None, **evidence) -> bool   # 预占（V3.3 §六）
+        commit(jti, *, expires_at=None) -> bool             # 预占 → 已消费
+        release(jti) -> bool                                # 退回预占
+        is_consumed(jti) / clear()
+
+    `reserve` / `commit` / `release` 三个是 V3.3 §六 加的：让「改业务状态」失败时
+    票据能被退回，而不是烧掉。实现方必须保证**预占也是原子的**（唯一约束），
+    否则两个并发请求会同时占上同一张票据。
     """
     global _consumption
     _consumption = guard
@@ -493,6 +551,67 @@ def consume_confirmation_token(
     if not consumed:
         return False, "确认令牌已被使用过（确认是一次性审批，请重新读取待确认事项）"
     return True, ""
+
+
+def reserve_confirmation_token(
+    token: str | None,
+    principal: str,
+    task_id: str,
+    action_fingerprint: str,
+    task_version: int,
+    *,
+    now: float | None = None,
+) -> tuple[bool, str, str]:
+    """校验并**预占**令牌（V3.3 §六）。返回 `(是否占上, 原因, jti)`。
+
+    与 `consume_confirmation_token` 的差别在于**作废的时机**：这里只是先把这个
+    `jti` 占住，还没有烧掉它；等业务状态真的改成功之后再
+    `commit_confirmation_token(jti)`。于是「票据已作废、业务却没做成」那个窗口
+    消失了（审核 §六 原话：那虽然不是安全漏洞、是 fail-safe，但用户得重新申请票据）。
+
+    预占与消费一样是**原子**的（`jti` 唯一约束），所以两个并发请求不可能同时占上
+    同一张票据；`commit` 之后任何预占都会失败。
+    """
+    ok, reason, jti = _verify_and_parse(
+        token, principal, task_id, action_fingerprint, task_version, now=now
+    )
+    if not ok:
+        return False, reason, ""
+
+    current = time.time() if now is None else now
+    try:
+        expires_at = int(str(token).strip().partition(".")[0])
+    except ValueError:  # pragma: no cover - _verify_and_parse 已挡住
+        expires_at = int(current)
+    reserved = _consumption.reserve(
+        jti,
+        task_id=task_id,
+        principal=principal,
+        fingerprint=action_fingerprint,
+        expires_at=expires_at,
+        now=current,
+    )
+    if not reserved:
+        return False, "确认令牌已被使用过（确认是一次性审批，请重新读取待确认事项）", ""
+    return True, "", jti
+
+
+def commit_confirmation_token(jti: str, *, expires_at: float | None = None) -> bool:
+    """把预占转成**已消费**——`POST /confirm` 在业务状态改成功之后必须调它。
+
+    顺序很要紧：**先改状态、后提交票据**。反过来就是 V3.2 的老行为（票据先作废），
+    遇到并发冲突时用户会看到 409 而且票据已经没了。
+    """
+    if not jti:
+        return False
+    return bool(_consumption.commit(jti, expires_at=expires_at))
+
+
+def release_confirmation_token(jti: str) -> bool:
+    """退回预占（业务没做成时调用）。**已消费的票据退不掉**——过滤在守卫那一层。"""
+    if not jti:
+        return False
+    return bool(_consumption.release(jti))
 
 
 def clear_consumed_confirmations() -> None:
