@@ -47,6 +47,18 @@ class Checkpoint(BaseModel):
     activity: str = ""
     ui_snapshot: str | None = None
 
+    # 关于「环境状态」（电池 / 网络）的**有理由延期**（v4.4 §2 P1）：
+    #
+    # 审核建议恢复点带上 `device_state{battery, network, foreground_app, login_state}`。
+    # 其中 `foreground_app` 已经被 `package`/`activity` + `same_screen_as()` 覆盖——
+    # 那正是「恢复时判断当前是不是微信聊天页」用的东西。还缺的电池/网络要
+    # `DeviceController` 新增接口，横跨 ADB + Android + 桥 + 静态契约测试四方，
+    # 而收益只是「恢复时多一条环境信息」。
+    #
+    # 触发条件：真机任务频繁因「低电量 / 网络切换」而非「页面不对」失败时，
+    # 再给 `DeviceController` 加 `battery_level()` / `network_type()` 并在
+    # `Checkpoint.capture` 里落一条 `device_state`。在那之前不加——空接口是负债。
+
     history_tail: list[Observation] = Field(default_factory=list)
 
     # 上次动作的执行效果判定（V2.1 §五）。DISPATCHED 时进程崩溃 → 恢复即 EFFECT_UNKNOWN，
