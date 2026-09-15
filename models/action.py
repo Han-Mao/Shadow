@@ -434,5 +434,15 @@ class Decision(BaseModel):
     step_done: bool = False
     thought: str = ""
 
+    # 产出这次决策的 prompt 版本（v4.5 §七 P1）。
+    #
+    # Agent 项目最常见的一种「莫名变差」不是模型变差，是 **prompt 漂移**——改了
+    # prompt 却没有记录，事后没法回答「这个结果是用哪个版本产出的」。这里由
+    # `vision.vlm` 在解析决策时填上（`decide` / `replan` 各自带版本），随
+    # `ACTION_DISPATCHED` 事件落进事件流，复现时能一路追到「哪个 prompt 版本 + 哪次
+    # 决策」。它**不参与任何判定**——纯粹是可追溯性，所以放进 `Decision` 而不是
+    # 塞进 `Action`（`Action` 是事实记录，不该承载「谁写的 prompt」这种来源信息）。
+    prompt_version: str = ""
+
     def describe(self) -> str:
         return f"{self.action.type.value}({self.action.target}) step_done={self.step_done}"

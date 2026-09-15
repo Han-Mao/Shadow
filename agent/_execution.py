@@ -416,7 +416,7 @@ class ExecutionMixin:
                     task, state, f"执行记录无法落盘，停止副作用：{exc.reason}"
                 )
 
-            failure = self._record_dispatch(task, state, execution, action, assessment)
+            failure = self._record_dispatch(task, state, execution, action, assessment, decision)
             if failure is not None:
                 return self._degrade(task, state, f"安全事件写盘失败，停止副作用：{failure}")
             result = self._execute(task, action, observation, session)
@@ -794,6 +794,7 @@ class ExecutionMixin:
         execution,
         action: Action,
         assessment,
+        decision=None,
     ) -> str | None:
         """记录派发意图（fail-closed），返回失败原因（`None` = 成功落盘）。
 
@@ -812,6 +813,10 @@ class ExecutionMixin:
             value=action.value,
             reason=action.reason,
         )
+        # prompt 版本（v4.5 §七 P1）：哪个版本的决策/Re-plan prompt 产出了这次动作。
+        # 复现「这个结果是怎么来的」时，它和事件流里的其它字段一起构成完整证据链。
+        if decision is not None and getattr(decision, "prompt_version", ""):
+            detail["prompt_version"] = decision.prompt_version
         if execution is None:
             return self._emit_critical_or(task.id, ACTION_DISPATCHED, **detail)
 

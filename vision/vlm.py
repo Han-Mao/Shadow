@@ -28,6 +28,31 @@ RETRYABLE_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 # 图片精度：坐标决策必须 high；计划与验证只需判断页面语义，low 足够，能省下大量 token 与延迟
 _DEFAULT_IMAGE_DETAIL = {"plan": "low", "decide": "high", "verify": "low"}
 
+# ---- Prompt 版本（v4.5 §七 P1）----
+#
+# Agent 项目最常见的一种「莫名变差」不是模型变差，是 **prompt 漂移**——改了 prompt
+# 没有记录，事后没法回答「这个结果是用哪个版本产出的」。所以每个会产出决策/结论的
+# prompt 都挂一个版本号，随结果写进事件流。**改 prompt 语义时 +1**（纯措辞微调、
+# 不改变产出含义的可以不动），这样复现一条异常轨迹时能一路追到「哪个 prompt 版本」。
+#
+# 版本号进 `Decision.prompt_version`（decide / replan），随 `ACTION_DISPATCHED` 落库；
+# plan / verify 的版本号也在这里声明，等它们的结果有对应落点再接（见各函数的 TODO 注释）。
+PROMPT_VERSION_PLAN = "plan_v3"
+"""计划 prompt（含任务级三要素 goal/constraints/success_condition，v4.3 §1）。"""
+
+PROMPT_VERSION_DECIDE = "decide_v4"
+"""单步决策 prompt（含计划上下文与目标证据，v4.3 §1）。"""
+
+PROMPT_VERSION_REPLAN = "replan_v1"
+"""结构化 Re-plan prompt。"""
+
+PROMPT_VERSION_VERIFY = "verify_v1"
+"""验证 prompt（三层：dispatch / effect / goal）。"""
+
+PROMPT_VERSION_RELATION = "relation_v1"
+"""任务关系判定 prompt。"""
+
+
 
 def _image_detail(stage: str) -> str:
     """按阶段取图片精度，可用 VLM_DETAIL_PLAN / VLM_DETAIL_DECIDE / VLM_DETAIL_VERIFY 覆盖。"""
@@ -414,7 +439,7 @@ def decide_next_action(
     except (VlmError, json.JSONDecodeError) as exc:
         raise VlmParseError(f"无法解析 VLM 响应: {exc}") from exc
 
-    return _parse_decision(data)
+    return _parse_decision(data, prompt_version=PROMPT_VERSION_DECIDE)
 
 
 def replan_action(
@@ -447,7 +472,7 @@ def replan_action(
     except (VlmError, json.JSONDecodeError) as exc:
         raise VlmParseError(f"无法解析 Re-plan 响应: {exc}") from exc
 
-    return _parse_decision(data)
+    return _parse_decision(data, prompt_version=PROMPT_VERSION_REPLAN)
 
 
 def _parse_action(data: dict[str, Any]) -> Action:
@@ -503,13 +528,14 @@ def _parse_goal_evidence(raw: Any) -> dict[str, str]:
     }
 
 
-def _parse_decision(data: dict[str, Any]) -> Decision:
-    """把 VLM 的 JSON 解析成 Decision（动作 + 当前步骤是否达成）。"""
+def _parse_decision(data: dict[str, Any], *, prompt_version: str = "") -> Decision:
+    """把 VLM 的 JSON 解析成 Decision（动作 + 当前步骤是否达成 + prompt 版本）。"""
     action = _parse_action(data)
     return Decision(
         action=action,
         step_done=bool(data.get("step_done")),
         thought=str(data.get("thought") or action.reason or ""),
+        prompt_version=prompt_version,
     )
 
 
