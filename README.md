@@ -104,7 +104,7 @@ V3.3 起 `Vision / Device` 这一层的左边是 `DeviceController` **协议**�
 ├── scripts/
 │   ├── demo_preemption.py  # 抢占恢复演示（离线可跑）
 │   └── replay_task.py      # 命令行回放一个任务的事件流
-└── tests/                  # 669 个离线用例
+└── tests/                  # 672 个离线用例
 ```
 
 ## 职责边界
@@ -1443,8 +1443,8 @@ commit(jti)        # 成功才把票据永久作废；业务失败（返回 None
 | Commit 2 `refactor: unify task/checkpoint/event storage` | 任务、恢复点、事件、票据在**同一个 `shadow.db`**，旧的 `*.json` / `*.jsonl` 一次性导入 | ✅ |
 | Commit 3 `fix: transactional confirmation` | `/confirm` 的「预占票据 → 改 Task 状态 → 写事件 → 作废票据」在**一个事务**里 | ✅（见「五」的内存边界） |
 | Commit 7 `chore: lock dependencies` | `pyproject.toml` / `requirements.txt` 钉死版本、`requirements-dev.txt`、`uv.lock`（29 包） | ✅ |
-| Commit 8 `test: crash/concurrency regression suite` | 并发确认、并发手工动作、设备忙落定、旧库导入、序号唯一、事务回滚…… | ◑ 崩溃恢复那几条上一轮已在 |
-| Commit 5 `refactor: single-writer task mutation` | 出口路径与触发条件已写在 `agent/task_manager.py` | ⏸ 见「六」 |
+| Commit 8 `test: crash/concurrency regression suite` + **事件驱动 `/wait`** | 并发确认、并发手工动作、设备忙落定、旧库导入、序号唯一、事务回滚、**`wait_terminal` 事件驱动** | ✅（崩溃恢复那几条上一轮已在） |
+| Commit 5 `refactor: single-writer task mutation` | 单进程下已由 `_mutation_lock` + CAS 达成；Task Actor 是触发条件满足时才做的下一步 | ◑ 见「六」 |
 
 ### 一、Commit 1：手工操作有了自己的身份（§1 / §5）
 
@@ -1535,17 +1535,40 @@ CREATE TABLE events (
   管辖——那正是审核 §7「single-writer state machine」要根治的问题（见下）。所以这里的保证
   表述为「磁盘上三样东西要么一起落下、要么一起没有」，而不是「内存也一致」。
 
-### 六、还没做的（按审核的 commit 顺序，附触发条件）
+### 六、Commit 8：事件驱动 `/wait`，以及 Commit 5 的诚实判断
 
-- **Commit 5（single-writer task mutation）**：这是「同一事务」补不上的那一半——内存对象
-  与磁盘的一致性。出口路径与触发条件写在 `agent/task_manager.py` 的 `_mutation_lock` 注释里
-  （多路注入成为常态、CAS conflict 成规模时做）。
-- **Commit 8 的事件驱动 `/wait`**：现在是「按 `revision` 取最新事实 + 轮询」，
-  多 worker 常态时要换成条件变量 / Redis pub-sub。
+**Commit 8（已落地）**：`/wait` 从「每 100ms `time.sleep` 轮询」改成**事件驱动**——
+新增 `scheduler.wait_terminal(task_id, timeout)`，用条件变量阻塞，任务到终态时 worker
+`notify_all` 唤醒等待者，不再空转。
+
+- 终态路径统一成「**先落盘、再通知**」（与 submit / resume / recover 同一条纪律）：
+  等待者被唤醒后查磁盘一定已经是终态，不会空转一轮。
+- 终态任务会从 lane 移出，所以 scheduler 额外留一份终态对象（`_terminal`，限长 200），
+  `wait_terminal` 才能返回「那个已经结束的任务」而不是让调用方再查磁盘。
+- **跨进程仍然兜底**：`_cond` 只能收到本进程通知，别的进程推进的任务靠 `freshest`
+  回查磁盘（每 0.5s 一次）。两条腿：进程内靠事件（省 CPU）、跨进程靠 `freshest`（正确）。
+
+**Commit 5（single-writer）——如实说，没有假装做了重构**：
+
+审核 §7 要的「Command Queue → Task Actor → 唯一写者」是架构演进，不是缺陷。现状已经
+**单进程内是 single-writer**：所有「改任务状态」的入口都经 `_mutation_lock` 串行化，
+落盘走 revision CAS（`_rewrite_authoritative`），冲突回滚内存。还没做的是把
+Runtime/Scheduler 对内存对象的**就地修改**也收进显式写者。
+
+所以这一项**不强行引入 Command Queue**（那会违背审核文档自己说的「不要一次全重写」），
+而是把判断讲透、写死在 `agent/task_manager.py` 的注释里：什么已经是 single-writer、
+什么还不是（内存对象与磁盘的一致性没有兜底——正是 §3 那条「事务回滚不了内存对象」的边界）、
+V4 之后「唯一写者」可以落在**数据库事务**上（地基已铺好）、以及**触发条件**
+（多路注入成常态 + CAS conflict 成规模 / 多 worker 部署成常态）。
+
+### 七、还没做的（附触发条件）
+
+- **Commit 5 的 Task Actor 化**：触发条件见 `agent/task_manager.py` 注释——多路注入成常态、
+  CAS conflict 成规模、或跨进程写同一 Task 成常态时，把 mutation 收口到「数据库事务里的唯一写者」。
 - **Policy Engine（v3.3 §八 的延期项）**：缺的是「App 敏感状态」（现在只有包名静态词表）
   与「风险历史回路」（完全没有），补记在 `models/semantic.py`。
 
-### 七、行为变化提醒
+### 八、行为变化提醒
 
 1. 手工端点（`/tap` `/text` `/back` `/actions`）的响应**新增** `execution_id` / `execution_status`
    （只加字段，不删不改名）。
@@ -1560,7 +1583,7 @@ CREATE TABLE events (
 
 ### 八、验证
 
-`python -m pytest -q` → **669 passed**（上轮 654 → +15，零回归）。
+`python -m pytest -q` → **672 passed**（上轮 669 → +3，零回归）。
 
 | 新增用例 | 覆盖 |
 |---|---|
@@ -1569,6 +1592,7 @@ CREATE TABLE events (
 | `test_api_auth.py`（+6 条） | 执行记录带调用方身份、`/executions` 需鉴权且未知 id 一律 404、**并发确认只有一个成功**、**确认中途失败三者一起回滚**、成功三者一起落下、票据表与 tasks/events 同库 |
 | `test_api_authz.py`（+1 条） | 执行记录也受设备范围约束 |
 | `test_database.py`（9 条） | 持久化 PRAGMA 真的生效、迁移版本可查、事务回滚一切/提交一切、**事务可重入**、共享库、两种旧目录传法、坏行隔离、写失败可见 |
+| `test_scheduler.py`（+3 条） | **`wait_terminal` 事件驱动**：及时返回终态任务、一直跑则超时返回 None、**先落盘再通知**（醒来时磁盘必已终态） |
 | `test_task_store.py` / `test_checkpoint_store.py` / `test_event_log.py` | 旧 JSON/JSONL 迁移保留 revision 与时间戳、坏文件迁移后仍隔离、序号连续、两写者不丢不重、重启可读 |
 
 ---
@@ -1702,7 +1726,7 @@ pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 
-**669 个用例，全部离线**：不需要 adb、模拟器或 API Key。
+**672 个用例，全部离线**：不需要 adb、模拟器或 API Key。
 
 | 文件 | 覆盖 |
 |---|---|

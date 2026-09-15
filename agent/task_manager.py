@@ -91,16 +91,32 @@ class TaskManager:
         # 所以互斥只在本模块内部成立。真正的兜底是 TaskStore 的 revision CAS
         # （见 `_rewrite`）——锁只是把窗口缩到可忽略。
         #
-        # V3.3 §五 复核了这个边界，结论是**保持现状 + 写下出口路径**：
-        # 审核指出「TaskManager 的 CAS」与「Runtime 直接改同一批对象」是两套并发模型，
-        # 高并发注入时会看到较多 CAS conflict（安全，但业务操作会被放弃重试）。
-        # 真正的修法不是再加锁，而是把 Task 变成 **single-writer state machine**：
-        # 所有 mutation 进事件队列 → 唯一写者（Task Actor / Scheduler）落地。
-        # 触发条件（到了就必须做）：
-        #   ① 一台设备同时收到多路注入（用户输入 + 系统通知 + Agent 自己 re-plan）成为常态，
+        # ---- V4 §5（single-writer）复核，2026-09 ----
+        #
+        # 审核要的「single-writer state machine / Task Actor / Command Queue」，
+        # 与现状的关系要如实说清，不能假装已经做了架构重构：
+        #
+        #   【已经是的】所有「改任务状态」的入口都经这一把锁串行化，落盘走 revision CAS
+        #     （`_rewrite_authoritative` 是唯一带 CAS 的改写路径，`_store.save` 无 CAS 时
+        #     也在事务里「读最新 revision + 1」再写）。这在**单进程**下就是 single-writer：
+        #     任意时刻只有一个线程在改一个任务，冲突由 CAS 兜底并回滚内存。
+        #
+        #   【还不是的】审核画的「Command Queue → Task Actor → 唯一写者」是把**所有**
+        #     mutation（包括 Runtime 对同一批对象的就地修改）收进一个事件队列、由唯一
+        #     写者落地。现状下 Runtime/Scheduler 仍然直接改内存对象，锁只护 TaskManager
+        #     自己的入口。所以「内存对象与磁盘的一致性」在数据库事务之外**没有**兜底——
+        #     这正是 V4 §3 落的那条「事务回滚不了内存对象」的边界（见 README）。
+        #
+        #   【V4 之后的新事实】`Database.transaction()` 可重入、`tasks` 表已在库里，
+        #     所以「唯一写者」未来可以落在**数据库事务**上（写入队列落同一张表），
+        #     而不必再引入进程内的事件队列 + Actor。这就是 V3.3 §五 当时写的
+        #     「与 V4 一起做最省事」——地基已经在 V4 铺好了。
+        #
+        # 触发条件（到了就必须把 single-writer 从「锁」升级成「显式写者」）：
+        #   ① 一台设备同时收到多路注入（用户 + 系统通知 + Agent re-plan）成为常态，
         #      且 "CAS conflict 后放弃重试" 在日志里成规模出现；
-        #   ② 需要跨进程写同一个 Task（那已经包含在 V4 Storage Refactor 里）。
-        # 与 V4 一起做最省事：那时事务边界由数据库给，写入队列可以落在同一张表上。
+        #   ② 需要跨进程写同一个 Task（多 worker 部署成常态）。
+        # 届时的方向：mutation 收口到「数据库事务里的唯一写者」，而不是再加锁。
         self._mutation_lock = threading.RLock()
 
     # ---- 创建与查询 ----
