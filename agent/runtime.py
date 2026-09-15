@@ -274,8 +274,21 @@ class AgentRuntime(
         )
         self._checkpoints.save(checkpoint)
         task.checkpoint_id = checkpoint.id
-        # V2.3：checkpoint 与 task pointer 必须一次提交。只写 checkpoint 不写 task
-        # 会在崩溃后产生「checkpoint 存在但 task 不知道它」的孤儿恢复点。
+        # V2.3 这里写的是「checkpoint 与 task pointer 必须一次提交」——**那句话说过头了**。
+        # 这是两个文件、两次写入，没有跨文件事务（V3.2 §三）。准确的说法是下面两条，
+        # 它们才是真正成立的：
+        #
+        #   ① **顺序**：先写 checkpoint、后写 task。所以任务**永远**不会指向一个
+        #      不存在或没写完的恢复点——这是崩溃恢复最怕的那个方向。
+        #   ② **单文件原子可见**：`JsonStore` 走 tmp + fsync + os.replace，任何一刻
+        #      读到的新名字下面，内容都已经完整落盘。
+        #
+        # 代价是反方向仍然存在：进程在第 ③ 步之前崩溃 → 恢复点文件在盘上、任务指针
+        # 没被提交 → 留下一个**孤儿恢复点**。它是无害的（没有任何代码路径会读
+        # 「非指针指向的恢复点」），由启动时的 `CheckpointStore.prune_orphans()` 清掉。
+        #
+        # 要真正的跨文件事务就得上 SQLite（`BEGIN; INSERT checkpoint; UPDATE task; COMMIT;`）
+        # ——依赖的是同一个触发条件：多进程部署或整体换存储（见 MEMORY [59]）。
         self._persist(task)
         self._emit(
             task.id,

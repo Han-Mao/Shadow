@@ -10,6 +10,28 @@ from typing import Any, Callable
 from models.exceptions import CorruptDataError
 
 
+def _fsync_directory(directory: Path) -> None:
+    """把目录项本身刷盘（rename 的持久化落在目录上，V3.2 §三）。
+
+    POSIX 上要单独打开目录 fsync；Windows 不允许打开目录，会抛 `PermissionError`
+    ——那边的原子替换语义由 NTFS 日志保证，我们能做到的只有文件内容的 fsync。
+
+    **刻意吞掉异常**：fsync 失败意味着底层不支持或权限不足，此时应当降级为
+    「与升级前一致」，而不是让每一次状态写入都失败。持久化的强度可以差一点，
+    但「写不进去就整个任务跑不了」是不可接受的。
+    """
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
 class JsonStore:
     """把每个实体存成 `<root>/<key>.json`。
 
@@ -70,8 +92,20 @@ class JsonStore:
         path = self._path(key)
         text = json.dumps(payload, ensure_ascii=False, indent=2, default=str)
         tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(text, encoding="utf-8")
+        # V3.2 §三：先 fsync 临时文件、再 rename、再 fsync 目录。
+        #
+        # 只 rename 不 fsync 的话，「进程被杀」是安全的——页缓存还在，内容一致。
+        # 但「机器掉电」不安全：目录项的新指向可能先落盘、文件内容后落盘，
+        # 重启后看到的就是一个新名字下面挂着的空文件 / 半截文件。
+        #
+        # 这一条对 Task ↔ Checkpoint 这对组合尤其要紧（见 runtime._save_checkpoint
+        # 的说明）：它的一致性完全建立在「新名字出现时内容一定已经落盘」上。
+        with tmp.open("w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(tmp, path)
+        _fsync_directory(path.parent)
 
     def keys(self) -> list[str]:
         with self._lock:

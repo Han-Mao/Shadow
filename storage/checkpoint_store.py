@@ -126,3 +126,37 @@ class CheckpointStore:
         prefix = f"{task_id}__"
         for key in [k for k in self._store.keys() if k.startswith(prefix)]:
             self._store.delete(key)
+
+    def prune_orphans(self, committed: dict[str, str]) -> int:
+        """删掉没被任何任务**提交过**的恢复点，返回删除条数（V3.2 §三）。
+
+        `committed` 是 `{task_id: checkpoint_id}`，即每个任务指针里真正记着的那个。
+
+        为什么会有孤儿：`runtime._save_checkpoint` 是三步——① 写 checkpoint、
+        ② 改内存里的指针、③ 落盘任务。进程在 ③ 之前崩溃，文件已经在盘上、指针却
+        没被提交。它不是「数据不一致」（任务不会指向一个不存在/不完整的恢复点，
+        原因见那里的说明），而是**没人认领的文件**：恢复流程不会用它，却会让
+        `GET /tasks/{id}/checkpoint` 显示一个任务从未提交过的恢复点。
+
+        哪些情况会被删：孤儿的崩溃残留，以及**被新恢复点取代的旧恢复点**。
+        为什么旧恢复点也可以删——今天没有任何代码路径会读「非指针指向的恢复点」：
+        `load()` 只用指针里的 id，`latest_for_task()` 只被 `GET /tasks/{id}/checkpoint`
+        与演示脚本用到，而它们要的本来就是「任务提交过的那个」。
+
+        **如果将来实现「回滚到更早的恢复点」，这个扫描必须改成按引用计数**，
+        否则会把回滚目标删掉。这句话就是那条改动的触发条件。
+
+        调用时机：启动恢复时、worker 起来之前扫一次即可（`Scheduler.recover()`）。
+        运行期不需要——运行期产生的孤儿只有崩溃才会留下。
+        """
+        keep = {
+            self._key(task_id, checkpoint_id)
+            for task_id, checkpoint_id in committed.items()
+            if checkpoint_id
+        }
+        orphans = [key for key in self._store.keys() if key not in keep]
+        for key in orphans:
+            self._store.delete(key)
+        if orphans:
+            logger.info("清理 %d 个未被任何任务提交的恢复点", len(orphans))
+        return len(orphans)

@@ -1021,6 +1021,101 @@ executor ASCII 输入仍走 input text），零回归。
 
 ---
 
+## V3.2 修复轮（依据 `v3.2审查建议.md`）
+
+这份文档有 **8 个审查项**（P0×2、P1×4、P2×2）。逐条核对 HEAD 后：**7 项成立并已修**、
+**1 项已被 V3.1 覆盖**。其中一项（Scheduler 多阶段提交）审核自己也说明「重点不是代码错了」
+——它是**表述**问题，所以本轮的处理是「把话说准」，见下面「如实说明」。
+
+### 一、本轮改动（按审核给的优先级排序）
+
+| 审查项 | 现状核对（HEAD 上的事实） | 改动 | 落点 |
+|---|---|---|---|
+| **1（P0）** `/tap`、`/text`、`/back` 直接绕过 RiskGate | **成立**。`/actions` 做了两轮风险判定，但这三个端点的链路是「鉴权 → 设备权限 → Device Lock → `device.tap()`」——**没有 `ActionRiskGate`**。`POST /tap {"x":680,"y":1200}` 能点掉「立即付款」，既不判风险、也不进 HITL、设备侧还留不下审计 | 四个手工端点收口到**同一个执行内核** `run_manual_action()`：两轮门禁（第二轮带 UI 树）→ 危险动作 403 → 执行 → 验证 → **设备侧事件留痕**。`/tap`、`/text`、`/back` 现在会先观察一次，所以「点击红色按钮」其实是「立即购买」也拦得住 | `api/server.py` |
+| **2（P0）** Confirmation Token 的「一次性」只存在内存 | **成立**。`_consumed_confirmations` 是进程内 dict，而签名密钥在配置 `SHADOW_API_TOKEN` 时是**稳定**的 → 重启后一张仍在 TTL 内、签名有效的旧票据**重新可用**。实际语义是「进程生命周期内一次性」 | 消费记录搬到 SQLite：`jti` 主键 + 原子 INSERT，就是审核要求的 `consume = CAS / unique constraint`，跨进程跨重启都成立。内存实现保留为默认（单测/嵌入式），但改为显式可替换，且 `/health` 暴露后端类名——名字不是 SQLite 实现时，「一次性」就不跨重启 | `storage/confirmation_store.py`（新增）、`api/auth.py`、`api/server.py` |
+| **3（P1）** Checkpoint 与 Task 指针不是原子提交 | **成立**，而且**注释比实现说得多**（原文写着「必须一次提交」，实际是三次写入）。不过它没有审核担心的那个方向的问题，理由见「如实说明」 | ① `JsonStore` 写入补 `fsync`（先刷文件、再 `os.replace`、再刷目录）→ 补上**掉电**场景；② 注释改成如实描述；③ 启动时 `prune_orphans()` 清掉没人认领的恢复点 | `storage/json_store.py`、`storage/checkpoint_store.py`、`agent/runtime.py`、`api/server.py` |
+| **4（P1）** Scheduler 的「真实执行」与「持久化状态」有多阶段窗口 | **成立**（`lease claim → 设备 acquire → RUNNING → persist → run()`），但审核自己也说「重点不是代码错了」，且点名「别在项目说明里说成 exactly once」 | 这是**表述**问题 → 本轮只改说法：README 明确写清它是 best-effort recovery + 对账，**不是 exactly-once side-effect execution**（见「如实说明」） | `README.md` |
+| **5（P1）** `/actions` 与 Runtime 是两套执行事实 | **成立**。`/actions` 只把 `verification` / `risk` 回给调用方，不进 TaskStep / StepAttempt / Trajectory / EventLog | 手工动作现在写**设备侧事件**（`channel="manual"`，`task_id="__manual__"`）→ `/history`、`/replay` 至少能看到「谁在什么时候点了哪、判成什么风险、验证结果如何」。执行内核统一了，任务编排没有——边界见下 | `api/server.py` |
+| **6（P1）** 设备权限是环境变量级，不是 Principal 级 | **成立**。main token 与 readonly token 都读同一个 `SHADOW_API_DEVICE_ALLOW`，只能表达「所有 operator 都能操作 A 和 B」 | 新增 `SHADOW_API_PRINCIPALS`（JSON）：每个 principal 有自己的令牌、只读标记与**自己的设备范围**。配置写错时 **fail-closed**——鉴权仍开启但一个人都认不出（全部 401），原因进 `/health` 与服务日志，`python -m api.server` 直接拒绝启动 | `api/auth.py`、`api/server.py` |
+| **7（P2）** readonly token 与 POST 只读接口语义冲突 | **成立**。readonly 被限定为「只能 GET」，而 `/screenshot`、`/observe` 是纯读取却注册成 POST → **只读令牌访问只读接口反而 403** | 两件事一起做：① 这两个端点同时注册 **GET**（正确的读方法），POST 保留不动；② 判定从「HTTP 方法」升级成「**操作能力**」，白名单写死（将来新增端点不会因为「恰好是 POST」被自动放行） | `api/server.py` |
+| **8（P2）** `generation` 不是完整的设备状态版本 | **V3.1 已覆盖**：运行时判断「页面还是不是决策时那一屏」用的是 `ObservationEpoch`（代次 + package/activity + 结构指纹 + 时刻），不再指望 generation | 补一条**语义记录**：三个端点的响应加 `generation_meaning`，README 与代码注释都写明它只回答「Shadow 自己动过设备没有」，外部操作（用户手点 / 通知栏 / App 异步刷新 / 另一个 adb client）都不会推进它 | `api/server.py` |
+
+### 二、如实说明（审核指出「说法比实现大」的地方）
+
+审核这一轮最有价值的部分不是列 bug，而是点名了几处**声明强于实现**。逐条说清现在的边界：
+
+1. **不是 exactly-once。** 任务执行是「多个本地步骤 + 崩溃后推断」的组合，因此在
+   `ActionEffectStatus` / `attempt_id` / reconciliation 之外，不存在「每一个副作用恰好发生一次」
+   的保证。准确的说法是：**best-effort recovery + 对账**——崩溃后先确认「上一次动作发出去了没有」，
+   拿不到证据就转人工，而不是假装它没发生过。这是设计取舍（手机侧没有事务），不是待修的缺陷。
+2. **Checkpoint 与 Task 指针不是一次事务。** 它们是两次文件写入，没有跨文件事务。
+   真实成立的只有两条：① **顺序**（先写恢复点、后写任务）→ 任务**永远不会**指向一个
+   不存在或没写完的恢复点；② **单文件原子可见 + fsync**（tmp → fsync → replace → fsync 目录）
+   → 新名字出现时内容一定已落盘，且掉电后不会看到一个空文件。代价是反方向仍会出现
+   **孤儿恢复点**（文件在、指针没提交），它是无害的，由启动时的 `prune_orphans()` 清掉。
+   要真正的跨文件事务就得上 SQLite（`BEGIN; INSERT checkpoint; UPDATE task; COMMIT;`）。
+3. **执行内核统一了，任务编排没有。** `/tap`、`/text`、`/back`、`/actions` 现在共用
+   同一条「门禁 → 执行 → 验证 → 留痕」链路；但手工动作**不属于任何 Task**，
+   所以不进 TaskStep / StepAttempt / Checkpoint / GoalVerification。硬塞进去会把
+   「任务事实」和「手工操作」混成一锅。结构性方案（独立 `ExecutionService`，Runtime 与 API
+   都依赖它）见下面的延期说明。
+
+### 三、有理由的延期（触发条件已就地写进代码）
+
+| 审查项 | 为什么本轮不做 | 触发条件（写在哪） |
+|---|---|---|
+| **5 的结构性部分**：抽独立 `ExecutionService`，Runtime 与 API 共用 | 把 Runtime 的 Observe→Think→Act→Verify 主循环抽成可复用的服务，会动到 V2.7 拆分出来的四个 mixin 与全部 runtime 用例；而手工端点的真实风险（绕过门禁、没有留痕）本轮已经堵住。先解决安全问题，再做结构重构 | 手工端点需要**参与任务编排**时（例如想让 `/tap` 也写 StepAttempt、或让手工动作能推进某个任务的计划）；或 Runtime 需要被第二个执行入口复用（如 API 之外的新前端）时（`api/server.py` 的 `run_manual_action` docstring） |
+
+### 行为变化提醒
+
+- **`/tap`、`/text`、`/back` 现在会先观察一次并过风险门禁**。代价是每次多一轮采集；收益是
+  「点掉立即付款」会被 403 拦下（`detail` 里会写明判定依据，并指路 `POST /tasks`）。
+  这三个端点的**响应只增字段不改字段名**，老调用方不受影响。
+- **手工端点新增失败码 503**：设备操作记录写不进 durable store 时**拒绝执行**。
+  这与 V3.1 的 P0-1 一脉相承——「手机真的点下去了、审计里没有」不可接受。
+- **只读令牌现在能访问 `/screenshot`、`/observe`**（GET 与 POST 都行），会改设备的操作照旧 403。
+- **多实例部署**：要把「同一张确认令牌不许用第二次」跨实例成立，必须让所有实例指向
+  **同一个 `SHADOW_CONFIRM_DB`**；各写各的文件只保证各自进程的重启安全。
+- **配错 `SHADOW_API_PRINCIPALS` 会导致全部请求 401**（fail-closed）。这是刻意的：
+  退回「没配鉴权」会把「配错了」变成「谁都能进」。原因在 `/health` 的 `principals_error` 里。
+- 启动时会清理**未被任何任务提交过**的恢复点。清理用 `list_all()`（含终态任务），
+  所以 `GET /tasks/{id}/checkpoint` 对已结束的任务照样能读出它提交过的那个。
+- 内部接口：`CheckpointStore.prune_orphans(committed)`、`auth.configure_consumption(guard)`、
+  `auth.config_error()`、`auth.consumption_backend()` 为新增。
+
+### 新环境变量
+
+| 变量 | 说明 | 默认值 |
+|---|---|---|
+| `SHADOW_API_PRINCIPALS` | 推荐的身份配置（JSON）：每个 principal 有 `token` / `read_only` / `devices`（数组，`["*"]` 表示不限）。设置后 legacy 令牌变量被忽略（会告警） | 未设置 |
+| `SHADOW_CONFIRM_DB` | 确认令牌「已消费」记录的 SQLite 路径。多实例部署必须指向同一个文件 | `$STORAGE_DIR/confirmations.db` |
+
+### API 变更
+
+| 变更 | 说明 |
+|---|---|
+| `GET /screenshot`、`GET /observe` | **新增**（原 POST 保留）。纯读取接口现在有正确的读方法 |
+| `GET /health` 新增 `confirmation_consumption`、`principals_error` | 前者是消费记录后端类名（不是 `InMemoryConsumption` 才说明「一次性」跨重启成立）；后者非 null 表示 principals 配错、正在拒绝所有请求 |
+| `POST /tap`、`/text`、`/back` 新增 403 / 503 | 403 = 危险动作（需走 `/tasks` + `/confirm`）；503 = 设备操作记录无法落盘，已拒绝执行 |
+| 三个手工端点响应新增 `risk` / `risk_detail` / `verification` / `generation_meaning` | 只增不改，老调用方不受影响 |
+
+### 验证
+
+`python -m pytest -q` → **526 passed（11.7s）**，较上轮 503 新增 **23** 条，零回归。
+
+| 新增用例 | 覆盖 |
+|---|---|
+| `test_confirmation_store.py`（新，7 条） | **换实例（≈重启）后第二次消费必须被拒**、两个连接只有一个能消费（unique constraint = CAS）、审计证据字段、过期清理、auth 层接上 SQLite 后跨重启成立、默认后端名字可查 |
+| `test_checkpoint_store.py`（新，4 条） | 孤儿与「被取代的旧恢复点」会被清、已提交的必须留着、空存储是 no-op、无指针任务不构成保留 |
+| `test_api.py`（+6 条） | `/text` 危险输入 403、`/tap` 由 UI 树解析出「立即付款」后 403、手工动作写设备侧事件（含 `channel`/`device`/`fingerprint`）、审计写不下去时 503 且**没有真的点下去**、启动清理删孤儿、**终态任务的已提交恢复点不被误删** |
+| `test_api_auth.py`（+6 条） | 只读令牌可用 GET/POST 的 `/screenshot`、`/observe`、只读令牌仍不能写、Principal 各自的设备范围、**principals 配错时 fail-closed**、legacy 变量仍有效、`/health` 报销费后端 |
+
+既有用例只改了 **1 处替身**（不是回归）：`tests/fakes.py` 的 `FakeDevice` 补 `dump_ui()`。
+`observer.observe` 依赖它，而本轮让 `/tap` 也必须观察——替身不补的话，新门禁在测试里只会
+抛 `AttributeError`，**等于没被覆盖**。
+
+---
+
 ## 快速开始
 
 ```powershell
@@ -1060,6 +1155,9 @@ python -m api.server    # 监听 127.0.0.1:8010
 | `GOAL_VERIFY_MODE` | 完成验证严格度。未设置 / `auto`：**按任务画像**自动判定（纯查询→`advisory`、导航/副作用→`strict`）；`off` / `advisory` / `strict`：**全局覆盖**该判定 | 未设置（按画像） |
 | `AUDIT_DIR` | 请求审计目录 | `$STORAGE_DIR/audit` |
 | `SHADOW_AUDIT` | 置 0 关闭请求审计 | 开启 |
+| `SHADOW_API_PRINCIPALS` | **推荐**的身份配置（JSON）：每 principal 独立 `token` / `read_only` / `devices`。设置后 legacy 令牌变量被忽略 | 未设置 |
+| `SHADOW_CONFIRM_DB` | 确认令牌「已消费」记录的 SQLite 路径；**多实例必须指向同一个文件** | `$STORAGE_DIR/confirmations.db` |
+| `SHADOW_TOCTOU_GUARD` | 置 0 关闭执行前的页面身份复查（V3.1） | `1`（开启） |
 | `SHADOW_DEBUG` | 置 1 时 500 响应回传异常摘要（默认脱敏） | 未设置 |
 
 ## API
@@ -1142,10 +1240,12 @@ pip install -r requirements.txt
 python -m pytest -q
 ```
 
-**503 个用例，全部离线**：不需要 adb、模拟器或 API Key。
+**526 个用例，全部离线**：不需要 adb、模拟器或 API Key。
 
 | 文件 | 覆盖 |
 |---|---|
+| `test_confirmation_store.py` | **确认令牌的一次性**：SQLite 消费记录（jti 主键 = 跨进程 CAS）、重启后仍拒绝、证据字段、过期清理 |
+| `test_checkpoint_store.py` | **恢复点孤儿清理**：已提交的留着、孤儿与被取代的清掉、无指针任务不构成保留 |
 | `test_semantic.py` | **动作语义层**：语义角色优先级（最危险优先）、同一 role 派生 risk 与幂等、`UNKNOWN` 的保守下限 |
 | `test_models.py` | 任务状态机、**故障/恢复态（DEGRADED / DEVICE_UNAVAILABLE）回归**、步骤依赖、动作风险（策略下限）/指纹、Checkpoint、预算、版本号、**尝试历史** |
 | `test_device.py` | ADB 封装、输入通道（含中文）、设备会话所有权与并发、**命令超时分级与总预算**、**多设备 serial 解析** |

@@ -16,12 +16,15 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field, ValidationError
 
+from dataclasses import dataclass
+
 from agent import executor, observer, replay as replay_mod, verifier
 from agent.classifier import TaskClassifier
-from agent.risk_gate import ActionRiskGate, RiskContext
+from agent.risk_gate import ActionRiskGate, RiskAssessment, RiskContext
 from agent.runtime import AgentRuntime
 from agent.scheduler import DeviceNotAllowedError, TaskScheduler
 from agent.task_manager import TaskManager
+from agent.verifier import Verification
 from device import screenshot as shots
 from device.adb import AdbController, AdbError, is_read_only
 from device.emulator import resolve_serial, resolve_serials
@@ -30,9 +33,18 @@ from device.pool import DevicePool, UnknownDeviceError, storage_hint
 from device.session import DeviceSession
 from models.action import Action, ActionRisk, ActionType, Point
 from models.budget import TaskBudget
+from models.exceptions import PersistenceError
+from models.state import Observation
 from models.task import RECOVERY_ERROR, TaskPriority, TaskStatus
-from storage import CheckpointStore, EventLog, TaskStore, TrajectoryStore
+from storage import (
+    CheckpointStore,
+    ConfirmationConsumptionStore,
+    EventLog,
+    TaskStore,
+    TrajectoryStore,
+)
 from storage.audit_log import AuditLog
+from storage.event_log import ACTION_DISPATCHED, ACTION_VERIFIED, RISK_ASSESSED
 from vision.vlm import VlmError, classify_relation
 
 from . import auth
@@ -125,6 +137,21 @@ event_log = EventLog(STORAGE_DIR / "events")
 # 损坏任务的隔离与留痕都挂在同一个日志上（V2.4 §十）
 task_store = TaskStore(STORAGE_DIR / "tasks", event_log=event_log)
 checkpoint_store = CheckpointStore(STORAGE_DIR / "checkpoints")
+
+# ---- 确认令牌的「已消费」记录（V3.2 §二）----
+#
+# 默认实现是**进程内存**，而确认令牌的签名密钥在配置了 `SHADOW_API_TOKEN` /
+# `SHADOW_CONFIRM_SECRET` 时是稳定的。两者相加的后果：服务重启后，一张在 TTL 内、
+# 签名依然有效的旧票据会**重新变得可用**——「一次性」退化成了「进程生命周期内一次性」。
+#
+# 生产路径换成 SQLite：jti 是主键，消费是一条 INSERT，唯一约束由数据库保证，
+# 天然是跨进程 + 跨重启的原子 consume。`SHADOW_CONFIRM_DB` 可显式指定位置
+# （多个实例要共享「谁用过这张票据」时必须指向同一个文件）。
+auth.configure_consumption(
+    ConfirmationConsumptionStore(
+        os.getenv("SHADOW_CONFIRM_DB", "").strip() or (STORAGE_DIR / "confirmations.db")
+    )
+)
 # 轨迹落盘（V2.1）：长跑任务重启后不能「失忆」——恢复点在，但前面几步干了什么也得在
 trajectory = TrajectoryStore(root=STORAGE_DIR / "trajectories")
 # 请求审计（V2.2 §九）：回答「谁在什么时候调了什么、被批准还是被拒绝」
@@ -153,8 +180,41 @@ manager = TaskManager(
 )
 
 
+def _prune_orphan_checkpoints() -> int:
+    """启动时清掉没人认领的恢复点（V3.2 §三）。
+
+    `runtime._save_checkpoint` 是「写恢复点 → 改指针 → 落盘任务」三步。进程在最后
+    一步之前崩溃，就会留下一个**孤儿恢复点**：文件在盘上，任务指针没提交。
+    它不是数据不一致（任务永远不会指向不存在/没写完的恢复点），但会一直占着磁盘、
+    还会让 `GET /tasks/{id}/checkpoint` 显示一个任务从未提交过的恢复点。
+
+    两个刻意的选择：
+
+    - 用 `list_all()` 而**不是** `list_active()`。终态任务同样可能有被提交过的恢复点
+      （那个 GET 端点要读它）；只按活跃任务算会把它们当孤儿**误删**。
+    - 只在启动时扫，不在运行期扫。孤儿只有「崩溃在恢复点与任务落盘之间」才会产生，
+      启动扫一次就够；运行期扫反而会与正在写恢复点的 worker 抢。
+
+    清理失败绝不能挡住启动——它是维护动作，不是启动前提。
+    """
+    try:
+        committed = {
+            task.id: task.checkpoint_id
+            for task in task_store.list_all()
+            if getattr(task, "checkpoint_id", "")
+        }
+        removed = checkpoint_store.prune_orphans(committed)
+    except Exception as exc:  # noqa: BLE001 - 维护动作失败不影响服务启动
+        logger.warning("启动清理孤儿恢复点失败（已跳过）：%s", exc)
+        return 0
+    if removed:
+        logger.info("启动清理：移除 %d 个未被任务提交的恢复点", removed)
+    return removed
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    _prune_orphan_checkpoints()
     scheduler.start()
     try:
         yield
@@ -162,7 +222,31 @@ async def lifespan(_: FastAPI):
         scheduler.stop()
 
 
-app = FastAPI(title="BlueWhale Shadow Phone Agent", version="0.3.1", lifespan=lifespan)
+app = FastAPI(title="BlueWhale Shadow Phone Agent", version="0.3.2", lifespan=lifespan)
+
+
+# 只读令牌允许的方法（V3.2 §七）。
+#
+# 此前判定是「readonly ⇒ 只能 GET」，而 `/screenshot` 与 `/observe` 是**纯读取**
+# 却注册成了 POST —— 于是「只读令牌访问只读接口」拿到 403，一个纯粹的契约不一致。
+# 两件事一起做：
+#   1. 这两个端点同时注册 GET（契约上正确的读方法，见它们的 docstring）；
+#   2. 判定从「HTTP 方法」升级成「**操作能力**」——方法只是代理指标，
+#      真正的判据是「这次请求会不会改变设备状态」。
+# 白名单刻意写死，不靠路径前缀猜：将来新增端点不会因为「恰好是 POST」被自动放行。
+_READ_ONLY_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+_READ_ONLY_ALLOWED_POST_PATHS = frozenset({"/screenshot", "/observe"})
+
+
+def _is_read_only_request(request: Request) -> bool:
+    """这次请求是不是**真的**只读（V3.2 §七）。
+
+    取「操作能力」而非「HTTP 方法」作判据：方法只是代理指标，
+    拿它当唯一判据会把只读令牌挡在只读接口外面。
+    """
+    if request.method in _READ_ONLY_METHODS:
+        return True
+    return request.method == "POST" and request.url.path in _READ_ONLY_ALLOWED_POST_PATHS
 
 
 @app.middleware("http")
@@ -201,7 +285,7 @@ async def access_control(request: Request, call_next):
                 status_code=401,
                 content={"ok": False, "error": "未授权：请携带 Authorization: Bearer <token>"},
             )
-        if principal.read_only and request.method not in {"GET", "HEAD", "OPTIONS"}:
+        if principal.read_only and not _is_read_only_request(request):
             record(403, "read-only token attempted a write")
             return JSONResponse(
                 status_code=403,
@@ -510,35 +594,235 @@ def device_access(session_item, *, timeout: float = 0.0, operation: str | None =
         session_item.release(_MANUAL_OWNER)
 
 
+# ---- 手工端点的统一执行内核（V3.2 §一 / §五）----
+#
+# 在此之前 `/tap`、`/text`、`/back` 直接调 `device.tap()` —— **完全绕过**
+# `ActionRiskGate`。而 README 声称「所有改变设备的 Action 都先经过统一风险门禁」，
+# 于是实际存在两条控制链：
+#
+#     Agent 路径： Action → RiskGate → HITL → Executor → Verifier
+#     手工路径：   /tap   → DeviceSession → device.tap()
+#
+# 后果不是理论上的：在「订单确认页」上 `POST /tap {"x":680,"y":1200}` 能点掉
+# 「立即付款」，既不判风险、也不进 HITL、设备侧还留不下审计记录。
+#
+# 现在四个手工端点共用下面这一个内核。要说清它**统一了什么、没统一什么**：
+#
+#   统一了：风险门禁（两轮，第二轮带 UI 上下文）、危险动作拒绝、执行、验证、
+#           设备侧事件留痕（RISK_ASSESSED / ACTION_DISPATCHED / ACTION_VERIFIED）；
+#   没统一：Runtime 那套 Task / TaskStep / StepAttempt / Checkpoint /
+#           GoalVerification 闭环。手工动作不属于任何任务，硬塞进 Task 只会把
+#           「任务事实」和「手工操作」混成一锅——共用的是**执行内核**，不是任务编排。
+#           结构性的深度统一（独立 `ExecutionService`，Runtime 与 API 都依赖它）
+#           见 README「V3.2 修复轮」里的延期说明与触发条件。
+
+MANUAL_ACTION_TASK_ID = _MANUAL_OWNER
+"""手工动作的事件流记在这个 id 下（V3.2 §五）。
+
+它们不属于任何 Task，但「谁在什么时候点了哪、判成什么风险、验证结果如何」同样是
+必须可追溯的事实——否则 `/history` 与 `/replay` 里的设备操作历史是残缺的。
+"""
+
+
+@dataclass(frozen=True)
+class ManualActionOutcome:
+    """一次手工动作的完整结果。内核只产出事实，端点负责翻译成 HTTP。"""
+
+    action: Action
+    assessment: RiskAssessment
+    result: dict
+    pre: Observation
+    post: Observation
+    verdict: Verification
+
+
+def _dangerous_refusal(assessment: RiskAssessment) -> str:
+    """危险动作的统一拒绝文案。指路而不是含糊地 403，否则调用方只会反复重试。"""
+    return (
+        "危险动作需经人工确认：请通过 POST /tasks 触发任务流程，"
+        f"再由 /tasks/{{id}}/confirm 放行（判定依据：{assessment.describe()}）"
+    )
+
+
+def run_manual_action(
+    action: Action,
+    session_item,
+    *,
+    operation: str | None = None,
+) -> ManualActionOutcome:
+    """手工端点**唯一**的执行内核（V3.2 §一）。
+
+    `operation` 用于 `device_access` 的只读性结构化校验（`is_read_only`）。
+    `/actions` 是动态分发（wait / done 这类无设备副作用的动作也会进来），
+    传 None 走保守加锁——与它原来的行为一致。
+    """
+    controller = session_item.controller
+    artifact_dir = _artifact_dir_for(session_item)
+
+    with device_access(session_item, operation=operation) as device:
+        # 第一轮：不带上下文。零成本，而且**不碰设备**——设备不可用时该给 403，
+        # 而不是先观察失败、再给一个把责任推给设备的误导性 502。
+        assessment = ActionRiskGate.assess(action)
+        if assessment.requires_confirmation:
+            raise HTTPException(status_code=403, detail=_dangerous_refusal(assessment))
+
+        pre = observer.observe(controller, artifact_dir, step=0)
+
+        # 第二轮：带 UI 树复核——抓「点击红色按钮」其实是「立即购买」这种情况。
+        # 这是 V2.2 §一 的核心能力，而手工路径以前**完全没有**这一轮。
+        assessment = ActionRiskGate.assess(
+            action,
+            context=RiskContext.from_observation(pre, instruction=MANUAL_ACTION_TASK_ID),
+        )
+        if assessment.requires_confirmation:
+            raise HTTPException(status_code=403, detail=_dangerous_refusal(assessment))
+
+        # 设备侧事实必须落盘（V3.2 §五）。这两条都是安全关键事件（会 fail-closed），
+        # 写不进 durable store 就**不执行**——否则会出现「手机真的点了付款，
+        # 但审计里查不到是谁点的」。手工路径以前一条事件都不留。
+        try:
+            event_log.emit(
+                MANUAL_ACTION_TASK_ID,
+                RISK_ASSESSED,
+                channel="manual",
+                action=action.type.value,
+                effective=assessment.effective.value,
+                policy=assessment.policy.value,
+                model=assessment.model.value,
+                downgrade_blocked=assessment.downgrade_blocked,
+                reason=assessment.describe(),
+                target_resolution=assessment.target_resolution,
+                unresolved_target=assessment.unresolved_target,
+                device=session_item.serial,
+            )
+            event_log.emit(
+                MANUAL_ACTION_TASK_ID,
+                ACTION_DISPATCHED,
+                channel="manual",
+                action=action.type.value,
+                risk=assessment.effective.value,
+                fingerprint=action.fingerprint,
+                target=str(action.target or ""),
+                value=action.value,
+                device=session_item.serial,
+            )
+        except PersistenceError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=f"设备操作记录无法落盘，已拒绝执行：{exc.reason}",
+            ) from exc
+
+        result = executor.execute(device, action, pre.ui_tree)
+        post = (
+            observer.observe(controller, artifact_dir, step=0, suffix="post")
+            if result.get("ok")
+            else pre
+        )
+        post.action = action
+        post.result = result
+        verdict = verifier.verify_action(MANUAL_ACTION_TASK_ID, pre, action, post, result)
+        post.status = verdict.outcome
+        post.message = verdict.message
+
+        event_log.emit(
+            MANUAL_ACTION_TASK_ID,
+            ACTION_VERIFIED,
+            channel="manual",
+            outcome=verdict.outcome.value,
+            dispatch=verdict.dispatch.status.value,
+            effect=verdict.effect.status.value,
+            target=verdict.effect.target.value,
+            message=verdict.message,
+            device=session_item.serial,
+        )
+
+    return ManualActionOutcome(
+        action=action,
+        assessment=assessment,
+        result=result,
+        pre=pre,
+        post=post,
+        verdict=verdict,
+    )
+
+
+def _manual_ok_payload(outcome: ManualActionOutcome, session_item, extra: dict | None = None) -> dict:
+    """成功响应。形状与升级前保持一致，只**追加**字段，不删也不改名。"""
+    payload = {
+        "ok": True,
+        "device": session_item.serial,
+        # V3.2 §八：generation 是「设备操作代次」，只记 Shadow 自己知道的写入，
+        # **不是** Android 全局 UI 版本。别把它读成「页面没变过」。
+        "generation": session_item.generation,
+        "generation_meaning": GENERATION_MEANING,
+        "risk": outcome.assessment.effective.value,
+        "risk_detail": outcome.assessment.describe(),
+        "verification": outcome.verdict.model_dump(),
+    }
+    payload.update(extra or {})
+    return payload
+
+
+def _manual_failure_response(outcome: ManualActionOutcome) -> JSONResponse:
+    """执行失败 → 502，形状与升级前 `AdbError` 的处理器一致。"""
+    return JSONResponse(
+        status_code=502,
+        content={"ok": False, "error": outcome.result.get("error", "设备操作失败")},
+    )
+
+
 @app.post("/tap")
 def tap(req: TapRequest, request: Request, device_serial: str | None = None):
+    """单步点击。**与 Agent 走同一条风险门禁**（V3.2 §一）。
+
+    升级前这里直接 `device.tap()`：不判风险、不进 HITL、不留设备侧审计。
+    现在会先观察一次并带上下文复核风险——「点掉立即付款」会被 403 拦下，
+    而不是静默执行。
+    """
     session_item = resolve_manual_device(req.device_serial or device_serial, request)
-    with device_access(session_item, operation="tap") as device:
-        device.tap(req.x, req.y)
-    return {"ok": True, "device": session_item.serial, "generation": session_item.generation}
+    outcome = run_manual_action(
+        Action(type=ActionType.TAP, target=Point(x=req.x, y=req.y)),
+        session_item,
+        operation="tap",
+    )
+    if not outcome.result.get("ok"):
+        return _manual_failure_response(outcome)
+    return _manual_ok_payload(outcome, session_item, {"x": req.x, "y": req.y})
 
 
 @app.post("/text")
 def text(req: TextRequest, request: Request, device_serial: str | None = None):
+    """单步输入。走统一内核（V3.2 §一）。
+
+    中文走 ADB Keyboard 广播、ASCII 走 `input text` —— 调用方不需要知道区别，
+    这一步由 `executor` 的 TYPE 分支统一处理（与 Agent 的输入链路是同一条）。
+    """
     session_item = resolve_manual_device(req.device_serial or device_serial, request)
-    # 中文走 ADB Keyboard 广播，ASCII 走 input text —— 调用方不需要知道区别
-    provider = build_default_input(session_item.controller)
-    with device_access(session_item, operation="type_text"):
-        provider.input(req.value)
-    return {
-        "ok": True,
-        "provider": provider.name,
-        "device": session_item.serial,
-        "generation": session_item.generation,
-    }
+    outcome = run_manual_action(
+        Action(type=ActionType.TYPE, value=req.value),
+        session_item,
+        operation="type_text",
+    )
+    if not outcome.result.get("ok"):
+        return _manual_failure_response(outcome)
+    return _manual_ok_payload(
+        outcome,
+        session_item,
+        {
+            "text": req.value,
+            "provider": outcome.result.get("provider"),
+        },
+    )
 
 
 @app.post("/back")
 def back(request: Request, device_serial: str | None = None):
+    """单步返回。走统一内核（V3.2 §一）。"""
     session_item = resolve_manual_device(device_serial, request)
-    with device_access(session_item, operation="back") as device:
-        device.back()
-    return {"ok": True, "device": session_item.serial, "generation": session_item.generation}
+    outcome = run_manual_action(Action(type=ActionType.BACK), session_item, operation="back")
+    if not outcome.result.get("ok"):
+        return _manual_failure_response(outcome)
+    return _manual_ok_payload(outcome, session_item)
 
 
 # `stable` 的语义常量（V2.4 §八）。审核指出这个名字容易被读成「UI 已经稳定」，
@@ -546,8 +830,16 @@ def back(request: Request, device_serial: str | None = None):
 # 别的客户端在改，generation 都不会动。把这个含义写进响应，免得调用方自己猜。
 STABLE_MEANING = "no_known_shadow_write_during_observation"
 
+# V3.2 §八：同一个坑的第二次记录。`generation` 既不是 UI 版本、也不是设备版本，
+# 它只回答「Shadow 自己在这段时间里有没有动过设备」。外部操作（用户手点、通知栏、
+# App 异步刷新、另一个 adb client）**不会**推进它。
+# 需要「决策依据的那一屏还是不是现在这一屏」时，用 runtime 的 `ObservationEpoch`
+# （V3.1 P1-6），不要拿 generation 当替代品。
+GENERATION_MEANING = "shadow_known_device_operations_only"
+
 
 @app.post("/screenshot")
+@app.get("/screenshot")
 def screenshot(request: Request, device_serial: str | None = None):
     """只读端点：不加设备锁，但会明确告诉你这次截图是不是「无已知写入」（V2.2 §九）。
 
@@ -558,6 +850,10 @@ def screenshot(request: Request, device_serial: str | None = None):
 
     只读性由 `device.adb.is_read_only` 结构化声明（V2.7 P1-7）：
     这里只调 `screenshot.capture` → `adb.screenshot`，属于只读封装，不改变设备状态。
+
+    V3.2 §七：同时注册 **GET**。此前只有 POST，而只读令牌被限定为只能 GET，
+    于是「只读令牌访问只读接口」反而拿到 403——一个纯粹的 API 契约不一致。
+    两种方法都保留，POST 不动（老调用方不受影响），新调用方请用 GET。
     """
     session_item = resolve_manual_device(device_serial, request)
     before = session_item.generation
@@ -571,6 +867,7 @@ def screenshot(request: Request, device_serial: str | None = None):
         "path": str(path),
         "device": session_item.serial,
         "generation": after,
+        "generation_meaning": GENERATION_MEANING,
         # 前后代次不同 = 中途有 Shadow 的写操作发生，这一张可能落在动画/过渡帧上
         "stable": before == after,
         "stable_meaning": STABLE_MEANING,
@@ -578,6 +875,7 @@ def screenshot(request: Request, device_serial: str | None = None):
 
 
 @app.post("/observe")
+@app.get("/observe")
 def observe(request: Request, device_serial: str | None = None):
     """只读端点，返回带代次的整屏观察。
 
@@ -588,6 +886,8 @@ def observe(request: Request, device_serial: str | None = None):
 
     只读性由 `device.adb.is_read_only` 结构化声明（V2.7 P1-7）：observer 只调
     截图 / `wm size` / `dumpsys` / `uiautomator dump`，都是只读采集，不改设备状态。
+
+    V3.2 §七：同时注册 **GET**，理由同 `/screenshot`。
     """
     session_item = resolve_manual_device(device_serial, request)
     before = session_item.generation
@@ -598,6 +898,7 @@ def observe(request: Request, device_serial: str | None = None):
         {
             "device": session_item.serial,
             "generation": after,
+            "generation_meaning": GENERATION_MEANING,
             "stable": before == after,
             "stable_meaning": STABLE_MEANING,
         }
@@ -607,6 +908,7 @@ def observe(request: Request, device_serial: str | None = None):
 
 @app.post("/actions")
 def execute_action(req: ActionRequest, request: Request, device_serial: str | None = None):
+    """执行一个 Action。走与 `/tap` 等**同一个**内核（V3.2 §一 / §五）。"""
     try:
         action_type = ActionType(req.type)
     except ValueError:
@@ -617,57 +919,18 @@ def execute_action(req: ActionRequest, request: Request, device_serial: str | No
         raise HTTPException(status_code=400, detail=f"Action 参数非法: {exc}") from exc
 
     session_item = resolve_manual_device(req.device_serial or device_serial, request)
-    controller = session_item.controller
-    artifact_dir = _artifact_dir_for(session_item)
+    # 动态分发（wait / done 这类无设备副作用的 action 也会进来）→ 不传 operation，
+    # 走保守加锁。is_read_only 的结构化校验只对操作名确定的端点
+    # （/tap、/text、/back）生效。
+    outcome = run_manual_action(action, session_item)
 
-    # /actions 是动态分发（wait / done 这类无设备副作用的 action 也会进来），
-    # 不传 operation：走保守加锁。is_read_only 的结构化校验只对明确的写端点
-    # （/tap、/text、/back）生效，那里操作名是确定的。
-    with device_access(session_item) as device:
-        # 统一风险门禁：危险动作不能绕过 HITL 直接执行（V2.1 §十）。
-        # 之前这里在 execute 之后才回传 risk，等于外部调用能静默执行危险动作。
-        #
-        # 分两轮判定（V2.2 §一）：
-        #   第一轮不带上下文——零成本，先把「确认付款」这类明显的拦下来，
-        #     而且不用碰设备（否则设备不可用时给的是 502 而不是 403，很误导）
-        #   第二轮带 UI 树上下文复核——抓「点击红色按钮」其实是「立即购买」这种情况
-        assessment = ActionRiskGate.assess(action)
-        if assessment.requires_confirmation:
-            raise HTTPException(
-                status_code=403,
-                detail=(
-                    "危险动作需经人工确认：请通过 POST /tasks 触发任务流程，"
-                    f"再由 /tasks/{{id}}/confirm 放行（判定依据：{assessment.describe()}）"
-                ),
-            )
-
-        pre = observer.observe(controller, artifact_dir, step=0)
-        assessment = ActionRiskGate.assess(
-            action, context=RiskContext.from_observation(pre, instruction="__action__")
-        )
-        if assessment.requires_confirmation:
-            raise HTTPException(
-                status_code=403,
-                detail=f"危险动作需经人工确认（目标元素风险复核）：{assessment.describe()}",
-            )
-        result = executor.execute(device, action, pre.ui_tree)
-        post = (
-            observer.observe(controller, artifact_dir, step=0, suffix="post")
-            if result.get("ok")
-            else pre
-        )
-        post.action = action
-        post.result = result
-        verdict = verifier.verify_action("__action__", pre, action, post, result)
-        post.status = verdict.outcome
-        post.message = verdict.message
-
-    payload = post.model_dump(exclude={"ui_tree"})
-    payload["verification"] = verdict.model_dump()
-    payload["risk"] = assessment.effective.value
-    payload["risk_detail"] = assessment.describe()
+    payload = outcome.post.model_dump(exclude={"ui_tree"})
+    payload["verification"] = outcome.verdict.model_dump()
+    payload["risk"] = outcome.assessment.effective.value
+    payload["risk_detail"] = outcome.assessment.describe()
     payload["device"] = session_item.serial
     payload["generation"] = session_item.generation
+    payload["generation_meaning"] = GENERATION_MEANING
     return payload
 
 
@@ -675,6 +938,11 @@ def execute_action(req: ActionRequest, request: Request, device_serial: str | No
 
 
 def _wait_for(task_id: str, timeout: float) -> dict:
+    """`wait=true` 时的同步等待。
+
+    注意 `time.sleep` 轮询而不是事件通知：任务可能被另一个进程的 worker 推进
+    （TaskLease 允许多进程部署），进程内的 Event 收不到那种进度。
+    """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         task = manager.get(task_id)
@@ -1038,8 +1306,22 @@ def scheduler_state(request: Request):
 
 @app.get("/health")
 def health():
-    """探活端点。唯一不需要鉴权的入口——运维探活不该还要带密钥。"""
-    return {"ok": True, "auth": "token" if auth.enabled() else "disabled", "host": HOST}
+    """探活端点。唯一不需要鉴权的入口——运维探活不该还要带密钥。
+
+    `confirmation_consumption` 是「确认令牌已消费记录」的后端类名（V3.2 §二）。
+    **只有它不是 `InMemoryConsumption` 时**，「一次性 Token」这句话才跨重启成立。
+    把后端名字暴露出来，是因为「我们到底配的是哪个实现」应该能被查到，
+    而不是靠人记住几个月前启动时设了什么环境变量。
+    """
+    return {
+        "ok": True,
+        "auth": "token" if auth.enabled() else "disabled",
+        "host": HOST,
+        "confirmation_consumption": auth.consumption_backend(),
+        # 非 null 说明 SHADOW_API_PRINCIPALS 配错了，此刻**所有请求都在被 401**。
+        # 必须能从这里查到——否则运维只看到「全部 401」，原因却只在一行日志里。
+        "principals_error": auth.config_error(),
+    }
 
 
 if __name__ == "__main__":
@@ -1048,6 +1330,13 @@ if __name__ == "__main__":
     refusal = auth.bare_bind_refused(HOST)
     if refusal:
         raise SystemExit(refusal)
+    # 配错了 principals 就**不要启动**：否则服务会安静地 401 掉所有请求，
+    # 而「为什么全都 401」要翻日志才知道（V3.2 §六）。
+    if auth.config_error():
+        raise SystemExit(
+            "SHADOW_API_PRINCIPALS 配置有误，拒绝启动：\n  "
+            + str(auth.config_error())
+        )
     if not auth.enabled():
         logger.warning(
             "未配置 SHADOW_API_TOKEN，API 无鉴权（仅建议在 127.0.0.1 本机使用）"

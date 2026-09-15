@@ -24,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import logging
+import json
 import os
 import secrets
 import threading
@@ -97,8 +98,92 @@ def _split_devices(raw: str) -> frozenset[str]:
     return frozenset(part.strip() for part in raw.split(",") if part.strip())
 
 
+# 配置错误（V3.2 §六）。解析不出 principals 时**绝不能**退回「没配鉴权」——
+# 那会把「配错了」变成「谁都能进」，是最坏的方向。所以记下原因、让鉴权处于
+# 「开着但一个人都认不出」的状态（所有请求 401），并把原因暴露到 /health。
+_config_error: str | None = None
+
+
+def _parse_principals(raw: str) -> tuple[dict[str, Principal], str | None]:
+    """解析 `SHADOW_API_PRINCIPALS`（V3.2 §六）。返回 (表, 问题描述)。
+
+    格式（每个 principal 有**自己的设备范围**，这正是审核要的 Principal → Device ACL）：
+
+        {"alice":   {"token": "t-alice", "devices": ["phone-001"]},
+         "bob":     {"token": "t-bob",   "devices": ["phone-002"]},
+         "auditor": {"token": "t-aud",   "read_only": true, "devices": ["*"]}}
+
+    `devices` 省略 / 空数组 / `["*"]` 都表示不限。
+    """
+    try:
+        spec = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        return {}, f"SHADOW_API_PRINCIPALS 不是合法 JSON：{exc}"
+    if not isinstance(spec, dict):
+        return {}, "SHADOW_API_PRINCIPALS 必须是一个对象（principal 名 → 配置）"
+
+    table: dict[str, Principal] = {}
+    problems: list[str] = []
+    for name, item in spec.items():
+        if not isinstance(item, dict):
+            problems.append(f"{name}: 配置必须是对象")
+            continue
+        token = str(item.get("token") or "").strip()
+        if not token:
+            problems.append(f"{name}: 缺少 token")
+            continue
+        devices = item.get("devices")
+        if devices is None:
+            device_set = frozenset()
+        elif isinstance(devices, (list, tuple)):
+            device_set = frozenset(
+                text for text in (str(d).strip() for d in devices) if text and text != "*"
+            )
+        elif isinstance(devices, str):
+            device_set = _split_devices(devices.replace("*", ""))
+        else:
+            problems.append(f"{name}: devices 必须是数组或逗号分隔字符串")
+            continue
+        if token in table:
+            problems.append(f"{name}: 令牌与 {table[token].name} 重复")
+            continue
+        table[token] = Principal(
+            name=str(name),
+            read_only=bool(item.get("read_only", False)),
+            devices=device_set,
+        )
+    return table, ("；".join(problems) if problems else None)
+
+
 def configured_tokens() -> dict[str, Principal]:
-    """从环境变量读出「令牌 → 身份」表。每次调用都重读，方便测试与热改配置。"""
+    """从环境变量读出「令牌 → 身份」表。每次调用都重读，方便测试与热改配置。
+
+    两种方式（同时配置时以 principals 为准，legacy 被忽略并告警）：
+
+    - **`SHADOW_API_PRINCIPALS`（V3.2 §六，推荐）**：每个 principal 有**自己的设备范围**。
+    - **legacy**：`SHADOW_API_TOKEN` / `SHADOW_API_READONLY_TOKEN` +
+      `SHADOW_API_DEVICE_ALLOW`。这一对只能表达「所有令牌共用一份设备白名单」——
+      也就是审核说的「Token + Global Device ACL」。保底兼容，新部署请用上面那种。
+    """
+    global _config_error
+
+    raw = (os.getenv("SHADOW_API_PRINCIPALS") or "").strip()
+    if raw:
+        table, problem = _parse_principals(raw)
+        _config_error = problem
+        if problem:
+            # 严格失败：宁可整表作废（全部 401），也不要「少配了一个 principal，
+            # 于是它变成未受限的匿名身份」。原因会出现在 /health 与服务日志里。
+            logger.error("principals 配置有误，鉴权将拒绝所有请求：%s", problem)
+            return {}
+        if os.getenv("SHADOW_API_TOKEN") or os.getenv("SHADOW_API_READONLY_TOKEN"):
+            logger.warning(
+                "同时配置了 SHADOW_API_PRINCIPALS 与 legacy 令牌变量，"
+                "以 principals 为准，legacy 已被忽略"
+            )
+        return table
+
+    _config_error = None
     table: dict[str, Principal] = {}
 
     main = (os.getenv("SHADOW_API_TOKEN") or "").strip()
@@ -119,9 +204,18 @@ def configured_tokens() -> dict[str, Principal]:
     return table
 
 
+def config_error() -> str | None:
+    """principals 配置的问题描述（没有问题时为 None）。
+
+    有值 = 配置写错了、鉴权正在拒绝所有请求。它必须**可查**（`/health` 与启动检查），
+    否则运维看到的是「所有请求 401」，而原因只在一行日志里。
+    """
+    return _config_error
+
+
 def enabled() -> bool:
     """是否启用了鉴权。未配置任何令牌 = 关闭（本地开发零配置）。"""
-    return bool(configured_tokens())
+    return bool(configured_tokens()) or _config_error is not None
 
 
 def require_auth() -> bool:
@@ -189,12 +283,65 @@ def bare_bind_refused(host: str) -> str | None:
 # 而是「能力票据」——拿到就一直有效。给一个短时限，够人看清内容再点就行。
 CONFIRM_TTL_SECONDS = float(os.getenv("SHADOW_CONFIRM_TTL_SECONDS", "300"))
 
-# 已消费的确认令牌（V2.4 §九）：jti -> 过期时间戳。
-# 审核指出光有 TTL + 签名仍然只是「signed capability」：连续 GET 三次会拿到三个
-# 有效令牌，任意一个在 TTL 内都能确认。加上 jti 并在消费后记名，同一个令牌第二次
-# 提交直接被拒——确认是**一次性审批**，不是可以反复使用的凭据。
-_consumed_confirmations: dict[str, int] = {}
-_consumption_lock = threading.Lock()
+# ---- 已消费的确认令牌（V2.4 §九 · V3.2 §二）----
+#
+# V2.4 加的「消费后记名」解决了「连续 GET 拿到多张票据、任意一张都能用」的问题，
+# 但记录本身是**进程内存里的 dict**。而确认令牌的签名密钥在配置了
+# `SHADOW_API_TOKEN` / `SHADOW_CONFIRM_SECRET` 时是**稳定**的，两者相加：
+#
+#     09:00 签发令牌 A → 09:01 用它确认 → 09:02 服务重启 → 09:03 令牌 A
+#     仍在 TTL 内、签名依然有效 → 它又「可用」了
+#
+# 所以 V2.4 的实现是「**进程生命周期内**一次性」，不是「一次性」（V3.2 §二）。
+# 现在消费记录走可插拔的守卫：生产用 `storage.confirmation_store` 的 SQLite 实现
+# （jti 主键 + 原子 INSERT），默认的内存实现只留给单测与「没配存储」的场景。
+
+
+class InMemoryConsumption:
+    """消费记录默认实现：进程内存。
+
+    **它不满足跨重启语义**。保留它是因为 `api.auth` 需要在没有存储层的场景下
+    也能工作（纯函数单测、嵌入式使用），而且它把「一次性」这条语义在
+    进程内表达完整了。生产部署必须在启动时 `configure_consumption()` 换成
+    SQLite 实现——`api/server.py` 已经这么做了。
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._used: dict[str, float] = {}
+
+    def consume(self, jti: str, *, expires_at: float = 0.0, **_evidence) -> bool:
+        current = time.time()
+        with self._lock:
+            # 顺手清掉过期条目，避免这个集合无限增长
+            for used_jti in [k for k, exp in self._used.items() if exp < current]:
+                self._used.pop(used_jti, None)
+            if jti in self._used:
+                return False
+            self._used[jti] = expires_at
+            return True
+
+    def is_consumed(self, jti: str) -> bool:
+        with self._lock:
+            return jti in self._used
+
+    def clear(self) -> None:
+        with self._lock:
+            self._used.clear()
+
+
+_consumption: object = InMemoryConsumption()
+
+
+def configure_consumption(guard) -> None:
+    """换掉消费记录的后端（V3.2 §二）。
+
+    接受任何实现 `consume(jti, *, expires_at, **evidence) -> bool` /
+    `is_consumed(jti)` / `clear()` 的对象——`storage.confirmation_store.
+    ConfirmationConsumptionStore` 就是生产用的那个。
+    """
+    global _consumption
+    _consumption = guard
 
 
 def confirmation_secret() -> bytes:
@@ -316,14 +463,14 @@ def consume_confirmation_token(
     *,
     now: float | None = None,
 ) -> tuple[bool, str]:
-    """校验并**消费**令牌：同一个令牌只能用一次（V2.4 §九）。
+    """校验并**消费**令牌：同一个令牌只能用一次（V2.4 §九 · V3.2 §二）。
 
     与 `verify_confirmation_token` 的差别只在「记名」这一步——校验通过后把 jti
-    记进已消费集合，重复提交会被明确拒绝，而不是当成一次全新的审批。
+    交给消费守卫，重复提交被明确拒绝，而不是当成一次全新的审批。
 
-    进程重启会丢掉这份记录，所以它只是 TTL 之外的第二道闸；真正的语义保障仍然
-    来自「待确认事项被消费后 `/confirm` 直接 409」，这里补的是「同一张票据不许
-    用第二次」这条显式语义。
+    记名的**持久性由守卫决定**（`configure_consumption`）：生产用的是 SQLite，
+    所以「同一张票据不许用第二次」跨进程、跨重启都成立。默认的内存守卫只保证
+    进程内——那不够，但它是显式可替换的，而不是藏在实现里。
     """
     ok, reason, jti = _verify_and_parse(
         token, principal, task_id, action_fingerprint, task_version, now=now
@@ -336,17 +483,27 @@ def consume_confirmation_token(
         expires_at = int(str(token).strip().partition(".")[0])
     except ValueError:  # pragma: no cover - _verify_and_parse 已挡住
         expires_at = int(current)
-    with _consumption_lock:
-        # 顺手清掉过期条目，避免这个集合无限增长
-        for used_jti in [k for k, exp in _consumed_confirmations.items() if exp < current]:
-            _consumed_confirmations.pop(used_jti, None)
-        if jti in _consumed_confirmations:
-            return False, "确认令牌已被使用过（确认是一次性审批，请重新读取待确认事项）"
-        _consumed_confirmations[jti] = expires_at
+    consumed = _consumption.consume(
+        jti,
+        task_id=task_id,
+        principal=principal,
+        fingerprint=action_fingerprint,
+        expires_at=expires_at,
+    )
+    if not consumed:
+        return False, "确认令牌已被使用过（确认是一次性审批，请重新读取待确认事项）"
     return True, ""
 
 
 def clear_consumed_confirmations() -> None:
-    """清空已消费记录（测试用）。"""
-    with _consumption_lock:
-        _consumed_confirmations.clear()
+    """清空已消费记录（**测试用**；生产上清空等于让用过的票据复活）。"""
+    _consumption.clear()
+
+
+def consumption_backend() -> str:
+    """当前消费记录后端的名字，供 /health 与启动日志核对。
+
+    值不是内存实现时就说明「一次性」是跨重启成立的——这个信息值得能被查到，
+    而不是靠人记住启动时配了什么。
+    """
+    return type(_consumption).__name__
