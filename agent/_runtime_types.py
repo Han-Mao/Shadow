@@ -162,7 +162,40 @@ class RuntimeState:
     """
 
     execution_mode: str = ""
-    """本任务声明的执行模式（`ExecutionMode.value`），决策时读。"""
+    """本任务**实际**的执行平面（`ExecutionMode.value`），决策时读。**已废弃语义**。
+
+    ⚠️ V5 P0③（审查 §四/§五）之前，这个字段被写入的是 `task.execution_mode`
+    ——用户的**要求**，不是实际发生的事。于是 `HYBRID` 在影子不可用时明明回落到
+    Display 0，这里仍然写着 `"hybrid"`，导致 `_user_presence_verdict` 认为
+    「它是影子 → 用户操作与它无关 → 继续跑」，而它其实正在和用户抢同一块屏。
+
+    现在它由 `refresh_user_context` 写入 **resolved** 平面，并且
+    `requested_execution_mode` 单独保存用户的要求。为了兼容旧调用点保留了这个
+    名字，语义等同于 `resolved_execution_mode`（见 `restored_execution_mode()`）。
+    """
+
+    requested_execution_mode: str = ""
+    """用户**要求**的执行平面（V5 P0③）。
+
+    与 `execution_mode` 成对出现，因为两者都是被需要的事实，不能只留一个：
+
+    - `requested`：`/tasks/{id}` 要显示用户提交了什么；Checkpoint 恢复时要能看出
+      「它本来是 hybrid」——否则恢复出来的任务永远看不出曾经降级过。
+    - `resolved`：Scheduler 判抢占、Runtime 判用户暂停、Checkpoint 记录实际落在哪，
+      都必须读这个。
+    """
+
+    resolved_execution_mode: str = ""
+    """**实际**的执行平面（V5 P0③）。影子不可用时 `HYBRID` 在这里变成 `foreground`。"""
+
+    plane_degraded: bool = False
+    """`resolved != requested`（目前只有 HYBRID 回落这一种来源）。进日志与审计。"""
+
+    plane_reason: str = ""
+    """降级原因（进了 `/tasks/{id}` 与 Checkpoint，便于事后解释「为什么在前台跑」）。"""
+
+    plane_degraded_reported: bool = False
+    """降级是否已经报过一次（避免每轮循环刷同一条日志）。"""
 
     session_id: str = ""
     """本次执行所属的会话 id（V5 §十三）。
@@ -177,6 +210,34 @@ class RuntimeState:
 
     shadow_state_id: str = ""
     """影子平面上的状态标识（V5 §十三）。真正的影子平面尚未实现，当前恒为空。"""
+
+    def effective_execution_mode(self, task_mode: str = "") -> str:
+        """实际平面（V5 P0③ 的唯一读取点）。
+
+        三处回退，顺序固定，都是「读不到就退到更保守的那一个」：
+
+        1. `resolved_execution_mode`：本轮由 `refresh_user_context` 解析出来的事实。
+        2. `execution_mode`：兼容旧路径写入的值（语义已统一为 resolved）。
+        3. `task_mode` / 最终 `foreground`：**还没解析过**时退到前台。
+
+        ━━━ 为什么最后一级退到 `foreground` 而不是「不知道」━━━
+
+        因为本字段的读者是 `_user_presence_verdict`，它要回答的是「用户在用手机时
+        要不要让开」。退到 `foreground` ＝ 「要让开」＝ 保守。
+        退到 `shadow` 会让任务在用户正操作时继续点屏幕——那正是要防的事。
+        （与 `UserContext` 那条「不知道时宁可说用户在操作」同向。）
+        """
+        return (
+            self.resolved_execution_mode
+            or self.execution_mode
+            or task_mode
+            or "foreground"
+        )
+
+    @property
+    def occupies_user_display(self) -> bool:
+        """本任务实际会不会占用用户那块屏（V5 P0③）。"""
+        return self.effective_execution_mode() == "foreground"
 
 
 @dataclass

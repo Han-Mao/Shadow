@@ -57,29 +57,60 @@ logger = logging.getLogger(__name__)
 MAX_PREEMPTION_LATENCY_SECONDS = 2.0
 
 
-# ---- 执行平面（V5 §九）----
+# ---- 执行平面（V5 §九，审查 P0① 修正）----
 #
 # 抢占是**同一个平面内**的仲裁：两个任务都想在 Display 0 上点，才需要分先后。
-# 所以只有 `execution_mode=foreground` 的任务才参与抢占。
+# 影子任务跑在另一块屏幕上，与 Display 0 的用户/任务没有资源冲突——让它去抢占
+# 前台任务（或被前台任务抢占）是**把两个不同平面的任务当成在争同一块屏幕**。
 #
-# 影子任务（`shadow` / `hybrid`）跑在另一块屏幕上，与 Display 0 的用户/任务
-# 没有资源冲突——让它去抢占前台任务（或被前台任务抢占）是**把两个不同平面的
-# 任务当成在争同一块屏幕**，而它们并没有。这正是 §九 的例子：
+# ━━━ 这里曾经有一个真实的并发缺陷（审查 §三）━━━
 #
-#     用户打开微信 → 无需抢占 A → A 继续执行（A 在影子平面）
+# 旧实现按 `task.execution_mode` 判定，把 `SHADOW` 与 `HYBRID` 一起当成影子。
+# 但 `HYBRID` 在影子**不可用**时会回落前台（`resolve_task_plane`）：
 #
-# 注意这与「影子平面当前不可用」是两件事。不可用时由 `ShadowSessionUnavailable`
-# 在 `device/session.py` 处置（`shadow` fail-closed、`hybrid` 降级到前台），
-# 那是**平面可用性**问题，不该在这里用抢占来表达。
+#     A = HYBRID，影子不可用 → 实际 FOREGROUND（打 Display 0）
+#     B = FOREGROUND                        → 打 Display 0
+#
+# 旧代码认为「A 是影子 → 不抢占」，于是两个任务同时往 Display 0 发动作。
+# 判定必须依据**实际平面**，不是任务声明。所以现在一律走
+# `_occupies_user_display()`，它内部用与 Runtime 同一个解析入口。
 SHADOW_MODES = {ExecutionMode.SHADOW.value, ExecutionMode.HYBRID.value}
 
 
+def _occupies_user_display(task: Task, shadow_available: bool | None = None) -> bool:
+    """这个任务**实际**会不会占用用户那块屏（Display 0）。
+
+    影子平面不可用时 `SHADOW`/`HYBRID` 都会回落到 Display 0，因此这里不能用
+    `task.execution_mode` 直接判断——那正是审查 §三 指出的缺陷。
+
+    ━━━ `shadow_available` 为什么默认是 `None` ━━━
+
+    `None` = 「不知道本端有没有影子平面」，`resolve_task_plane` 会把它按
+    **不可用**处置，于是 `HYBRID` 保守地算作**占用 Display 0**。这个方向是对的：
+
+    - 说「占用」而其实在影子 → 多一次不必要的抢占（任务慢一点，可接受）
+    - 说「不占用」而其实在前台 → **两个任务同时点同一块屏**（不可接受）
+
+    调用方（`TaskScheduler._occupies_user_display`）会传一个零 I/O 的缓存快照；
+    本函数本身**不碰设备、不建连接**，因为它是在设备锁内被调用的
+    （`_maybe_preempt_by_id` 持有 `self._cond`），引入 I/O 会把整个队列堵住。
+    """
+    from device.session import resolve_task_plane
+
+    return resolve_task_plane(
+        task.execution_mode, shadow_available=shadow_available, task_id=task.id
+    ).occupies_user_display
+
+
 def _is_shadow(task: Task) -> bool:
-    """任务是否声明了影子平面（V5 §九）。
+    """任务是否**声明**了影子平面（仅用于诊断，**不用于**抢占判定）。
 
     读 `task.execution_mode.value` 而不是直接比枚举：`Task.execution_mode` 是
     **宽松**字段（`LooseExecutionMode`，老记录 / 未知值会降级成 FOREGROUND），
     这里保持与它一致的读法，避免两处判定口径不一致。
+
+    ⚠️ 回答的是「用户要求什么」，不是「实际在哪跑」。抢占一律用
+    `_occupies_user_display()`——用本方法判抢占就是审查 §三 那个并发缺陷。
     """
     return task.execution_mode.value in SHADOW_MODES
 
@@ -157,6 +188,7 @@ class TaskScheduler:
         idle_poll_seconds: float = 0.2,
         event_log: EventLog | None = None,
         lease_store: Any | None = None,
+        shadow_available: Any | None = None,
     ) -> None:
         self._runtime = runtime
         # 向后兼容：老调用方传的是单个 DeviceSession（单设备场景）
@@ -171,6 +203,17 @@ class TaskScheduler:
         # 先 claim，抢不到就不执行——「一个任务同一时刻最多一个执行者」从「单进程内
         # 靠 lane.running」升级为「跨进程靠 SQLite 租约」。
         self._lease_store = lease_store
+        # V5 §九（审查 P0①）：影子平面可用性的**零 I/O 快照来源**。
+        #
+        # 抢占判定在 `self._cond` 内执行，绝不能在里面建连接 / 探测设备。
+        # 所以这里收一个「无参调用、返回 bool | None」的 provider（或直接给
+        # `None`/`True`/`False`），由调用方（`api/server.py`）在装配时注入一个
+        # **读缓存**的实现；未接线时取「未知」，`resolve_task_plane` 会把未知
+        # 按「不可用」保守处置（HYBRID 算作占用 Display 0 → 正常参与抢占）。
+        #
+        # 这个方向是刻意的：说「不占用」而其实在前台 → 两个任务同时点同一块屏，
+        # 后果比「多一次不必要的抢占」严重得多。
+        self._shadow_available = shadow_available
 
         self._lanes: dict[str, _DeviceLane] = {
             device.serial: _DeviceLane(serial=device.serial, session=device)
@@ -202,6 +245,25 @@ class TaskScheduler:
         # V2.5 §八：订阅设备池的「设备可用」事件——设备掉线不再静默改派之后，
         # 这是动态设备池下等待中的任务唯一的自动恢复触发点。
         self._pool.subscribe(self.on_device_available)
+
+    def _shadow_plane_available(self) -> bool | None:
+        """影子平面可用吗（零 I/O，供锁内调用）。
+
+        三态：`True` / `False` / `None`（不知道）。provider 抛异常时按「不知道」
+        处理——抢占判定不能因为一个可选能力的探测失败而崩掉，而「不知道」在
+        `resolve_task_plane` 那里已经等价于保守的「不可用」。
+        """
+        source = self._shadow_available
+        if source is None:
+            return None
+        if callable(source):
+            try:
+                value = source()
+            except Exception as exc:  # noqa: BLE001 —— 可选能力，探测失败不该影响调度
+                logger.debug("读取影子平面可用性失败（按未知处理）：%s", exc)
+                return None
+            return value if isinstance(value, bool) else None
+        return source if isinstance(source, bool) else None
 
     # ---- 设备 ----
 
@@ -734,9 +796,15 @@ class TaskScheduler:
             running = lane.running
             if running is None or running.id == by_task_id:
                 return False
-            # V5 §九：跨平面的抢占不成立。两边都在影子平面 → 各自跑各自的屏幕；
-            # 一边影子一边前台 → 更是两块屏幕，没有争用关系。
-            if _is_shadow(pending) or _is_shadow(running):
+            # V5 §九（审查 P0① 修正）：跨平面的抢占不成立——但这里的「平面」必须是
+            # **实际**平面。`HYBRID` 在影子不可用时会回落前台，此时它与前台任务
+            # 争的正是同一块 Display 0，**必须**照常抢占。
+            # 旧实现按 `task.execution_mode` 判断，把回落的 HYBRID 误当成影子，
+            # 于是两个任务会同时往 Display 0 发动作。
+            shadow_ok = self._shadow_plane_available()
+            if not _occupies_user_display(pending, shadow_ok) or not _occupies_user_display(
+                running, shadow_ok
+            ):
                 logger.debug(
                     "任务 %s 与 %s 不在同一执行平面，不触发抢占",
                     by_task_id,

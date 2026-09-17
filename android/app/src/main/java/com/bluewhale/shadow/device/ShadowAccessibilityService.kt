@@ -96,6 +96,22 @@ class ShadowAccessibilityService : AccessibilityService() {
         private fun beginGestureDispatch(): Unit = dispatchingGesture.set(true)
 
         private fun endGestureDispatch(): Unit = dispatchingGesture.set(false)
+
+        /**
+         * 当前有没有**我们发起**的动作在飞（V5 P1④，审查 §六）。
+         *
+         * 逻辑本体在 [AgentActionScope]（纯 JVM，可被普通 JUnit 覆盖），
+         * 这里只是转发。**为什么转发而不是就地实现**：这段逻辑一旦留在 Service
+         * 里，想在 JVM 上测它就得把整个 `AccessibilityService`（及 android 父类）
+         * 加载起来，而 android.jar 的方法是 `throw RuntimeException("Stub!")`——
+         * 于是它只能靠真机验证，而真机上的失败表现是**静默的行为退化**（任务莫名
+         * 暂停），不是崩溃。
+         */
+        fun isAgentActionInFlight(): Boolean = AgentActionScope.isInFlight()
+
+        /** 见 [AgentActionScope.run]。 */
+        fun <T> agentActionScope(what: String, block: () -> T): T =
+            AgentActionScope.run(what, block)
     }
 
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -283,7 +299,17 @@ class ShadowAccessibilityService : AccessibilityService() {
         val service = requireService()
         // performGlobalAction 的返回值是「有没有受理」，不是「动作生效了没有」。
         // 这一点必须记住：返回 true 只说明系统接下了这次请求。
-        if (!service.performGlobalAction(action)) {
+        //
+        // V5 P1④：包在 Agent 动作作用域里。返回/回桌面会引发
+        // `TYPE_WINDOW_STATE_CHANGED`，不标记就会被记成「用户刚切了页面」。
+        // `performGlobalAction` 本身是同步受理（动作生效是异步的），所以作用域
+        // 只能覆盖「下发」这一段；异步到达的窗口事件由紧随其后的
+        // `launch`/手势作用域或下一轮的探测兜住——**这里不追求 100% 过滤**，
+        // 因为方向是保守的（漏过滤只是多暂停一次，不是点错地方）。
+        val accepted = agentActionScope(what) {
+            service.performGlobalAction(action)
+        }
+        if (!accepted) {
             throw ShadowActionFailed("$what 没有下发成功（performGlobalAction 返回 false）")
         }
     }

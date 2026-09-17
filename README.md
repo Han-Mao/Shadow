@@ -3,6 +3,18 @@
 一个以**长任务执行可靠性**为核心的 Mobile Agent 框架：动作抽象、多设备调度、
 任务状态机、崩溃恢复与执行验证，而不是「LLM → click() → 结束」的一发式脚本。
 
+> **当前版本最准确的定位**（V5）
+>
+> Shadow 面向的目标是「手机 Agent 能在用户正常使用手机的同时后台执行任务」。
+> **到目前为止做到的是**：面向长任务的任务调度、抢占恢复、用户活动感知与执行平面抽象——
+> 用户一碰手机，Agent 会在安全点落检查点并暂停，用户停手后自动恢复，
+> 且**永远不会**和用户在同一个屏幕上抢动作。
+>
+> **还没有做到的是**：真正独立的 Shadow Display，因此第三方 App 的
+> **后台并行执行仍处于架构预留阶段**（不是「已实现」）。现有 Android 权限组合
+> （`AccessibilityService` + `MediaProjection`）造不出一块能独立操作的屏幕，
+> 详见下文〈执行平面〉一节。
+
 ## 架构
 
 ```
@@ -112,10 +124,19 @@ V5 引入了**执行平面**这一层概念：
 
 | 概念 | 回答的问题 |
 |---|---|
-| `ExecutionMode`（`foreground` / `shadow` / `hybrid`） | 这个任务声明跑在哪个平面 |
+| `ExecutionMode`（`foreground` / `shadow` / `hybrid`） | 这个任务**声明**跑在哪个平面 |
+| `TaskPlane` / `resolve_task_plane()` | 这个任务**实际**跑在哪个平面（含降级与原因） |
 | `ExecutionSession` / `ShadowSession` | 这次执行**实际**落在哪块屏幕上 |
+| `ShadowActionRouter` | 这一步动作往哪块屏幕发 |
 | `UserContext` | 用户此刻在不在用手机 |
 | `ExecutionTarget` | 执行到这一步时「该在哪执行」 |
+
+**「声明」与「实际」必须分开**，这是 V5 最要紧的一条。用户提交
+`execution_mode=hybrid` 是**声明**；影子平面不可用时它**实际**会落到前台，
+于是这个任务就必须和别的任务一样去竞争 `Display 0`。把两者混在一起曾导致
+两个任务都以为自己独占屏幕——真机上的表现是两串点击互相打断、且都不报错。
+现在全链路只认一个入口 `resolve_task_plane()`：调度器的抢占判定、Runtime 的
+用户让位判定、Checkpoint 落盘读的都是它，`task.execution_mode` 只作为输入。
 
 **当前能力（诚实清单）**：第一阶段已落地的是「**用户不被打扰**」——
 用户一碰手机，`safe_point()` 就在每个动作前让任务落检查点并暂停（`PAUSED` /
@@ -125,14 +146,17 @@ V5 引入了**执行平面**这一层概念：
 真正的影子平面（Agent 跑在独立虚拟显示上）属于第二阶段，当前**明确不实现**：
 `MediaProjection` 只能捕获显示、`AccessibilityService` 无法在后台启动独立 App 实例，
 所以现有 API 造不出可独立操作的屏幕。`ShadowDisplayManager` 如实返回
-`available=false`（fail-closed），`shadow` 任务会被拒绝而不是悄悄退回用户屏幕。
+`available=false`（fail-closed），`shadow` 任务会被拒绝而不是悄悄退回用户屏幕；
+影子动作路由（`shadow_tap` / `shadow_swipe` / …）**一律抛
+`ShadowActionUnsupported`，绝不回落**——因为「一次静默回落」意味着用户的屏幕上
+被点了一下，且日志里看不出它来自影子任务。
 
 ```bash
 # 提交一个影子平面任务（当前会被如实拒绝——能力未实现）
 curl -X POST localhost:8010/tasks -H 'content-type: application/json' \
   -d '{"instruction":"后台跑个任务","execution_mode":"shadow"}'
 
-# 看一个任务实际跑在哪块屏幕上
+# 看一个任务实际跑在哪块屏幕上（含降级原因）
 curl localhost:8010/tasks/<id> | python -m json.tool | grep -A3 execution
 ```
 

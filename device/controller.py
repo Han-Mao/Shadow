@@ -94,6 +94,28 @@ class DeviceBudgetExhausted(DeviceError):
     """
 
 
+class ShadowActionUnsupported(NotImplementedError):
+    """影子平面**当前无法承载**这个动作（审查 P1⑤）。
+
+    刻意继承 `NotImplementedError` 而不是 `DeviceError`：它的含义是
+    「这个能力本端还没有」，不是「设备出错了」。上层（`executor`）据此走
+    「转人工 / 改前台 / 放弃这一步」的决策，而不是当作故障去重试——
+    重试一个原理上不存在的能力只会白烧预算。
+
+    **与 `ShadowSessionUnavailable` 的区别**（后者在 `device/session.py`）：
+    那个是「整个影子平面没有」，这个是「平面在，但这个**动作**过不去」。
+    分开的理由是处置粒度不同：前者只能等本端实现或改 `execution_mode`，
+    后者可以逐个动作地决定要不要回落前台。
+
+    **放在 `controller.py` 而不是 `session.py`**：它是设备端口契约的一部分
+    （`shadow_*` 系列方法的约定失败类型），而三个后端（protocol 基类、
+    `adb.py`、`android.py`）都要抛它。若定义在 `session.py`，`controller.py`
+    就得反向导入 `session.py`——那会让「协议层」依赖「会话层」，
+    而 `device/session.py` 本身描述的是「任务在哪里运行」，层级反而更高。
+    所以定义在契约层，`session.py` 再 re-export 给路由器的使用者。
+    """
+
+
 def is_read_only(operation: str) -> bool:
     """这次设备操作会不会改变设备状态（V2.7 P1-7）。
 
@@ -238,6 +260,90 @@ class DeviceController(Protocol):
             reason="本后端未声明 supports_user_activity()",
         )
 
+    # ---- 影子平面可用性（V5 P0③ / 审查 §三）----
+    #
+    # 与上面那对方法同一性质：**只有后端知道**本端有没有可交互的独立显示，
+    # 所以问控制器要，而不是在核心或调度器里猜。
+    #
+    # 这个名字特意叫 `_available` 而不是 `supports_shadow()`：
+    # **「支持不支持」是本端的能力，而「现在有没有」是运行期的事实**。
+    # 将来虚拟显示能被创建、也可能被销毁（用户撤销投屏授权），
+    # 那时 `supports_*` 会恒为 True 而本方法变成动态的——语义从一开始就分开，
+    # 免得后期要改所有调用点。
+
+    def shadow_plane_available(self) -> bool | None:
+        """影子执行平面现在可用吗。**三态**：`True` / `False` / `None`（不知道）。
+
+        缺省返回 `None`（不知道），**不是** `False`——虽然 `resolve_task_plane`
+        把两者都按「不可用」保守处置，但保留区别是为了让日志能说清
+        「本端确认做不到」还是「本端没上报这个能力」。
+
+        实现约束：**本方法必须零 I/O、永不抛异常**。它在调度器的设备锁内被调用
+        （`_occupies_user_display`），也在 runtime 的每轮循环里被调用。
+        想知道真实状态的后端应当在别处维护一份缓存快照，这里只读缓存。
+
+        ━━━ 当前的真实现状是 `False`，这是**如实**而不是保守 ━━━
+
+        Android 侧 `ShadowDisplayManager` 探测后恒报不可用：`MediaProjection`
+        只能捕获、`AccessibilityService` 无法后台起独立 App 实例（§六）。
+        于是所有 `SHADOW`/`HYBRID` 任务都会落到前台平面——
+        这正是审查 §三 那个并发缺陷的触发条件（调度器当时以为 hybrid 在影子平面）。
+        """
+        return None
+
+    # ---- 影子平面动作路由（审查 P1⑤）----
+    #
+    # 这一组是「同一个动作、打到另一块显示上」。**刻意用 `shadow_` 前缀的新名字**，
+    # 而不是给既有的 `tap`/`swipe` 加一个 `display_id=` 参数。两个理由：
+    #
+    # 1. **静默回落要变成不可能。** 若给 `tap` 加可选参数，忘了传的调用点会
+    #    静默打到 Display 0 上——正是影子平面唯一要防的事。带前缀的新名字在
+    #    没实现时就是没实现，路由层（`ShadowActionRouter._call`）会抛出来。
+    # 2. **两种后端的实现路径本来就不同。** ADB 后端在原理上做不到（`input tap`
+    #    只有当前显示，见 `device/adb.py`），Android 后端要等桥支持
+    #    display 参数的动作。同名同参会让人以为「只是传个参数的事」。
+    #
+    # **全部不设默认实现、也全部不进 `_REQUIRED_METHODS`**：
+    #   - 不设默认实现 → 「没实现」这件事必须显式表达。若给一个默认返回 `None`
+    #     的软实现，路由层判 `callable()` 会**通过**，然后动作无声消失。
+    #   - 不进必需集合 → 一个后端没有影子平面是可以接受的（ADB 就是），
+    #     不该在装配期判它不可用。
+    #
+    # 所以这一组的判据是「协议里有名字，但 `_REQUIRED_METHODS` 与
+    # `OPTIONAL_PROTOCOL_METHODS` 都不含它」，由 `SHADOW_ACTION_METHODS` 单独列出。
+
+    def shadow_screenshot_bytes(self) -> bytes:
+        """在影子平面截图。做不到就抛（**不要**退回默认显示）。"""
+        raise ShadowActionUnsupported("本后端未实现影子平面截图")
+
+    def shadow_dump_ui(self):
+        """在影子平面取 UI 树。读不到要抛，**不能**返回空树（[80]/[92]）。"""
+        raise ShadowActionUnsupported("本后端未实现影子平面 UI 树")
+
+    def shadow_tap(self, x: int, y: int, *, duration_ms: int = 0) -> None:
+        raise ShadowActionUnsupported("本后端未实现影子平面点击")
+
+    def shadow_long_press(self, x: int, y: int, duration_ms: int = 800) -> None:
+        raise ShadowActionUnsupported("本后端未实现影子平面长按")
+
+    def shadow_swipe(
+        self, x1: int, y1: int, x2: int, y2: int, duration_ms: int = 300
+    ) -> None:
+        raise ShadowActionUnsupported("本后端未实现影子平面滑动")
+
+    def shadow_set_text(self, value: str) -> None:
+        raise ShadowActionUnsupported("本后端未实现影子平面文本输入")
+
+    def shadow_back(self) -> None:
+        raise ShadowActionUnsupported("本后端未实现影子平面返回")
+
+    def shadow_home(self) -> None:
+        raise ShadowActionUnsupported("本后端未实现影子平面回主屏")
+
+    def shadow_launch(self, package: str, activity: str | None = None) -> None:
+        """在影子平面启动 App。P2 的核心难点，当前真机做不到（§六/§十一）。"""
+        raise ShadowActionUnsupported("本后端未实现影子平面启动 App")
+
 
 # 协议要求实现的方法。`assert_implements` 用它做装配期检查。
 _REQUIRED_METHODS: tuple[str, ...] = (
@@ -274,6 +380,37 @@ _REQUIRED_METHODS: tuple[str, ...] = (
 OPTIONAL_PROTOCOL_METHODS: tuple[str, ...] = (
     "supports_user_activity",
     "user_context",
+    "shadow_plane_available",
+)
+
+# 影子平面的动作路由（审查 P1⑤）。这一组**既不是必需也不是可选软能力**，
+# 所以单独列一份：判据是「协议里有名字，实现方可以抛 `NotImplementedError`」。
+#
+# 三个集合的关系，以及为什么必须这么分：
+#
+#   _REQUIRED_METHODS           缺一个 → 装配期报错（后端跑不起来）
+#   OPTIONAL_PROTOCOL_METHODS   有默认实现 → 没实现也能跑（能力信息可缺）
+#   SHADOW_ACTION_METHODS       有默认实现但**默认实现是抛** → 没实现则这条路不可用
+#
+# 第三类的存在理由：影子动作与「用户活动探测」不同，它**不能**有一个
+# 「返回无害缺省值」的软实现——`shadow_tap` 若默默返回 `None`，
+# 动作就无声消失了（调用方以为点过了）。但它的**硬性要求又是局部的**：
+# 一个后端没有影子平面完全可以接受（ADB 就是），不该在装配期判它不可用。
+# 所以「有方法签名 + 默认抛」是唯一同时满足两边的形状。
+#
+# 它同时是 `tests/test_device_port.py` 里那条「协议方法必须归类」检查的第三张白名单，
+# 且带一条额外的断言：这些方法的缺省实现**必须真的会抛**。名字被列进来、
+# 实现却返回 `None` 的话，路由层的 `callable()` 检查会通过——那是静默失效。
+SHADOW_ACTION_METHODS: tuple[str, ...] = (
+    "shadow_screenshot_bytes",
+    "shadow_dump_ui",
+    "shadow_tap",
+    "shadow_long_press",
+    "shadow_swipe",
+    "shadow_set_text",
+    "shadow_back",
+    "shadow_home",
+    "shadow_launch",
 )
 
 

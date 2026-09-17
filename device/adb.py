@@ -24,6 +24,7 @@ from .controller import (
     DeviceError,
     is_read_only,
 )
+from .session import ShadowActionUnsupported
 from .user_activity import DEFAULT_IDLE_THRESHOLD, UserContext
 
 DEFAULT_SERIAL = "emulator-5554"
@@ -31,6 +32,16 @@ REMOTE_UI_DUMP = "/sdcard/window_dump.xml"
 # 校验的是「用户原始输入」：空格允许，% 禁止（% 是 ADB input text 的转义引导符，
 # 放行会让 "100%" 这类输入被设备当成非法转义）
 TYPE_SAFE_PATTERN = re.compile(r"^[a-zA-Z0-9_.@,/?! ]+$")
+
+# `shadow_*` 动作在 ADB 后端上统一的拒绝理由（审查 P1⑤）。
+#
+# 抽成一个常量是为了让**九条拒绝路径说同一句话**：理由只该有一份，
+# 否则很容易出现「三处说了原理、六处只说未实现」，而用户读到的恰好是后者，
+# 于是他会去等一个永远不会到来的更新。
+_ADB_SHADOW_REFUSAL = (
+    "ADB 后端没有影子平面：input tap/swipe/text 与 screencap 都只作用于当前显示"
+    "（Display 0），命令本身没有任何参数能指向另一块屏幕"
+)
 
 # 当前上下文的命令总预算截止时刻（monotonic 秒）。见 `deadline_budget`。
 _DEADLINE: ContextVar[float | None] = ContextVar("adb_deadline", default=None)
@@ -333,6 +344,20 @@ class AdbController:
     def supports_user_activity(self) -> bool:
         return True
 
+    def shadow_plane_available(self) -> bool | None:
+        """ADB 后端**永远**给不出影子平面（V5 P0③）。
+
+        返回 `False` 而不是 `None`（不知道）：这是一个**确定的事实**，不是探测
+        失败。ADB 的全部能力是「往这台手机的一块屏幕上发命令」——`input tap`、
+        `screencap` 都作用在当前显示（默认 Display 0）上，没有任何参数能指向
+        另一块屏幕。所以它不可能承载一个「用户看不见的独立执行平面」。
+
+        说 `False` 的后果对所有 `SHADOW`/`HYBRID` 任务是一样的（都会落到前台），
+        与说 `None` 等价；区别只在日志与 `/health` 里能说清「确定没有」还是
+        「没上报」，排查时这个区别有用。
+        """
+        return False
+
     def user_context(
         self, *, idle_threshold: float = DEFAULT_IDLE_THRESHOLD
     ) -> UserContext:
@@ -444,3 +469,46 @@ class AdbController:
             if low.startswith("mdreaminglockscreen") or low.startswith("mshowinglockscreen"):
                 return "true" in low
         return None
+
+    # ---- 影子平面动作（审查 P1⑤）----
+    #
+    # 这一组在 ADB 后端上**永远不会成功**，而这是如实的结论，不是还没做：
+    #
+    #   `input tap/swipe/text` 与 `screencap` 作用于当前显示（硬件上就是 Display 0），
+    #   命令本身**没有任何参数**能指向另一块屏幕。ADB 的全部能力就是
+    #   「往这台手机的那一块屏幕上发命令」。
+    #
+    # 所以这里显式实现它们并抛 `ShadowActionUnsupported`（而不是靠协议基类的
+    # `NotImplementedError`），差别在**错误信息**：从错误信息里能直接读出
+    # 「ADB 后端原理上做不到，换 Android 后端也一样是另一回事」，
+    # 而不是让人以为「这个后端还没实现，将来会补」。
+    #
+    # 注意它们**不**回落到 `self.tap()`。那正是 `ShadowActionRouter` 花整段注释
+    # 在防的事：一次静默回落，用户的屏幕就被点了，而且日志里看不出是影子任务干的。
+
+    def shadow_screenshot_bytes(self) -> bytes:
+        raise ShadowActionUnsupported(f"{_ADB_SHADOW_REFUSAL}（无法在影子平面截图）")
+
+    def shadow_dump_ui(self):
+        raise ShadowActionUnsupported(f"{_ADB_SHADOW_REFUSAL}（无法读影子平面的 UI 树）")
+
+    def shadow_tap(self, x: int, y: int, *, duration_ms: int = 0) -> None:
+        raise ShadowActionUnsupported(f"{_ADB_SHADOW_REFUSAL}（无法在影子平面点击）")
+
+    def shadow_long_press(self, x: int, y: int, duration_ms: int = 800) -> None:
+        raise ShadowActionUnsupported(f"{_ADB_SHADOW_REFUSAL}（无法在影子平面长按）")
+
+    def shadow_swipe(self, x1: int, y1: int, x2: int, y2: int, duration_ms: int = 300) -> None:
+        raise ShadowActionUnsupported(f"{_ADB_SHADOW_REFUSAL}（无法在影子平面滑动）")
+
+    def shadow_set_text(self, value: str) -> None:
+        raise ShadowActionUnsupported(f"{_ADB_SHADOW_REFUSAL}（无法在影子平面输入文本）")
+
+    def shadow_back(self) -> None:
+        raise ShadowActionUnsupported(f"{_ADB_SHADOW_REFUSAL}（无法在影子平面返回）")
+
+    def shadow_home(self) -> None:
+        raise ShadowActionUnsupported(f"{_ADB_SHADOW_REFUSAL}（无法在影子平面回主屏）")
+
+    def shadow_launch(self, package: str, activity: str | None = None) -> None:
+        raise ShadowActionUnsupported(f"{_ADB_SHADOW_REFUSAL}（无法在影子平面启动应用）")

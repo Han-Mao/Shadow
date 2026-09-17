@@ -300,10 +300,18 @@ class AgentRuntime(
         if not state.user_confirmed or not state.user_active:
             return None
 
-        mode = state.execution_mode or task.execution_mode.value
+        mode = state.effective_execution_mode(task.execution_mode.value)
         if mode != ExecutionMode.FOREGROUND.value:
-            # 影子/混合模式：用户在用 Display 0 与影子平面无关（§九 / §十五）。
+            # 影子模式且**确实**跑在影子平面上：用户在用 Display 0 与它无关
+            # （§九 / §十五），不该因为「用户在操作」而暂停它。
             # 需要用户在场的动作另由风险门禁处置，不在这里拦整条任务。
+            #
+            # ⚠️ V5 P0③（审查 §四）：这里读的必须是 **resolved** 平面。
+            # 旧实现读 `state.execution_mode`，而它被写成 `task.execution_mode`
+            # ——于是 HYBRID 在影子不可用、实际回落到 Display 0 时，这里仍然
+            # 返回 None（不暂停），Agent 就继续往用户正在用的屏幕上点。
+            # `effective_execution_mode()` 在解析不出来时退到 `foreground`，
+            # 也就是「宁可多让一次」的保守侧。
             return None
 
         # 用户在场 → 让开。但**必须**有上界：用户一直在操作时不能无限期地
@@ -453,13 +461,98 @@ class AgentRuntime(
         package = getattr(context, "foreground_package", None)
         if package:
             state.foreground_package = str(package)
-        state.execution_mode = task.execution_mode.value
+        # V5 P0③（审查 §四/§五）：写入**解析后**的平面，不是 `task.execution_mode`。
+        #
+        # 旧实现直接写 `task.execution_mode.value`，于是 HYBRID 在影子不可用、
+        # 实际回落到 Display 0 时，state 里仍然写着 "hybrid"——`_user_presence_verdict`
+        # 据此认为「它是影子、用户操作与它无关」，**继续和用户抢同一块屏**。
+        # 这正是审查 §四 指出的第二个严重问题。
+        self._refresh_execution_plane(task, state, session)
         # V5 §十三：顺手把「这次执行落在哪块屏幕上」也记下来（恢复点要存它）。
         # 从设备侧读而不是从任务声明读——`display_id` 是**实际**用的那块，
         # 而后端已经知道这个事实（ADB 恒为默认显示，Android 侧将来可能是影子显示）。
         display_id = getattr(session.controller, "display_id", None)
         if isinstance(display_id, int) and not isinstance(display_id, bool):
             state.display_id = display_id
+
+    def _refresh_execution_plane(
+        self, task: Task, state: "RuntimeState", session: DeviceSession
+    ) -> None:
+        """把「任务要求的平面」解析成「实际平面」写进 `state`（V5 P0③）。
+
+        ━━━ 与 `ExecutionSession.resolve_plane()` 的分工 ━━━
+
+        `resolve_plane()` 回答的是「**这个动作**落在哪」（会把 `USER_REQUIRED`
+        的动作单独拎出来判前台）；这里回答的是「**这个任务整体**在哪」——
+        用户暂停判定关心的是后者：整条任务会不会占用用户的屏幕。
+
+        影子可用性取自**设备侧的能力**而不是任务声明：`ExecutionSession` 在本
+        路径上还不存在（那是 §八 的会话层，Real 里由调度器持有），而设备控制器
+        已经知道本端有没有影子平面。
+
+        ━━━ 解析失败不抛异常 ━━━
+
+        `SHADOW` 任务在严格路径下会抛 `ShadowSessionUnavailable`——那是
+        `resolve_plane()` 在**执行**路径上的职责（要么做到、要么明确失败）。
+        这里是**观测**路径：拿不到结论就记「保守＝前台」并继续，
+        因为用户暂停判定宁可按「会占用屏幕」处理（代价=多让一次），
+        也不能因为解析不出平面就把任务弄挂。
+        """
+        from device.session import resolve_task_plane
+
+        source = self._shadow_plane_probe(session)
+        try:
+            plane = resolve_task_plane(
+                task.execution_mode,
+                shadow_available=source,
+                task_id=task.id,
+                strict=False,
+            )
+        except Exception as exc:  # noqa: BLE001 —— 观测路径不该弄挂任务
+            logger.debug("解析执行平面失败（按前台保守处理）：%s", exc)
+            state.requested_execution_mode = str(task.execution_mode.value)
+            state.resolved_execution_mode = ExecutionMode.FOREGROUND.value
+            state.execution_mode = ExecutionMode.FOREGROUND.value
+            state.plane_degraded = True
+            state.plane_reason = f"平面解析失败：{exc}"
+            return
+
+        state.requested_execution_mode = plane.requested.value
+        state.resolved_execution_mode = plane.resolved.value
+        # 兼容旧调用点：`execution_mode` 的语义已统一为 resolved（见 _runtime_types）。
+        state.execution_mode = plane.resolved.value
+        state.plane_degraded = plane.degraded
+        state.plane_reason = plane.reason
+        if plane.degraded:
+            # 降级是**用户可感知**的事实（他的 hybrid 其实在前台跑），
+            # 第一次发生时报一次，别每轮刷屏。
+            if not state.plane_degraded_reported:
+                logger.info(
+                    "任务 %s 的执行平面发生降级：%s → %s（%s）",
+                    task.id,
+                    plane.requested.value,
+                    plane.resolved.value,
+                    plane.reason,
+                )
+                state.plane_degraded_reported = True
+
+    def _shadow_plane_probe(self, session: DeviceSession) -> bool | None:
+        """影子平面可用吗（三态）。**不建连接**——只读后端已有的能力位。
+
+        `True` / `False` / `None`（不知道）。之所以能直接说 `True`：设备侧只有在
+        真的握有一个可用影子会话时才会报这个值；当前 Android 实现恒报 `False`
+        （`ShadowDisplayManager` 如实声明做不到），所以实际路径上永远是
+        `False` 或 `None`——两条都会让 `HYBRID` 保守地算作前台。
+        """
+        probe = getattr(session.controller, "shadow_plane_available", None)
+        if not callable(probe):
+            return None
+        try:
+            value = probe()
+        except Exception as exc:  # noqa: BLE001 —— 可选能力，探测失败按未知
+            logger.debug("读取影子平面可用性失败（按未知处理）：%s", exc)
+            return None
+        return value if isinstance(value, bool) else None
 
     def _emit(self, task_id: str, kind: str, **data) -> None:
         """写一条事件。**按 kind 自动分级**（V3.1 P0）。
@@ -538,15 +631,19 @@ class AgentRuntime(
                 "observations": state.observation_count,
                 "model_calls": state.model_call_count,
             },
-            # V5 §十三：把「这个任务实际跑在哪块屏幕上」一起存下来。
+            # V5 §十三（+ P0③ 修正）：把「这个任务实际跑在哪块屏幕上」一起存下来。
             #
-            # 存的是 `state.execution_mode`（**实测**的平面）而不是
+            # 存的是 `state.resolved_execution_mode`（**解析后**的平面）而不是
             # `task.execution_mode`（任务的**声明**）：两者在 hybrid 降级、
             # 影子平面中途不可用时就会分叉，而恢复时要知道的是真相。
-            # `state.execution_mode` 由 `refresh_user_context` 每轮写入；
-            # 还没刷过时留空，`capture` 的默认值 "foreground" 恰好等于
-            # 「V5 之前的老恢复点」的语义。
-            execution_mode=state.execution_mode or ExecutionMode.FOREGROUND.value,
+            # 旧实现存 `state.execution_mode`，而那个字段被写成 task 的声明值——
+            # 于是 hybrid 降级后恢复点里依然写着 "hybrid"，恢复语义错误（审查 §五）。
+            execution_mode=state.effective_execution_mode(task.execution_mode.value),
+            # 用户**要求**的平面也一并留下：恢复出来才知道它本来申请的是什么，
+            # 否则「降级过」这个事实在恢复后就永久消失了。
+            requested_execution_mode=state.requested_execution_mode,
+            plane_degraded=state.plane_degraded,
+            plane_reason=state.plane_reason,
             session_id=state.session_id,
             display_id=state.display_id,
             shadow_state_id=state.shadow_state_id,

@@ -97,7 +97,28 @@ class Checkpoint(BaseModel):
     # 「真的不知道」混起来，而后者在恢复时应当更保守。
 
     execution_mode: str = "foreground"
-    """实际执行时的平面（`ExecutionMode.value`），不是任务声明的那个。"""
+    """**实际**执行时的平面（`ExecutionMode.value`），不是任务声明的那个。
+
+    ⚠️ V5 P0③（审查 §五）：这个语义在修正前**没有兑现**。`capture()` 被传入的
+    是 `state.execution_mode`，而那个字段当时被写成 `task.execution_mode`——
+    于是 hybrid 降级后恢复点里依然写着 `"hybrid"`，恢复时按影子平面去定位
+    一块并不存在的显示。现在写入的是 `state.effective_execution_mode()`
+    （解析后的实际平面），语义与字段名一致。
+    """
+
+    requested_execution_mode: str = ""
+    """用户**要求**的平面（V5 P0③）。
+
+    与 `execution_mode`（实际）成对保存：只留实际的话，「它本来是 hybrid、
+    只是当时降级了」这个事实在恢复后就永久消失了，用户和运维都看不出发生过降级。
+    空串＝V5 P0③ 之前的老恢复点（当时没有这个概念）。
+    """
+
+    plane_degraded: bool = False
+    """记录时是否处于降级状态（实际平面 ≠ 要求平面）。"""
+
+    plane_reason: str = ""
+    """降级原因（人可读），恢复后仍能解释「为什么它当时在前台跑」。"""
 
     session_id: str = ""
     """执行会话 id（`ShadowSession.session_id`）。空串＝没有会话概念（V5 之前）。"""
@@ -133,6 +154,9 @@ class Checkpoint(BaseModel):
         semantic_state: str = "",
         budget_used: dict[str, int] | None = None,
         execution_mode: str = "foreground",
+        requested_execution_mode: str = "",
+        plane_degraded: bool = False,
+        plane_reason: str = "",
         session_id: str = "",
         display_id: int | None = None,
         shadow_state_id: str = "",
@@ -163,6 +187,9 @@ class Checkpoint(BaseModel):
             semantic_state=semantic_state,
             budget_used=dict(budget_used or {}),
             execution_mode=execution_mode,
+            requested_execution_mode=requested_execution_mode,
+            plane_degraded=plane_degraded,
+            plane_reason=plane_reason,
             session_id=session_id,
             display_id=display_id,
             shadow_state_id=shadow_state_id,
@@ -200,6 +227,14 @@ class Checkpoint(BaseModel):
             # 排查时的**第一个问题**（「为什么它点到了我的微信？」），
             # 而它不在 summary 里的话，只能去翻原始记录才能回答。
             "execution_mode": self.execution_mode,
+            "requested_execution_mode": self.requested_execution_mode,
+            "plane_degraded": self.plane_degraded,
+            # `plane_reason` 与 `plane_degraded` 必须**成对**出现（V5 P0③）：
+            # 只报「降级了」而不报「为什么降级」，用户知道任务没在后台跑，
+            # 却不知道该去开什么。这两个字段的关系就是
+            # `UserContext.active` 与 `UserContext.reason` 的关系——
+            # 结论与依据分开，只看结论会把排查方向带偏。
+            "plane_reason": self.plane_reason,
             "session_id": self.session_id,
             "display_id": self.display_id,
             "created_at": self.created_at.isoformat(),

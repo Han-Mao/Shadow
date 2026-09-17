@@ -98,6 +98,16 @@ object UserActivityMonitor {
      * 的代价是任务暂停几秒；误判成「用户不在」的代价是手势打到用户脸上。
      */
     private fun isUserDriven(event: AccessibilityEvent): Boolean {
+        // V5 P1④（审查 §六）：Agent 动作在飞时，这一批事件都是我们自己造成的。
+        //
+        // 这里检查的是**作用域**（`isAgentActionInFlight`）而不仅仅是手势标记：
+        // `launch(package)` 并不发手势，却会引发 `TYPE_WINDOW_STATE_CHANGED`；
+        // 只挡手势的话，Agent 启动应用后就会把自己判成「用户刚操作过」并暂停。
+        //
+        // 注意这只在**动作执行的那一小段窗口内**生效（`agentActionScope` 的
+        // try/finally 之间）。用户此刻真的碰屏幕，那时事件早已落在窗口之外
+        // （或手势来源是我们自己，见下），会被正常记成用户操作——这正是我们要的。
+        if (ShadowAccessibilityService.isAgentActionInFlight()) return false
         if (ShadowAccessibilityService.isDispatchingGesture()) return false
         return when (event.eventType) {
             AccessibilityEvent.TYPE_VIEW_CLICKED,
@@ -110,6 +120,10 @@ object UserActivityMonitor {
             -> true
             // 窗口切换：可能是用户切的，也可能是 Agent 的 `launch` 触发的。
             // 归到「用户」这一侧是保守的（宁可多暂停）。
+            //
+            // ⚠️ P1④：正因为归到了「用户」这一侧，Agent 自己的 `launch` 必须由
+            // 上面的作用域标记挡掉，否则会形成「Agent 启动应用 → 以为自己被打扰
+            // → 暂停自己」的死循环。
             AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> true
             else -> false
         }

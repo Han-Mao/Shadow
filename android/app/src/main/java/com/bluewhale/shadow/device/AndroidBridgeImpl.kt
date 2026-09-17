@@ -154,6 +154,14 @@ class AndroidBridgeImpl(private val context: Context) {
 
     /** 启动应用。`activity` 为空时按包名启动主界面（与 ADB 侧语义一致）。 */
     fun launch(package_: String, activity: String?) {
-        AppLauncher.launch(context, package_, activity)
+        // V5 P1④（审查 §六）：包在 Agent 动作作用域里。
+        //
+        // `launch` 会引发 `TYPE_WINDOW_STATE_CHANGED`，而那个事件被
+        // `UserActivityMonitor` 归到「用户」一侧（保守取值）。不标记的话，
+        // Agent 启动应用 → 下一轮 runtime 看到「用户刚操作过」→ **暂停自己**。
+        // 手势那条老路已由 `dispatchingGesture` 挡住，这里是同一个循环的第二个入口。
+        ShadowAccessibilityService.agentActionScope("launch") {
+            AppLauncher.launch(context, package_, activity)
+        }
     }
 }

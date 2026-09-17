@@ -47,7 +47,29 @@ from _toolchain import (  # noqa: E402 - 同目录的兄弟模块
 
 WORK = REPO / "artifacts/kotlin_verify"  # artifacts/ 在 .gitignore 内
 
-TEST_CLASS = "com.bluewhale.shadow.device.UiTreeSerializerTest"
+
+def discover_test_classes(out_dir: Path) -> list[str]:
+    """从编译产物里**找出**所有 JUnit 测试类。
+
+    ─── 为什么是发现而不是写死 ───
+
+    这里原本硬编码了一个类名。加了第二个测试类之后，它会**静默不被运行**——
+    编译照样通过、`OK (10 tests)` 照样打印，看起来一切正常，实际新用例一次没跑过。
+    这类「测试数目虚少」的坑在本项目已经踩过一次（见 CONVENTIONS 里
+    「`cat >> 文件 << 'EOF'` 会被执行两次」那条），所以改成扫目录。
+
+    判据：类名以 `Test` 结尾且不是内部类（`$` 在名字里）。这个约定与
+    Gradle 的默认扫描规则不同（它扫全部），但对本工程够用且**更严**——
+    叫 `FooTest` 才会被跑，不会误跑工具类。
+    """
+    found = []
+    for path in sorted(out_dir.rglob("*Test.class")):
+        rel = path.relative_to(out_dir).with_suffix("")
+        name = ".".join(rel.parts)
+        if "$" in name:
+            continue
+        found.append(name)
+    return found
 
 
 def gen_stubs() -> Path:
@@ -142,11 +164,31 @@ def compile_sources(java: str, stubs: Path, out_dir: Path) -> bool:
 def run_unit_tests(java: str, out_dir: Path) -> bool:
     # golden 文件要从 classpath 根找得到（Gradle 里是 src/test/resources 的默认行为）
     shutil.copyfile(APP / "src/test/resources/golden_ui_tree.xml", out_dir / "golden_ui_tree.xml")
-    classpath = ";".join(str(p) for p in (out_dir, STDLIB_JAR, JUNIT_JAR, HAMCREST_JAR))
-    proc = run_java(java, ["-cp", classpath, "org.junit.runner.JUnitCore", TEST_CLASS])
-    print("   ", "\n    ".join(line for line in (proc.stdout + proc.stderr).splitlines() if line.strip()))
-    # JUnitCore 成功时会打 `OK (N tests)`；有失败则打 `FAILURES!!!` 且返回码非 0
-    return proc.returncode == 0 and "OK (" in proc.stdout
+    classes = discover_test_classes(out_dir)
+    if not classes:
+        print("    没发现任何 *Test 类（编译是过了，但没有测试被运行）")
+        return False
+    # `ANDROID_JAR` 必须进**运行期** classpath，与编译期同理。
+    #
+    # 少了它的症状很隐蔽：编译过得好好的，一跑测试就是
+    # `NoClassDefFoundError: android/accessibilityservice/AccessibilityService`
+    # ——而那个类只是被测类的**父类**，测试代码一行都没碰它。
+    # JVM 加载子类时要解析父类，于是整个测试类都起不来。
+    #
+    # 注意 android.jar 里的方法体是 `throw new RuntimeException("Stub!")`，
+    # 所以**只依赖它是安全的**，真去调 android API 仍会炸。这也是
+    # `AgentActionScope` 被拆成独立纯 JVM 类的原因。
+    classpath = ";".join(
+        str(p) for p in (out_dir, STDLIB_JAR, JUNIT_JAR, HAMCREST_JAR, ANDROID_JAR)
+    )
+    for name in classes:
+        print(f"    → {name}")
+        proc = run_java(java, ["-cp", classpath, "org.junit.runner.JUnitCore", name])
+        print("   ", "\n    ".join(line for line in (proc.stdout + proc.stderr).splitlines() if line.strip()))
+        # JUnitCore 成功时会打 `OK (N tests)`；有失败则打 `FAILURES!!!` 且返回码非 0
+        if not (proc.returncode == 0 and "OK (" in proc.stdout):
+            return False
+    return True
 
 
 def main() -> int:

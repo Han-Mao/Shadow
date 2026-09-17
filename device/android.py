@@ -61,7 +61,7 @@ import time
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
-from typing import Callable, Iterator, Protocol, runtime_checkable
+from typing import Any, Callable, Iterator, Protocol, runtime_checkable
 
 from .controller import (
     DeviceBudgetExhausted,
@@ -69,6 +69,7 @@ from .controller import (
     assert_implements,
     is_read_only,
 )
+from .session import ShadowActionUnsupported
 from .user_activity import DEFAULT_IDLE_THRESHOLD, UserContext
 
 logger = logging.getLogger(__name__)
@@ -592,6 +593,28 @@ class AndroidDeviceController:
         """
         return callable(getattr(self._bridge, "user_activity", None))
 
+    def shadow_plane_available(self) -> bool | None:
+        """桥那边有没有可用的影子平面（V5 P0③）。
+
+        判据同样是**桥有没有这个方法**：老版本 APK 的桥不带 `shadow_session`，
+        那时返回 `None`（不知道）——因为「桥没实现」与「桥实现了但创建不出独立
+        显示」是两件事，日志上要能分开。
+
+        新桥会真的调一次 `ShadowDisplayManager`，当前实现恒报 `available=false`：
+        `MediaProjection` 只能捕获、`AccessibilityService` 无法后台起独立 App
+        实例（§六）。所以这里的 `False` 是**如实**的现状，不是保守取值。
+
+        **零 I/O**：读的是桥的**本地**能力位/缓存，不发 HTTP。
+        真去创建虚拟显示是很重的操作，不能放在抢占判定（设备锁内）的路径上。
+        """
+        probe = getattr(self._bridge, "shadow_session", None)
+        if not callable(probe):
+            return None
+        cached = getattr(self._bridge, "shadow_available", None)
+        if isinstance(cached, bool):
+            return cached
+        return False
+
     def user_context(
         self, *, idle_threshold: float = DEFAULT_IDLE_THRESHOLD
     ) -> UserContext:
@@ -653,6 +676,85 @@ class AndroidDeviceController:
             release(str(session_id))
         except Exception as exc:  # noqa: BLE001 —— 清理失败不该升级成任务失败
             logger.warning("释放影子会话 %s 失败：%s", session_id, exc)
+
+    # ---- 影子平面动作（审查 P1⑤）----
+    #
+    # 这一组转发给桥的 `shadow_*` 方法，**并且绝不回落到不带前缀的同名方法**。
+    #
+    # 三条硬规矩，每条都对应一种具体的失败形状：
+    #
+    # 1. **桥缺 `shadow_*` → 抛 `ShadowActionUnsupported`，不回落 `self.tap()`。**
+    #    眼下真机上桥还没有这些方法（§六：造不出独立显示），所以这里全部会抛。
+    #    那是如实的：影子动作失败会被记账、会出现在 `/executions` 里；
+    #    而回落成 `self._bridge.tap(...)` 是**静默地**点在用户正看的屏幕上，
+    #    日志上还看不出它来自影子任务——本能力唯一要防的事。
+    #
+    # 2. **桥的 `shadow_*` 抛异常 → 原样透出，不吞成「成功」。**
+    #    这条与 `shadow_release` 的「失败不抛」**刻意相反**，因为两者性质不同：
+    #    释放是清理（失败了任务照样算成功），动作是效果（失败了这一步就没做成）。
+    #    把动作异常吞掉，会让 verifier 拿到一个「已执行」的假象。
+    #
+    # 3. **不给 display_id 参数。** 显示绑定在**会话**上（`shadow_session()` 时确定），
+    #    不是每个动作各带一个。让动作自己传 display id，就会出现
+    #    「会话绑在 display 7、这个动作传了 display 0」这种自相矛盾的组合，
+    #    而那正好等于把动作打到用户屏幕上。
+
+    def shadow_screenshot_bytes(self) -> bytes:
+        result = self._shadow_action("screenshot_bytes", "shadow_screenshot_bytes")
+        if not isinstance(result, (bytes, bytearray)):
+            raise ShadowActionUnsupported(
+                f"影子平面截图返回了意外类型 {type(result).__name__}（期望 bytes）"
+            )
+        return bytes(result)
+
+    def shadow_dump_ui(self) -> str:
+        """影子平面的 UI 树。
+
+        **读不到要抛**（[80]/[92]）：这里把「空结果」判成错误而不是返回空串，
+        因为空串在观察层会被解读成「这块屏幕是空的」——而真相往往是
+        「桥不认这个 display」。两者的处置完全不同（前者是等，后者是修）。
+        """
+        result = self._shadow_action("dump_ui", "shadow_dump_ui")
+        if not isinstance(result, str) or not result.strip():
+            raise ShadowActionUnsupported(
+                "影子平面 UI 树为空：读不到 ≠ 屏幕是空的，请检查桥是否支持 display 参数"
+            )
+        return result
+
+    def shadow_tap(self, x: int, y: int, *, duration_ms: int = 0) -> None:
+        self._shadow_action("tap", "shadow_tap", int(x), int(y), int(duration_ms))
+
+    def shadow_long_press(self, x: int, y: int, duration_ms: int = 800) -> None:
+        self._shadow_action("long_press", "shadow_long_press", int(x), int(y), int(duration_ms))
+
+    def shadow_swipe(self, x1: int, y1: int, x2: int, y2: int, duration_ms: int = 300) -> None:
+        self._shadow_action(
+            "swipe", "shadow_swipe", int(x1), int(y1), int(x2), int(y2), int(duration_ms)
+        )
+
+    def shadow_set_text(self, value: str) -> None:
+        self._shadow_action("set_text", "shadow_set_text", str(value))
+
+    def shadow_back(self) -> None:
+        self._shadow_action("back", "shadow_back")
+
+    def shadow_home(self) -> None:
+        self._shadow_action("home", "shadow_home")
+
+    def shadow_launch(self, package: str, activity: str | None = None) -> None:
+        """在影子平面启动应用。P2 的核心难点（§十一），真机上当前做不到。"""
+        self._shadow_action("launch", "shadow_launch", str(package), activity)
+
+    def _shadow_action(self, action: str, bridge_method: str, *args) -> Any:
+        """调用桥上的影子动作；任何「调不了」都抛，不回落、不吞异常。"""
+        method = getattr(self._bridge, bridge_method, None)
+        if not callable(method):
+            raise ShadowActionUnsupported(
+                f"影子动作 {action} 不可用：当前 Android 桥没有实现 {bridge_method}()。"
+                "本端尚未实现「往独立显示发动作」（见 device/session.py 的 ShadowSession 说明），"
+                "绝不回落到 Display 0"
+            )
+        return method(*args)
 
     # ---- Act ----
 
