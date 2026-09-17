@@ -8,6 +8,9 @@
     FOREGROUND_SERVICE                端点必须常驻——被系统回收的话，正在跑的任务
                                       会突然发现设备消失（DEVICE_UNAVAILABLE）
     FOREGROUND_SERVICE_DATA_SYNC      前台服务的类型声明（Android 10+ 必需）
+    FOREGROUND_SERVICE_MEDIA_PROJECTION
+                                      同一件事，但专给投屏。**Android 14+ 调用
+                                      getMediaProjection 的硬性前提**，见下面那段
     POST_NOTIFICATIONS                前台服务的通知（Android 13+ 必需，
                                       没有它服务仍能跑，但用户看不到「正在被控制」）
     QUERY_ALL_PACKAGES                按包名启动应用（方案文档 §6）。
@@ -18,6 +21,21 @@
   刻意**不申请**的权限：
     - 不申请 SYSTEM_ALERT_WINDOW / 不申请 root。整个设备层只走公开的
       AccessibilityService + MediaProjection，与方案文档 §3/§4 一致。
+
+  ━━━ 为什么投屏非要有自己的前台服务类型（2026-09-16 在真机上踩到）━━━
+
+  targetSdk ≥ 34 时，Android 14 要求：**调用 `getMediaProjection()` 之前，
+  必须已经有一个 `mediaProjection` 类型的前台服务在运行**，否则抛 `SecurityException`。
+  这是硬检查、不是文档里的软建议。少了它的表现是：
+
+      用户在系统弹窗里点了「立即开始」→ 应用回一句「建立屏幕捕获失败」
+
+  而这条链路上没有任何一处报出真正的原因——不写在注释里，下一个人只会
+  反复去试那个系统弹窗。
+
+  所以 `DeviceEndpointService` 同时声明 `dataSync|mediaProjection` 两种类型：
+  端点常驻用前者，建立投屏时用后者。两件事由同一个服务承担是有意的，因为它们
+  本来就必须同生共死——服务一停投屏也得停，否则状态栏会一直挂着「正在录制」。
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
@@ -26,6 +44,7 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission
         android:name="android.permission.QUERY_ALL_PACKAGES"
@@ -41,6 +60,7 @@
 
     <application
         android:allowBackup="false"
+        android:icon="@drawable/ic_launcher"
         android:label="@string/app_name"
         android:supportsRtl="true"
         android:theme="@style/ShadowTheme">
@@ -75,12 +95,15 @@
         </service>
 
         <!--
-          设备端点（前台服务）。exported="false"：它不该被外部应用启动，
+          设备端点 + 投屏（前台服务）。exported="false"：它不该被外部应用启动，
           只能由 MainActivity 拉起。
+
+          两种类型缺一不可：`dataSync` 给常驻的 HTTP 端点，`mediaProjection`
+          给投屏——后者是 Android 14+ 调 `getMediaProjection()` 的前提（见文件顶部）。
         -->
         <service
             android:name=".endpoint.DeviceEndpointService"
             android:exported="false"
-            android:foregroundServiceType="dataSync" />
+            android:foregroundServiceType="dataSync|mediaProjection" />
     </application>
 </manifest>

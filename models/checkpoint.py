@@ -80,6 +80,40 @@ class Checkpoint(BaseModel):
     # 已消耗预算快照（V2.1 §二十一）：恢复后才知道还剩多少动作 / 观察 / 模型调用。
     budget_used: dict[str, int] = Field(default_factory=dict)
 
+    # ---- 执行平面上下文（V5 §十三）----
+    #
+    # §十三 要求恢复点带上「这个任务当时跑在**哪块屏幕上**」。加这四个字段的理由
+    # 不是「多存点信息总没坏处」，而是**恢复时无法从别处推出来**：
+    #
+    #   `Task.execution_mode` 是任务的**声明**（「我希望跑在影子平面」），
+    #   而恢复点要回答的是「**我上次实际在哪跑的**」。两者在正常情况下一致，
+    #   在 hybrid 降级、影子平面中途不可用、用户改了模式之后就会分叉——
+    #   而恰恰是那些情况下的恢复最需要知道真相：如果上次跑在用户那块屏幕上，
+    #   恢复时按「影子平面」去定位页面，就会对着一块空的显示找东西。
+    #
+    # 默认值全部取「前台 / 未指定」，因为这正是 V5 之前所有恢复点的真实情况：
+    # 老记录反序列化后得到的就是这个组合，语义恰好等于「当时没有平面概念，
+    # 就是那块默认屏幕」。**不能用 None 表示「不知道」**——那会让老记录和
+    # 「真的不知道」混起来，而后者在恢复时应当更保守。
+
+    execution_mode: str = "foreground"
+    """实际执行时的平面（`ExecutionMode.value`），不是任务声明的那个。"""
+
+    session_id: str = ""
+    """执行会话 id（`ShadowSession.session_id`）。空串＝没有会话概念（V5 之前）。"""
+
+    display_id: int | None = None
+    """实际使用的 display id。`None` ＝当时没有记录。"""
+
+    shadow_state_id: str = ""
+    """影子平面上的状态标识（§十三）。
+
+    留空是诚实的现状：真正的影子平面（§十五 第二阶段）尚未实现，
+    所以现在**没有**这个东西可记。这个字段先占位，是为了让恢复逻辑写成
+    「有就用、没有就按单平面处置」，而不是等实现时再回来加一个字段——
+    那时所有既存恢复点又都要靠默认值兜底一次。
+    """
+
     created_at: datetime = Field(default_factory=datetime.now)
 
     @classmethod
@@ -98,6 +132,10 @@ class Checkpoint(BaseModel):
         action_attempt_id: str | None = None,
         semantic_state: str = "",
         budget_used: dict[str, int] | None = None,
+        execution_mode: str = "foreground",
+        session_id: str = "",
+        display_id: int | None = None,
+        shadow_state_id: str = "",
     ) -> "Checkpoint":
         """从一次观察中提取恢复所需的最小状态。"""
         snapshot = None
@@ -124,6 +162,10 @@ class Checkpoint(BaseModel):
             screen_fingerprint=fingerprint,
             semantic_state=semantic_state,
             budget_used=dict(budget_used or {}),
+            execution_mode=execution_mode,
+            session_id=session_id,
+            display_id=display_id,
+            shadow_state_id=shadow_state_id,
         )
 
     def same_screen_as(self, observation: Observation) -> bool:
@@ -154,5 +196,11 @@ class Checkpoint(BaseModel):
             "action_effect": self.action_effect.value,
             "screen_fingerprint": self.screen_fingerprint[:12],
             "budget_used": dict(self.budget_used),
+            # V5 §十三：执行平面也要能被查出来。「任务跑在哪块屏幕上」是个
+            # 排查时的**第一个问题**（「为什么它点到了我的微信？」），
+            # 而它不在 summary 里的话，只能去翻原始记录才能回答。
+            "execution_mode": self.execution_mode,
+            "session_id": self.session_id,
+            "display_id": self.display_id,
             "created_at": self.created_at.isoformat(),
         }

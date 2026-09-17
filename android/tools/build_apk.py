@@ -58,7 +58,12 @@ from _toolchain import (  # noqa: E402 - 同目录的兄弟模块
 
 WORK = REPO / "artifacts/android_apk"  # artifacts/ 在 .gitignore 内
 OUT_APK = APP / "build/outputs/apk/debug/app-debug.apk"
-KEYSTORE = WORK / "debug.keystore"
+# 调试密钥**不能**放 `WORK` 里：`main()` 开头会 `rmtree(WORK)`，那样每次构建都生成
+# 一把新密钥、签名随之改变，于是 `adb install -r` 必然撞上
+# `INSTALL_FAILED_UPDATE_INCOMPATIBLE`，只能先卸载再装（2026-09-16 真机踩到）。
+# 用 AGP 的惯例位置 `~/.android/debug.keystore`：跨构建稳定，且与
+# `./gradlew assembleDebug` 共用同一把密钥 —— 两条构建路径产出的包可以互相覆盖安装。
+KEYSTORE = Path.home() / ".android" / "debug.keystore"
 KEY_ALIAS = "androiddebugkey"
 KEY_PASS = "android"
 
@@ -246,6 +251,17 @@ def dex(java: str, *class_dirs: Path) -> Path:
     传的是**显式列出的 `.class` 文件**，不是目录：kotlinc 会在输出目录里放一个
     `META-INF/main.kotlin_module`，而 D8 遇到目录时会连带扫到它并报
     `Unsupported source file type` ——一个和真正原因毫无关系的错误信息。
+
+    **还要把 `kotlin-stdlib.jar` 一起 dex。** Kotlin 编出来的字节码会调用
+    `kotlin.jvm.internal.Intrinsics` 这一类**不在源码里**的类（空值检查、默认参数、
+    数据类的 `equals` 等都由它实现），它们来自标准库。编译期靠 `-classpath` 能找到，
+    但**运行期**必须真的在 dex 里，否则一启动就是：
+
+        java.lang.NoClassDefFoundError: Failed resolution of: Lkotlin/jvm/internal/Intrinsics;
+
+    AGP 由 `kotlin-stdlib` 依赖自动完成这一步，手写链路必须显式做。这个坑的代价很高
+    ——漏了它，包能打、能签名、能安装，`verify_contents` 那套静态校验也会全过
+    （它查的是「项目自己的类在不在」），**只有真机点开图标的那一刻才崩**。
     """
     out = WORK / "dex"
     out.mkdir(parents=True, exist_ok=True)
@@ -261,6 +277,10 @@ def dex(java: str, *class_dirs: Path) -> Path:
             "--lib", str(ANDROID_JAR),
             "--output", str(out),
             *[str(p) for p in classes],
+            # 运行时库：d8 接受 jar，会把它里面的 class 一并收进 classes.dex。
+            # 源码目前没有用 kotlinx.coroutines（只用了一次 kotlin.concurrent.thread，
+            # 那是 stdlib 里的），所以只需要 stdlib 这一份。
+            str(STDLIB_JAR),
         ],
     )
     if proc.returncode != 0:
@@ -292,13 +312,16 @@ def zipalign(zipalign_bin: Path, unsigned: Path) -> Path:
 
 
 def ensure_keystore(keytool: str) -> Path:
-    """调试签名用的 keystore。
+    """调试签名用的 keystore —— 位置与理由见 `KEYSTORE` 处的注释。
 
     固定口令 + 固定别名是 Android 工具链的既有约定（`~/.android/debug.keystore` 就是
-    `android`/`androiddebugkey`/`android`）。放在 `artifacts/` 里而不是用户目录：
-    它只是**调试**密钥，跟着这个仓库走最省事，也绝不会被误当成发布密钥
-    （`artifacts/` 在 .gitignore 内，签不进去）。
+    `android` / `androiddebugkey` / `android`），所以机器上已有 Android Studio 生成的那一份时
+    **直接复用**，两条构建路径产出的包可以互相覆盖安装。
+
+    它只是**调试**密钥：不在工作区内、签不进仓库，也不会被误当成发布密钥。
     """
+    # `~/.android/` 在新机器上不一定存在（旧位置 WORK 是 main() 里建好的）。
+    KEYSTORE.parent.mkdir(parents=True, exist_ok=True)
     if KEYSTORE.exists():
         return KEYSTORE
     proc = run(
@@ -357,13 +380,15 @@ def verify_signature(java: str, apk: Path) -> None:
 def verify_contents(aapt2: Path, apk: Path, manifest_text: str, package: str) -> None:
     """逐条核对「包该有的东西都在」——这是没有真机时能达到的最强验证。
 
-    查五样：
+    查六样：
     ① `dexdump` 能解析 `classes.dex`（容器没坏、能读出 class 数）；
     ② 清单里的每个组件类都在 dex 里（`ClassNotFoundException` 的替身）；
     ③ 三个**不在清单里但少了就是废包**的类也在（桥、端点、序列化器）；
-    ④ `resources.arsc` 与辅助功能配置 XML 在（少了前者启动就崩；少了后者
+    ④ `kotlin.jvm.internal.Intrinsics` 在 dex 里，即 kotlin-stdlib 真的被收进来了
+       ——编译期有 `-classpath` 就够，**运行期必须物理存在**（见 `dex()`）；
+    ⑤ `resources.arsc` 与辅助功能配置 XML 在（少了前者启动就崩；少了后者
        `resource-id` 全空 → 风险判定会**静默变松**）；
-    ⑤ badging 里的包名/版本/权限与源码一致。
+    ⑥ badging 里的包名/版本/权限与源码一致。
     """
     with zipfile.ZipFile(apk) as zf:
         entries = set(zf.namelist())
@@ -395,6 +420,19 @@ def verify_contents(aapt2: Path, apk: Path, manifest_text: str, package: str) ->
         if descriptor.encode() not in dex:
             missing.append(name)
     assert not missing, f"这些类不在 dex 里：{missing}"
+
+    # 第 ④ 条：Kotlin 运行时库。见 `dex()` 的 docstring —— 「编译期能找到」不等于
+    # 「打进了 dex」。漏了它时，上面每一条检查都会通过、包也能正常安装，**只有真机
+    # 点开图标的那一刻才崩**（2026-09-16 在 vivo V2352A / Android 16 上踩到）。
+    # 查具体类名而不是「有没有 Lkotlin/ 前缀」：Intrinsics 是每个 Kotlin 文件都会调的，
+    # 它缺席就一定是标准库没进来，报错信息也能直接指向修法。
+    assert b"Lkotlin/jvm/internal/Intrinsics;" in dex, (
+        "dex 里没有 kotlin.jvm.internal.Intrinsics —— kotlin-stdlib 没被 d8 收进去。\n"
+        "  症状：包能打、能签名、能安装，静态检查全过，真机一点开图标就崩：\n"
+        "    NoClassDefFoundError: Failed resolution of: Lkotlin/jvm/internal/Intrinsics;\n"
+        "  修法：`dex()` 里把 STDLIB_JAR 作为 d8 的输入之一"
+        "（AGP 由 kotlin-stdlib 依赖自动完成这一步）。"
+    )
 
     badging = run(str(aapt2), ["dump", "badging", str(apk)])
     text = badging.stdout

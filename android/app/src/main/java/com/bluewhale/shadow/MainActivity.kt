@@ -94,12 +94,14 @@ class MainActivity : Activity() {
             toast("没有授权屏幕捕获——没有它 Shadow 看不到屏幕，只能执行动作")
             return
         }
-        try {
-            ScreenCapture.start(this, resultCode, data)
-        } catch (exc: Exception) {
-            toast("建立屏幕捕获失败：${exc.message}")
-        }
-        refresh()
+        // 交给服务去建立：Android 14+ 要求 `getMediaProjection()` 之前已经有
+        // `mediaProjection` 类型的前台服务在运行，而「进入前台」这件事只有服务
+        // 自己能做到（见 `DeviceEndpointService.handleProjection`）。
+        // 在这里直接调 `ScreenCapture.start()` 会抛 SecurityException ——
+        // 现象就是应用回一句「建立屏幕捕获失败」，而链路上没人说得出原因。
+        DeviceEndpointService.startProjection(this, resultCode, data)
+        // 服务是「先 startForeground 再建立投屏」，比同步调用慢一步，所以延后刷新。
+        toggleButton.postDelayed({ refresh() }, 800)
     }
 
     private fun requestNotificationPermissionIfNeeded() {

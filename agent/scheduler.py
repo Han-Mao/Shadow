@@ -31,6 +31,7 @@ from typing import Any, Protocol
 from device.pool import DevicePool
 from device.session import DeviceSession
 from models.exceptions import DeviceUnavailableError, PersistenceError
+from models.execution_mode import ExecutionMode
 from models.task import (
     PAUSED_BY_PREEMPTION,
     PAUSED_BY_USER,
@@ -54,6 +55,33 @@ logger = logging.getLogger(__name__)
 #      给安全点间隔一个可论证的上界（从「6 条命令各自超时累加」降到「预算 + 1 条」）
 #   2. 本条阈值（2s）——超过就 warning，让「高优任务被长命令堵住」能被看见
 MAX_PREEMPTION_LATENCY_SECONDS = 2.0
+
+
+# ---- 执行平面（V5 §九）----
+#
+# 抢占是**同一个平面内**的仲裁：两个任务都想在 Display 0 上点，才需要分先后。
+# 所以只有 `execution_mode=foreground` 的任务才参与抢占。
+#
+# 影子任务（`shadow` / `hybrid`）跑在另一块屏幕上，与 Display 0 的用户/任务
+# 没有资源冲突——让它去抢占前台任务（或被前台任务抢占）是**把两个不同平面的
+# 任务当成在争同一块屏幕**，而它们并没有。这正是 §九 的例子：
+#
+#     用户打开微信 → 无需抢占 A → A 继续执行（A 在影子平面）
+#
+# 注意这与「影子平面当前不可用」是两件事。不可用时由 `ShadowSessionUnavailable`
+# 在 `device/session.py` 处置（`shadow` fail-closed、`hybrid` 降级到前台），
+# 那是**平面可用性**问题，不该在这里用抢占来表达。
+SHADOW_MODES = {ExecutionMode.SHADOW.value, ExecutionMode.HYBRID.value}
+
+
+def _is_shadow(task: Task) -> bool:
+    """任务是否声明了影子平面（V5 §九）。
+
+    读 `task.execution_mode.value` 而不是直接比枚举：`Task.execution_mode` 是
+    **宽松**字段（`LooseExecutionMode`，老记录 / 未知值会降级成 FOREGROUND），
+    这里保持与它一致的读法，避免两处判定口径不一致。
+    """
+    return task.execution_mode.value in SHADOW_MODES
 
 
 class RuntimeLike(Protocol):
@@ -706,6 +734,15 @@ class TaskScheduler:
             running = lane.running
             if running is None or running.id == by_task_id:
                 return False
+            # V5 §九：跨平面的抢占不成立。两边都在影子平面 → 各自跑各自的屏幕；
+            # 一边影子一边前台 → 更是两块屏幕，没有争用关系。
+            if _is_shadow(pending) or _is_shadow(running):
+                logger.debug(
+                    "任务 %s 与 %s 不在同一执行平面，不触发抢占",
+                    by_task_id,
+                    running.id,
+                )
+                return False
             interruptible = running.interruptible
             running_priority = running.priority
             running_id = running.id
@@ -1053,6 +1090,19 @@ class TaskScheduler:
                 lane.suspended.append(task)
             self._record_preemption_latency(task.id)
             logger.info("任务 %s 已挂起（让出设备 %s），等待恢复", task.id, lane.serial)
+        elif name == "suspended_by_user":
+            # V5 §十四：**因为用户正在用手机**而主动让开。
+            #
+            # 与上面的抢占挂起刻意分开处理：这里的「让位」不是设备争用的结果，
+            # 而是人的存在本身。所以：
+            #   - **不进 `_suspended` 队列**：那条队列的恢复由「设备空出来」驱动，
+            #     而这里要等的是「用户停手 + 页面还是那一屏」。放进去会让调度器
+            #     一有空设备就立刻把任务捞起来重跑，下一轮又撞上用户 → 空转。
+            #     任务状态已经是 PAUSED(user)，由 `resume` / `/tasks/{id}/resume`
+            #     显式拉起，或者由调度器的空闲探测决定（见 `_user_resume_scan`）。
+            #   - **不记抢占延迟**：`_record_preemption_latency` 里面靠
+            #     `_preempt_request_at` 判来源，本来就不会记到这一条，此处显式说明。
+            logger.info("任务 %s 因用户正在使用设备而暂停（原因=user）", task.id)
         elif name == "awaiting_confirmation":
             # 等人工确认：既不算完成也不算失败，**不能**放进任何队列——
             # 放进去会被 worker 立刻取出重跑，再次撞上同一个危险动作，变成死循环。

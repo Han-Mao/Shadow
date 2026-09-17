@@ -37,6 +37,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
+from .user_activity import DEFAULT_IDLE_THRESHOLD, UserContext
+
 # 只读操作（V2.7 P1-7）：这些方法只**读取**设备状态，不改变设备上的任何东西。
 # API 的只读端点（/screenshot、/observe）只能调用这里面的方法；会改设备的
 # tap / text / swipe / keyevent / am start 一律不在此列。
@@ -113,7 +115,6 @@ class DeviceController(Protocol):
     标注「前端不可见」：这个方法只有设备后端实现，Agent 侧不直接调——
     Agent 走 `Action` → `executor`，`executor` 才碰设备。
     """
-
     # ---- Observe：只读 ----
 
     def screen_size(self) -> tuple[int, int]:
@@ -209,6 +210,34 @@ class DeviceController(Protocol):
         """
         ...
 
+    # ---- 用户活动（V5 §十）----
+    #
+    # 这两个方法**不是**「设备能力」而是「共享者是否在场」——把它放进设备端口是因为
+    # 只有后端知道怎么问（ADB 查 dumpsys、Android 读 AccessibilityService 事件流），
+    # 与 `build_input_provider` 是同一类问题：**问控制器要，而不是在核心 if-else 判后端**。
+    #
+    # 协议里给**保守默认实现**而不是标成必需方法：`_REQUIRED_METHODS` 是装配期的硬检查，
+    # 把一个新能力加进去会让所有既有后端（含测试替身）当场启动失败——
+    # 而「不知道用户在不在」是一个完全可接受的降级（保守态 = 当作用户在场），
+    # 不该升级成「这个后端不可用」。真正的强要求写在 `supports_user_activity()` 上：
+    # 它返回 False 时，`SHADOW`/`HYBRID` 模式的任务会被拒绝或降级（见 `device/factory.py`）。
+
+    def supports_user_activity(self) -> bool:
+        """本后端能否探测用户活动。缺省 False（不知道 ≠ 用户不在）。"""
+        return False
+
+    def user_context(self, *, idle_threshold: float = DEFAULT_IDLE_THRESHOLD) -> UserContext:
+        """读一次用户活动快照（只读）。
+
+        缺省返回「不知道」（`confirmed=False`），**不是**「用户不在」。
+        实现必须永不抛异常（`UnsupportedUserActivityError` 除外，它表示本端根本做不到）。
+        """
+        return UserContext(
+            active=True,
+            confirmed=False,
+            reason="本后端未声明 supports_user_activity()",
+        )
+
 
 # 协议要求实现的方法。`assert_implements` 用它做装配期检查。
 _REQUIRED_METHODS: tuple[str, ...] = (
@@ -228,6 +257,23 @@ _REQUIRED_METHODS: tuple[str, ...] = (
     "wait",
     "deadline_budget",
     "build_input_provider",
+)
+
+# 协议里带**默认实现**的软能力（V5 §十）。
+#
+# 与 `_REQUIRED_METHODS` 的区别不是「重要不重要」，而是**缺了它会不会让这个后端不可用**：
+#
+# - 必需方法缺一个，这个后端根本跑不起来（`dump_ui` 没有 → 观察不了 → 什么都做不了），
+#   所以装配期就要报错（`assert_implements`）。
+# - 软能力缺了只是「这项信息拿不到」，而我们有明确的降级语义（`UserContext.confirmed=False`
+#   = 不知道，保守当作用户在场）。为此拒绝启动一个后端是过头的。
+#
+# 但软能力**不是可选的语义**：`SHADOW` / `HYBRID` 模式的任务依赖它来决定
+# 「能不能不打扰用户」。消费方式是先问 `supports_user_activity()`，
+# 而不是假设它一定可用（见 `device/factory.py`）。
+OPTIONAL_PROTOCOL_METHODS: tuple[str, ...] = (
+    "supports_user_activity",
+    "user_context",
 )
 
 

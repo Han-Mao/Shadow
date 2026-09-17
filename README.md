@@ -101,6 +101,41 @@ Core 仍跑在电脑上，手机只装一个「设备端点」APK，两者走局
 
 > 详见 `android/README.md`（两条路线、权限、排障、无 SDK 编译）。
 
+## 执行平面：不打断用户的 Agent（V5）
+
+V2–V4 解决了「Agent 任务之间的抢占与恢复」，但**没有**解决「Agent 在后台执行、
+用户同时正常用手机」。原因是物理的：用户和 Agent 共用同一块屏幕（`Display 0`），
+`DeviceSession._owner` 回答的是「哪个 Agent 持有设备」，回答不了
+「用户在用设备时 Agent 在哪执行」。
+
+V5 引入了**执行平面**这一层概念：
+
+| 概念 | 回答的问题 |
+|---|---|
+| `ExecutionMode`（`foreground` / `shadow` / `hybrid`） | 这个任务声明跑在哪个平面 |
+| `ExecutionSession` / `ShadowSession` | 这次执行**实际**落在哪块屏幕上 |
+| `UserContext` | 用户此刻在不在用手机 |
+| `ExecutionTarget` | 执行到这一步时「该在哪执行」 |
+
+**当前能力（诚实清单）**：第一阶段已落地的是「**用户不被打扰**」——
+用户一碰手机，`safe_point()` 就在每个动作前让任务落检查点并暂停（`PAUSED` /
+原因 `user`）；用户停手 2 秒且**页面还是那一屏**时自动恢复。这仍然是一种
+**协作式让步**，不是真正的并行执行。
+
+真正的影子平面（Agent 跑在独立虚拟显示上）属于第二阶段，当前**明确不实现**：
+`MediaProjection` 只能捕获显示、`AccessibilityService` 无法在后台启动独立 App 实例，
+所以现有 API 造不出可独立操作的屏幕。`ShadowDisplayManager` 如实返回
+`available=false`（fail-closed），`shadow` 任务会被拒绝而不是悄悄退回用户屏幕。
+
+```bash
+# 提交一个影子平面任务（当前会被如实拒绝——能力未实现）
+curl -X POST localhost:8010/tasks -H 'content-type: application/json' \
+  -d '{"instruction":"后台跑个任务","execution_mode":"shadow"}'
+
+# 看一个任务实际跑在哪块屏幕上
+curl localhost:8010/tasks/<id> | python -m json.tool | grep -A3 execution
+```
+
 ## 环境变量
 
 | 变量 | 说明 | 默认 |

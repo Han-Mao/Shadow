@@ -7,6 +7,7 @@ import com.bluewhale.shadow.device.AndroidBridgeImpl
 import com.bluewhale.shadow.device.ScreenCapture
 import com.bluewhale.shadow.device.ShadowAccessibilityService
 import com.bluewhale.shadow.device.ShadowActionFailed
+import com.bluewhale.shadow.device.ShadowDisplayManager
 import com.bluewhale.shadow.device.ShadowServiceUnavailable
 import org.json.JSONArray
 import org.json.JSONObject
@@ -210,6 +211,10 @@ class BridgeHttpServer(
             .put("state", bridge.state())
             .put("accessibility", ShadowAccessibilityService.isConnected())
             .put("projection", ScreenCapture.isReady())
+            // V5 §六：影子平面的真实可用性。当前恒 false（现有 API 造不出独立屏幕），
+            // 但**照实报**——健康检查里出现一个骗人的 true 会让排查方向完全错掉。
+            .put("shadow_display", ShadowDisplayManager.isAvailable())
+            .put("shadow_reason", ShadowDisplayManager.currentSession()?.reason ?: "not_probed")
             .put("screen", screenSizeJson())
             .put("port", port)
             .put("protocol", 1)
@@ -245,6 +250,19 @@ class BridgeHttpServer(
                     return
                 }
                 "state" -> bridge.state()
+                // V5 §十：用户活动快照。
+                // 返回 null（辅助功能没连上 = 本能力不可用）时**照实回 null**，
+                // 不要在这里替换成「用户不在」的默认值——Python 侧把 null 读成
+                // 「桥声明不支持这项能力」，而编一个 active=false 会让
+                // 「我不知道用户在不在」被翻译成「用户不在，可以随便点」。
+                "user_activity" -> bridge.user_activity()
+                // V5 §五 / §六：影子执行平面探测。返回值**一定不是 null**——
+                // 「不支持」是通过 available=false + reason 表达的（见 AndroidBridgeImpl）。
+                // 与 user_activity 的 null 语义（「桥没有这项能力」）刻意区分开。
+                "shadow_session" -> bridge.shadow_session(payload.optString("session_id", ""))
+                "shadow_release" -> {
+                    bridge.shadow_release(payload.optString("session_id", "")); null
+                }
                 "tap" -> {
                     bridge.tap(payload.getInt("x"), payload.getInt("y")); null
                 }

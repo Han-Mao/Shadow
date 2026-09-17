@@ -264,9 +264,9 @@ python android/tools/build_apk.py
 # [1/9] 合并清单（package=com.bluewhale.shadow，debuggable=true）
 #      清单声明 3 个组件：MainActivity、ShadowAccessibilityService、DeviceEndpointService
 # [2/9] aapt2 compile …  [3/9] aapt2 link …  [4/9] javac …  [5/9] kotlinc …
-# [6/9] d8：27 个 class → classes.dex（74 KB）
+# [6/9] d8：项目自己的 class + kotlin-stdlib.jar → classes.dex（2.5 MB）
 # [7/9] 装包 + zipalign …  [8/9] 签名（调试密钥）…  [9/9] 校验
-# 产物：android/app/build/outputs/apk/debug/app-debug.apk（49 KB）
+# 产物：android/app/build/outputs/apk/debug/app-debug.apk（793 KB）
 ```
 
 它额外下载 build-tools r35（约 60MB，与 `compileSdk` 对齐），并用到其中的
@@ -279,11 +279,14 @@ python android/tools/build_apk.py
 | `Unsupported source file type`（d8） | 传了目录，kotlinc 在输出目录里留了 `META-INF/main.kotlin_module`。改成显式列出 `.class` |
 | `Couldn't get file size: Bad file descriptor`（dexdump） | `dexdump` 只认裸 `.dex`，给它 APK 不行。把包里那份解出来再验 |
 
-> 这条路抓到过两处**真缺陷**（均已修）：
+> 这条路抓到过**三处真缺陷**（均已修）。前两处是编译期就现形的：
 > `ShadowAccessibilityService.globalAction()` 里的 `require()` 被 Kotlin 解析成了标准库的
 > `kotlin.require(Boolean)`（本类没有同名成员，报错信息完全指不到问题）；
 > `findFocus(FOCUS_INPUT)` 少了类名限定（`FOCUS_INPUT` 属于 `AccessibilityNodeInfo`）。
-> 两处在真机上只会表现为「返回/回桌面莫名失败」和「输入找不到焦点框」。
+> 这两处在真机上只会表现为「返回/回桌面莫名失败」和「输入找不到焦点框」。
+> 第三处**只有装到真机点开图标才会现形**：`dex()` 漏了 `kotlin-stdlib.jar`
+> ——静态校验全过、包也能装，一启动就是 `NoClassDefFoundError`
+> （完整经过见下面「已知限制 6」）。
 
 ### 两边合起来才是闭环
 
@@ -328,15 +331,30 @@ python android/tools/build_apk.py
 5. **只支持单台手机一个端点**：一个 App 实例一个端点（端口 8765）。
    多台手机＝多台各跑一个，Core 侧用 `ADB_SERIAL`/日志区分标识——这与
    `device/factory.py` 的 `resolve_device_serials`「Android 后端恒为一台」一致。
-6. **打包与真机行为：前者已做，后者仍未验证。**
+6. **打包与真机：装机与启动已实测通过；交互行为仍未验证。**
    - **已做**：`python android/tools/build_apk.py` 产出 `app-debug.apk`
-     （aapt2 → javac → kotlinc → d8 → zipalign → apksigner，49 KB，v2+v3 签名），
-     并静态校验了包名 / 版本 / 权限 / 签名 / 「清单声明的组件都在 dex 里」/
+     （aapt2 → javac → kotlinc → d8 → zipalign → apksigner，**793 KB**，v2+v3 签名），
+     并静态校验了包名 / 版本 / 权限 / 签名 /「清单声明的组件都在 dex 里」/
      辅助功能配置 XML 在包内。清单里的 `minSdk 26 / targetSdk 34 / compileSdk 35`
      与 `build.gradle.kts` 一致。
-   - **仍未验证**：真机行为。最需要盯的三条——手势坐标是否被 ROM 缩放、
+   - **2026-09-16 真机实测**（vivo V2352A / Android 16 / API 36，经无线调试）：
+     装机成功，`MainActivity` 正常启动并完整渲染（就绪状态那行正确显示
+     「还不能工作：缺 辅助功能服务、屏幕捕获」），崩溃缓冲区为空。
+     **这一轮暴露出两个只在真机上才会现形的缺陷，均已修**：
+     ① `dex()` 漏了把 `kotlin-stdlib.jar` 交给 d8。编译期有 `-classpath` 就够，
+        运行期却没有实体，于是点开图标即
+        `NoClassDefFoundError: Failed resolution of: Lkotlin/jvm/internal/Intrinsics`。
+        这个包能打、能签名、能安装，上面那套静态校验**全部通过**，
+        **只有真机点开的那一下才崩**。已修（`dex()` 把 `STDLIB_JAR` 加进 d8 输入），
+        并在 `verify_contents()` 加了第 ④ 条守卫把这个坑钉死。
+     ② 调试密钥原先放在 `WORK` 里，而 `main()` 开头就 `rmtree(WORK)` ——
+        等于**每次构建都换一把密钥**，`adb install -r` 必然撞
+        `INSTALL_FAILED_UPDATE_INCOMPATIBLE`，只能先卸载再装。已挪到
+        `~/.android/debug.keystore`（AGP 的惯例位置，好处是与 `./gradlew assembleDebug`
+        共用同一把密钥，两条构建路径产出的包可以互相覆盖安装）。
+   - **仍未验证**：交互行为。最需要盯的三条——手势坐标是否被 ROM 缩放、
      投屏帧率与延迟是否够 VLM 用、厂商后台存活策略会不会杀掉前台服务。
-     这三条只有设备在手才能看，脚本能保证的只到「包是完整的、装得上去」。
+     这三条要等权限授权、真跑起任务才能看。
 
 ---
 

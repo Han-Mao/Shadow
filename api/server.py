@@ -54,6 +54,7 @@ from models.execution import (
     EXECUTION_UNKNOWN,
     EXECUTION_UNVERIFIED,
 )
+from models.execution_mode import ExecutionMode
 from models.state import Observation
 from models.task import RECOVERY_ERROR, TaskPriority, TaskStatus
 from storage import (
@@ -579,6 +580,18 @@ class TaskRequest(BaseModel):
     wait_timeout: float = Field(default=120.0, ge=1, le=600)
     # 指定跑在哪台设备上（V2.1 §十三）。不填就由调度器派给最闲的一台。
     device_serial: str | None = None
+    # 执行平面（V5 §三）：这个任务在哪个屏幕上跑。
+    #   foreground → 当前屏幕直接执行（默认，= V4.5 之前的行为）
+    #   shadow     → 影子平面执行，不碰用户当前的屏幕
+    #   hybrid     → 能后台的后台，不能后台的才申请前台
+    # 这里用**严格枚举**：拼错的值直接 422，不会被静默降级成 foreground
+    # （静默降级意味着「用户以为在后台安全跑、实际占着他的屏幕」）。
+    # `Task` 上的同名字段是宽松的，因为那条路读的是既有记录——读宽写严。
+    execution_mode: ExecutionMode = ExecutionMode.FOREGROUND
+    # 这个任务是否必须真实用户参与（V5 §十一）。声明了它的任务在后端不具备
+    # 影子平面能力时不会被自动执行，而是转人工——因为生物识别 / OTP / 系统授权
+    # 这类动作程序替不了。
+    requires_user: bool = False
 
 
 class InjectRequest(BaseModel):
@@ -1342,6 +1355,10 @@ def create_task(req: TaskRequest, request: Request):
             # 未指定设备时，调度器只能从被允许的设备里挑（V2.2 §二）。
             # 以前只检查 req.device_serial，不填就等于绕过限制。
             allowed_devices=allowed,
+            # 执行平面（V5 §三）：透传到任务上。pydantic 已经保证它是合法枚举值，
+            # 到这里不需要再校验一次（校验放在边界，不放业务层）。
+            execution_mode=req.execution_mode,
+            requires_user=req.requires_user,
         )
     except DeviceNotAllowedError as exc:
         raise _audit_denied(request, principal, "no allowed device", str(exc)) from exc

@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 
 from .budget import TaskBudget
 from .exceptions import InvalidTransitionError
+from .execution_mode import ExecutionMode, LooseExecutionMode
 from .task_plan import TaskPlan
 from .task_step import StepStatus, TaskStep, build_steps
 
@@ -297,6 +298,31 @@ class Task(BaseModel):
     # 是否允许被打断 / 是否允许恢复，由调度器读取
     interruptible: bool = True
     resumable: bool = True
+
+    # 执行模式（V5 §三 / §十六）：这个任务在**哪个平面**上跑。
+    #
+    # 默认 FOREGROUND = V4.5 之前的所有行为（占着当前屏幕执行），所以引入这个字段
+    # 不改变任何既有任务的语义——它只是让「影子平面」这件事第一次可以被表达出来。
+    # 具体含义与三档的区别见 `models/execution_mode.py`。
+    #
+    # 用 `LooseExecutionMode` 而不是裸 `ExecutionMode`：这里读的是**既有记录**，
+    # 未知值（更新版本写的 / 记录损坏）应当降级成 FOREGROUND，而不是让整条任务
+    # 反序列化失败、被 `TaskStore` 隔离成「损坏」。写入口（`TaskRequest`）仍然是
+    # 严格枚举，非法值在 API 层就 422 了——读宽写严。
+    execution_mode: LooseExecutionMode = ExecutionMode.FOREGROUND
+
+    # 执行会话 id（V5 §八 / §十三）。与 `device_serial` 是**两个不同的问题**：
+    #   device_serial → 「在哪台手机上」（设备身份，见 V2.1 §十三）
+    #   session_id    → 「在这个任务的哪个执行环境里」（会话身份）
+    # 前台模式下同一个设备只有一个执行环境，所以为空；影子模式下每个任务一个,
+    # 这个 id 就是隔离与恢复的句柄。
+    session_id: str | None = None
+
+    # 这个任务是否**必须**由真实用户参与才能完成（V5 §十一）。
+    # 与 `execution_mode` 分开存的原因：用户可以在建任务时就声明
+    # 「这活儿必须我来」（execution_mode=shadow 但 requires_user=True），
+    # 而模式是「怎么跑」、这个是「谁必须在场」，两者不互相推导。
+    requires_user: bool = False
 
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)

@@ -228,6 +228,50 @@ class RemoteAndroidBridge:
         value = self._call("state")
         return str(value or "unknown")
 
+    def user_activity(self) -> dict | None:
+        """用户活动快照（V5 §十）。
+
+        `None` 有三种来源，Python 侧**不需要区分**——它们都表示「本能力不可用」，
+        消费方（`AndroidDeviceController.supports_user_activity`）会据此如实返回 False：
+        JSON 的 `null`（老 APK 端点没有这个方法时的 404 也会落到这里）、
+        端点如实回的 null（辅助功能没连上）。
+
+        回包不是 dict 时原样返回，由 `_user_context_from_bridge` 做形状校验并降级——
+        跨语言边界的形状错误要在**一个地方**统一处理，而不是在这里再写一遍。
+        """
+        value = self._call("user_activity")
+        if value is None:
+            return None
+        if isinstance(value, dict):
+            return value
+        return {"confirmed": False, "reason": f"端点返回了意外的形状：{type(value).__name__}"}
+
+    # ---- 影子执行平面（V5 §五 / §六）----
+
+    def shadow_session(self, session_id: str) -> dict:
+        """探测影子平面（V5 §五）。
+
+        与 `user_activity` 的关键区别：这里**不返回 None**。老 APK 端点没有这个路由时
+        `_call` 会抛出来（404），由 `_shadow_session_from_bridge` 接成
+        `available=False`——因为「影子平面不可用」本来就是这个调用的**正常答案**，
+        而 `user_activity` 的 None 是「这个能力不存在」。两件事的处置不同，
+        所以在传输层就不要把它们混成一个形状。
+        """
+        value = self._call("shadow_session", {"session_id": str(session_id)})
+        if isinstance(value, dict):
+            return value
+        return {
+            "available": False,
+            "reason": f"端点返回了意外的形状：{type(value).__name__}",
+            "display_id": None,
+        }
+
+    def shadow_release(self, session_id: str) -> None:
+        """释放影子会话。走写超时（它是个动作，不是读数）。"""
+        self._call(
+            "shadow_release", {"session_id": str(session_id)}, timeout=WRITE_TIMEOUT_SECONDS
+        )
+
     # ---- Act ----
 
     def tap(self, x: int, y: int) -> None:

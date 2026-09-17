@@ -7,15 +7,17 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
+import com.bluewhale.shadow.BuildConfig
 import com.bluewhale.shadow.MainActivity
 import com.bluewhale.shadow.R
 import com.bluewhale.shadow.device.ScreenCapture
 
 /**
- * 让设备端点**常驻**的前台服务（部署路线 B）。
+ * 让设备端点**常驻**的前台服务（部署路线 B），同时承担投屏的建立。
  *
  * 为什么必须是前台服务而不是一个普通线程：
  *
@@ -27,6 +29,17 @@ import com.bluewhale.shadow.device.ScreenCapture
  *
  * 服务停止时**同时停掉投屏**（[ScreenCapture.stop]）：投屏是系统级资源，
  * 留着它会让状态栏一直显示「正在录制/投屏」，用户会以为应用还在工作。
+ *
+ * ━━━ 为什么投屏也归这个服务管（2026-09-16 真机上踩到）━━━
+ *
+ * targetSdk ≥ 34 时，Android 14 要求：**调 `getMediaProjection()` 之前必须先有一个
+ * `mediaProjection` 类型的前台服务在运行**，否则抛 `SecurityException`。
+ * 原来的写法是 `MainActivity.onActivityResult` 直接调 `ScreenCapture.start()` ——
+ * 那一刻服务要么没启动、要么以 `dataSync` 类型在跑，两种都不满足这条要求。
+ * 现象就是应用弹一句「建立屏幕捕获失败」，而链路上没有任何一处说出真正的原因。
+ *
+ * 所以投屏建立被搬进服务：先 `startForeground(…, mediaProjection)`，再建立投屏。
+ * **顺序不能反** —— 这正是这条 Android 规则的全部要求。
  */
 class DeviceEndpointService : Service() {
 
@@ -37,8 +50,11 @@ class DeviceEndpointService : Service() {
 
         const val ACTION_START = "com.bluewhale.shadow.action.START_ENDPOINT"
         const val ACTION_STOP = "com.bluewhale.shadow.action.STOP_ENDPOINT"
+        const val ACTION_START_PROJECTION = "com.bluewhale.shadow.action.START_PROJECTION"
         const val EXTRA_PORT = "shadow_port"
         const val EXTRA_TOKEN = "shadow_token"
+        const val EXTRA_RESULT_CODE = "shadow_result_code"
+        const val EXTRA_RESULT_DATA = "shadow_result_data"
 
         @Volatile
         var server: BridgeHttpServer? = null
@@ -46,11 +62,34 @@ class DeviceEndpointService : Service() {
 
         val isRunning: Boolean get() = server?.isRunning == true
 
+        /** 最近一次用过的端口——单独建立投屏时，通知里也该有个像样的数字。 */
+        @Volatile
+        private var lastPort: Int = BuildConfig.DEFAULT_ENDPOINT_PORT
+
         fun start(context: Context, port: Int, token: String) {
             val intent = Intent(context, DeviceEndpointService::class.java)
                 .setAction(ACTION_START)
                 .putExtra(EXTRA_PORT, port)
                 .putExtra(EXTRA_TOKEN, token)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(intent)
+            } else {
+                context.startService(intent)
+            }
+        }
+
+        /**
+         * 用系统弹窗给的授权建立投屏 —— 调用方是 `MainActivity.onActivityResult`。
+         *
+         * 走服务而不是直接调 `ScreenCapture`：Android 14+ 要求 `getMediaProjection()`
+         * 之前已有 `mediaProjection` 类型的前台服务在跑，而「让服务进入前台」这件事
+         * 只有服务自己能做到。见类注释。
+         */
+        fun startProjection(context: Context, resultCode: Int, data: Intent) {
+            val intent = Intent(context, DeviceEndpointService::class.java)
+                .setAction(ACTION_START_PROJECTION)
+                .putExtra(EXTRA_RESULT_CODE, resultCode)
+                .putExtra(EXTRA_RESULT_DATA, data)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 context.startForegroundService(intent)
             } else {
@@ -78,6 +117,8 @@ class DeviceEndpointService : Service() {
                 return START_NOT_STICKY
             }
 
+            ACTION_START_PROJECTION -> return handleProjection(intent)
+
             else -> {
                 val port = intent?.getIntExtra(EXTRA_PORT, 0)?.takeIf { it in 1..65535 }
                     ?: return START_NOT_STICKY
@@ -90,7 +131,7 @@ class DeviceEndpointService : Service() {
 
                 // 必须先 startForeground 再干活：Android 给 startForegroundService 之后的
                 // 处理时间只有几秒，超时会 ANR/被杀。
-                startForeground(NOTIFICATION_ID, buildNotification(port))
+                promoteToForeground(port, withProjection = false)
 
                 try {
                     val created = server ?: BridgeHttpServer(applicationContext, port, token).also { server = it }
@@ -107,6 +148,60 @@ class DeviceEndpointService : Service() {
         // START_NOT_STICKY：不要在系统重启服务时自动拉起——用户没点「启动」就不该
         // 有监听端口存在。安全性优先于可用性。
         return START_NOT_STICKY
+    }
+
+    /**
+     * 建立投屏。**这里的顺序就是那条 Android 规则的全部内容**：
+     * 先把服务提到前台（带 `mediaProjection` 类型），再调 `getMediaProjection()`。
+     */
+    private fun handleProjection(intent: Intent): Int {
+        val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, 0)
+        @Suppress("DEPRECATION") // getParcelableExtra(String) 的新签名要 API 33+，这里兼容低版本
+        val data: Intent? = intent.getParcelableExtra(EXTRA_RESULT_DATA)
+        if (data == null) {
+            Log.e(TAG, "投屏授权数据缺失，无法建立投屏")
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
+        promoteToForeground(lastPort, withProjection = true)
+
+        return try {
+            ScreenCapture.start(applicationContext, resultCode, data)
+            Log.i(TAG, "投屏已建立（前台服务类型含 mediaProjection）")
+            START_NOT_STICKY
+        } catch (exc: Exception) {
+            // 不再让它静默：界面那边只能看到一个 toast，真正的原因必须留在这里。
+            Log.e(TAG, "建立屏幕捕获失败：${exc.javaClass.simpleName}: ${exc.message}", exc)
+            START_NOT_STICKY
+        }
+    }
+
+    /**
+     * 进入前台并声明**当前实际用途**对应的类型。
+     *
+     * 两个类型各自对应一件事，Android 会校验它们与实际用途是否相符，所以不能一律
+     * 都写上：端点在跑才要 `dataSync`，建立投屏时必须带 `mediaProjection`。
+     * 两件事同时发生时两个都声明。
+     */
+    private fun promoteToForeground(port: Int, withProjection: Boolean) {
+        lastPort = port
+        val notification = buildNotification(port)
+        val types = foregroundTypes(withProjection)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(NOTIFICATION_ID, notification, types)
+        } else {
+            // Q 以下没有「带类型的前台服务」这回事，投屏在那些版本上也不需要前置条件。
+            startForeground(NOTIFICATION_ID, notification)
+        }
+    }
+
+    private fun foregroundTypes(withProjection: Boolean): Int {
+        var types = 0
+        if (isRunning) types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+        if (withProjection) types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+        // 兜底：types 为 0 时 startForeground 会抛，而走到这里说明总有一件事要做。
+        return if (types != 0) types else ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
     }
 
     override fun onDestroy() {

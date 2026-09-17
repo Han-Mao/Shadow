@@ -118,16 +118,50 @@ def _extract_json(text: str) -> dict[str, Any]:
     raise VlmParseError(f"无法从 VLM 响应中解析 JSON 对象: {text[:200]!r}")
 
 
-def _compact_ui_tree(ui_tree: str | None, max_nodes: int = 20) -> str:
-    """把 XML 压缩成可点击元素列表，供 VLM 理解结构（路线 B 接入）。"""
+def _on_screen(node) -> bool:
+    """节点是否真的在当前屏幕上（给 `_compact_ui_tree` 做过滤用）。
+
+    `find_clickable` 返回的是**深度优先的树序**，而 launcher 会把别的页面的图标
+    **预先布局在负坐标**处——它们同样 `clickable="true"`，但根本不在屏幕上。
+    `(0,0,0,0)` 那种零矩形则是 bounds 解析失败的降级结果（见 `parser._parse_bounds`）。
+    这两类都不该占用 prompt 的名额。
+    """
+    x1, y1, x2, y2 = node.bounds
+    if x2 <= 0 or y2 <= 0:
+        return False
+    return not (x1 == 0 and y1 == 0 and x2 == 0 and y2 == 0)
+
+
+def _compact_ui_tree(ui_tree: str | None, max_nodes: int = 40) -> str:
+    """把 XML 压缩成可点击元素列表，供 VLM 理解结构（路线 B 接入）。
+
+    **先滤掉屏幕外的、再按视觉顺序排**——这两步不是锦上添花，是取舍的核心：
+
+    2026-09-16 在真机上第一次跑任务时，模型给出
+    `target='设置图标（位于Dock栏第二个位置）'`，执行层却报
+    `未在 UI 树中找到可点击元素`。查下来根源在这里：`find_clickable` 是树序，
+    vivo 桌面的多页面图标又都带负坐标（屏幕外），于是**屏幕外的元素占满了名额**
+    ——真正可见的「设置」（Dock 栏，屏幕内）排在**第 83 位**，
+    模型压根没看到它的坐标，只好靠视觉去「描述」目标；而带位置说明的长描述
+    无法与 UI 树里的短文本（`content-desc="设置"`）精确匹配，于是两次重试全废。
+
+    所以：① 丢掉屏幕外与零矩形；② 按 `(y, x)` 排序，让「前 N 个」
+    真的等于「屏幕上最先看到的 N 个」。
+
+    `max_nodes` 取 40 是量出来的：桌面那棵树里可点击 85 个、筛掉屏幕外之后仍有
+    40+ 个，其中还夹着 `android.view.ViewGroup`、`containerForIconInFolder`
+    这类对模型无意义的容器。**实测「设置」在视觉序里排第 31 位**——名额给 30
+    时它正好被切掉，40 才稳。
+    """
     if not ui_tree:
         return ""
     try:
         from . import parser
         root = parser.parse(ui_tree)
-        nodes = parser.find_clickable(root)[:max_nodes]
+        visible = [node for node in parser.find_clickable(root) if _on_screen(node)]
+        visible.sort(key=lambda node: (node.center[1], node.center[0]))
         lines = []
-        for i, node in enumerate(nodes, 1):
+        for i, node in enumerate(visible[:max_nodes], 1):
             label = node.text or node.content_desc or node.resource_id or node.class_name
             x, y = node.center
             lines.append(f"{i}. {label} [{x},{y}]")

@@ -69,8 +69,17 @@ from .controller import (
     assert_implements,
     is_read_only,
 )
+from .user_activity import DEFAULT_IDLE_THRESHOLD, UserContext
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_DISPLAY_ID = 0
+"""Android 的 `Display.DEFAULT_DISPLAY`。
+
+影子平面的**否定判据**要用到它：`display_id == 0` 意味着「就是用户在看的那块屏幕」，
+那就不构成影子平面。写在这里而不是从 Kotlin 侧取，是因为这个数字是 Android 平台
+常量（`Display.DEFAULT_DISPLAY` 自 API 1 起就是 0），不是我们会变的东西。
+"""
 
 # 当前上下文的采集总预算截止时刻（monotonic 秒）。语义与 `device.adb` 里那个一致：
 # 一次采集内多次桥调用共享同一个截止时刻，耗尽后**不再开始新的调用**。
@@ -105,6 +114,160 @@ class AndroidBudgetExhausted(AndroidBridgeError, DeviceBudgetExhausted):
     """
 
 
+def _user_context_from_bridge(
+    payload: dict, *, idle_threshold: float
+) -> UserContext:
+    """把桥返回的 dict 翻译成 `UserContext`（V5 §十）。
+
+    单独抽成模块级函数（而不是塞进 `AndroidDeviceController.user_context`）是为了
+    **可离线测试**：桥的返回形状是本后端最容易出错的地方（Kotlin 侧字段名写错、
+    类型不是 JSON 原生类型、`confirmed` 漏传），而这些错误在真机上只会表现为
+    「Agent 莫名其妙不暂停」。抽出来之后可以在 PC 上直接喂各种畸形 dict 验证。
+
+    三条降级规则，都指向同一个方向——**宁可说「不知道」，不说「用户不在」**：
+
+    1. `confirmed` 缺省为 **False**（而不是 True）。Kotlin 侧忘了传这个键时，
+       我们不会假装这次读数有依据。
+    2. `active` 缺省为 **True**（保守）。没有明确说「用户不在」时，当作用户在场。
+    3. 类型不对（例如 `idle_seconds` 传了字符串）时按「不知道」丢弃该字段，
+       不抛异常——探测失败不该升级成任务失败。
+    """
+    confirmed = bool(payload.get("confirmed", False))
+
+    idle_raw = payload.get("idle_seconds")
+    idle: float | None = None
+    if isinstance(idle_raw, (int, float)) and not isinstance(idle_raw, bool):
+        idle = float(idle_raw)
+
+    locked_raw = payload.get("screen_locked")
+    locked: bool | None = locked_raw if isinstance(locked_raw, bool) else None
+
+    package = payload.get("foreground_package")
+    fg = package if isinstance(package, str) and package else None
+
+    reason = payload.get("reason")
+    reason_text = reason if isinstance(reason, str) else ""
+
+    if not confirmed:
+        # 未确认时 active 一律保守取 True，即使桥传了 False——
+        # 「没依据的 active=False」是最危险的组合（它会被读成「用户不在，可以点」）。
+        if not reason_text:
+            reason_text = "桥未确认这次读数"
+        return UserContext(
+            active=True,
+            confirmed=False,
+            foreground_package=fg,
+            screen_locked=locked,
+            idle_seconds=idle,
+            reason=reason_text,
+        )
+
+    active_raw = payload.get("active")
+    active = active_raw if isinstance(active_raw, bool) else True
+    return UserContext(
+        active=active,
+        confirmed=True,
+        foreground_package=fg,
+        last_user_input_at=None,
+        screen_locked=locked,
+        idle_seconds=idle,
+        reason=reason_text,
+    )
+
+
+def _shadow_session_from_bridge(
+    bridge: object, session_id: str, *, adapter: str = "bridge"
+) -> dict:
+    """探测影子平面可用性，把结果规整成 `{available, reason, display_id}`（V5 §五）。
+
+    单独抽成模块级函数，理由与 `_user_context_from_bridge` 完全相同：
+    跨语言边界的形状错误在真机上只表现为「影子任务莫名失败」，抽出来才好在 PC 上
+    直接喂畸形输入验证。
+
+    ━━━ 与用户活动那个函数的方向**相反**，这是刻意的 ━━━
+
+    `_user_context_from_bridge` 的降级方向是「保守地说用户在操作」（宁可慢）；
+    这里的方向是「保守地说影子平面不可用」（宁可降级/拒绝）。两者都是「不确定时
+    选安全的那一侧」，只是**安全侧在哪边不同**：
+
+    - 用户活动判错 → Agent 在用户看屏幕时发手势，**碰了用户的手机**；
+    - 影子平面判错 → 动作被发到一块我们以为独立的屏幕上，实际落在 Display 0，
+      **同样碰了用户的手机**。
+
+    两个错都指向「打扰/影响用户」，所以两者的保守方向一致：不确定就别动。
+
+    四条降级规则：
+
+    1. 桥没有这个方法 / 调用抛异常 → `available=False`，原因如实写明；
+    2. 返回不是 dict → `available=False`（不是「当作可用」）；
+    3. `available` 不是 bool → 取 **False**（不是取真值）；
+    4. `available=True` 但 `display_id` 缺失或等于默认显示 → **仍判不可用**。
+       第 4 条最容易被认为是多余的，却最要紧：影子平面的**定义**是「一块独立的
+       显示」。声称可用却报默认显示，等于承认动作会落到用户那块屏幕上——
+       这正是本能力要避免的事。宁可在这里把它拦下来。
+    """
+    probe = getattr(bridge, "shadow_session", None)
+    if not callable(probe):
+        return {
+            "available": False,
+            "reason": f"桥 {adapter} 没有 shadow_session 方法（APK 版本较旧）",
+            "display_id": None,
+        }
+
+    try:
+        payload = probe(str(session_id))
+    except Exception as exc:  # noqa: BLE001 —— 探测失败不升级为任务失败
+        logger.warning("探测影子平面失败：%s", exc)
+        return {
+            "available": False,
+            "reason": f"桥调用失败：{exc}",
+            "display_id": None,
+        }
+
+    if not isinstance(payload, dict):
+        return {
+            "available": False,
+            "reason": f"桥返回了意外的类型 {type(payload).__name__}",
+            "display_id": None,
+        }
+
+    # 严格取 bool：字符串 "true" / 数字 1 都不算「可用」。
+    # 这里不学 Python 的 truthiness——`"false"` 在真值判断里是 True，
+    # 而它会让我们把一块不存在的屏幕当成存在的。
+    available_raw = payload.get("available")
+    available = available_raw if isinstance(available_raw, bool) else False
+
+    display_raw = payload.get("display_id")
+    display_id = (
+        int(display_raw)
+        if isinstance(display_raw, int) and not isinstance(display_raw, bool)
+        else None
+    )
+
+    reason_raw = payload.get("reason")
+    reason = reason_raw if isinstance(reason_raw, str) else ""
+
+    if available and (display_id is None or display_id == DEFAULT_DISPLAY_ID):
+        # 声称可用但没给出**独立的** display id（`Display.DEFAULT_DISPLAY` 是 0）
+        # → 按不可用处置，理由说清楚。
+        #
+        # `== DEFAULT_DISPLAY_ID` 那一半才是这条规则真正的用武之地：
+        # 桥最容易犯的错不是「忘了传 display_id」，而是「传了 0」——因为
+        # `ShadowDisplayManager` 在不可用时返回的正是 `Display.DEFAULT_DISPLAY`。
+        # 只判 None 的话，「available=true + display_id=0」这个组合会顺利通过，
+        # 而它字面意思就是「影子平面可用，用的还是用户那块屏幕」。
+        return {
+            "available": False,
+            "reason": (
+                "桥声称影子平面可用，但未给出独立的 display_id"
+                "（动作会落到默认显示上，正是本能力要避免的）"
+            ),
+            "display_id": None,
+        }
+
+    return {"available": available, "reason": reason, "display_id": display_id}
+
+
 @runtime_checkable
 class AndroidBridge(Protocol):
     """Android 侧（Kotlin/Java）必须实现的能力。
@@ -128,6 +291,55 @@ class AndroidBridge(Protocol):
 
     def state(self) -> str: ...
 
+    # ---- 用户活动（V5 §十）----
+    #
+    # Kotlin 侧拿到的是**精确时间**（AccessibilityService 的 TYPE_VIEW_TOUCHED /
+    # 输入事件流 + PowerManager 的锁屏状态），比 ADB 侧的「前后台窗口变化近似」
+    # 强很多，所以两边返回同一个结构、但 `confirmed` 的可信度不同。
+    #
+    # `user_activity()` 返回一个 dict（跨语言边界最容易对齐的形状），键：
+    #   {
+    #     "confirmed": bool,        # 这次读数有没有依据
+    #     "active": bool,           # confirmed=False 时是保守值 True
+    #     "idle_seconds": float|None,
+    #     "foreground_package": str|None,
+    #     "screen_locked": bool|None,
+    #     "reason": str,
+    #   }
+    # 用 dict 而不是让 Kotlin 构造 Python 对象：Chaquopy 下传 dict 是零成本且类型安全的，
+    # 而传自定义类需要两侧同时改。返回 None 表示「本桥版本还不支持」——
+    # 与 `confirmed=False` 是两回事，前者是「这个能力不存在」。
+    def user_activity(self) -> dict | None: ...
+
+    # ---- 影子执行平面（V5 §五 / §六）----
+    #
+    # `shadow_session()` 探测「影子平面现在能不能用」，键：
+    #   {
+    #     "available": bool,       # 能不能在影子平面执行动作
+    #     "reason": str,            # 不可用时的结构化原因码
+    #     "display_id": int|None,   # 影子平面的 display id；不可用时是默认显示
+    #   }
+    #
+    # ━━━ 它当前**一定**返回 available=False ━━━
+    #
+    # 这不是「还没接完线」，而是 §六 的结论：`MediaProjection` 只能捕获显示、
+    # `AccessibilityService` 无法在后台启动独立 App 实例，所以现有 API 造不出
+    # 一块可独立操作的屏幕。桥如实说不支持，调用方据此 fail-closed
+    # （`shadow` 任务）或降级到前台（`hybrid` 任务）。
+    #
+    # ━━━ 为什么不用「返回 None」表示不支持 ━━━
+    #
+    # `None` 在 `user_activity` 那里表示「这个桥版本没有这个能力」，用来驱动
+    # `supports_*()` 判据。而影子探测的语义是「我探测过了，结论是不可用」——
+    # 那是**正常的探测结果**，不是能力缺失。混用会让「老 APK」与
+    # 「新 APK 探测后说不可用」这两件事无法区分，而它们的处置并不相同。
+    #
+    # 与 `user_activity` 的另一处一致：这两个方法都**不抛异常**，
+    # 用返回值的字段表达结论（端口约定：`current_focus` 同源）。
+    def shadow_session(self, session_id: str) -> dict | None: ...
+
+    def shadow_release(self, session_id: str) -> None: ...
+
 
 _BRIDGE_METHODS: tuple[str, ...] = (
     "screen_size",
@@ -142,6 +354,12 @@ _BRIDGE_METHODS: tuple[str, ...] = (
     "press_home",
     "launch",
     "state",
+    "user_activity",
+    # V5 §五：影子平面探测/释放。加进必需方法表是刻意的——影子任务的能力
+    # 判断依赖它，若允许「桥没有这个方法」，那么它就是靠 `getattr` 兜底，
+    # 于是**每个**调用点都得自己写一遍「拿不到怎么办」，而那些写法必然会分叉。
+    "shadow_session",
+    "shadow_release",
 )
 
 
@@ -362,6 +580,79 @@ class AndroidDeviceController:
             logger.warning("查询设备状态失败：%s", exc)
             return "unknown"
         return str(reported) or "unknown"
+
+    # ---- 用户活动（V5 §十）----
+
+    def supports_user_activity(self) -> bool:
+        """本桥能不能探测用户活动。
+
+        判据是**桥有没有这个方法**——老版本 APK 的桥不带 `user_activity`，
+        那时必须如实说「做不到」，好让 `SHADOW`/`HYBRID` 任务被拒绝或降级
+        （见 `device/factory.py`），而不是让它以为「用户在不在都无所谓」。
+        """
+        return callable(getattr(self._bridge, "user_activity", None))
+
+    def user_context(
+        self, *, idle_threshold: float = DEFAULT_IDLE_THRESHOLD
+    ) -> UserContext:
+        """从桥读用户活动（V5 §十）。
+
+        **永不抛异常**（协议要求）：桥挂了、返回的 dict 缺字段、类型不对，
+        一律降级成 `confirmed=False`（不知道）——因为「探测用户失败」
+        不该升级成「任务失败」，正确处置是保守暂停。这与 `state()` 的处理同源。
+        """
+        if not self.supports_user_activity():
+            return UserContext(
+                active=True,
+                confirmed=False,
+                reason="当前 Android 桥不支持 user_activity（APK 版本较旧）",
+            )
+        try:
+            payload = self._bridge.user_activity()
+        except Exception as exc:  # noqa: BLE001 —— 见 docstring：探测失败不升级为任务失败
+            logger.warning("读取用户活动失败：%s", exc)
+            return UserContext(active=True, confirmed=False, reason=f"桥调用失败：{exc}")
+
+        if payload is None:
+            # 与「读失败」分开：None 表示这个桥**明确声明**不支持这项能力。
+            return UserContext(
+                active=True,
+                confirmed=False,
+                reason="桥声明不支持用户活动探测",
+            )
+        if not isinstance(payload, dict):
+            return UserContext(
+                active=True,
+                confirmed=False,
+                reason=f"桥返回了意外的类型 {type(payload).__name__}",
+            )
+
+        return _user_context_from_bridge(payload, idle_threshold=idle_threshold)
+
+    # ---- 影子执行平面（V5 §五 / §六）----
+
+    def shadow_session(self, session_id: str) -> dict:
+        """探测影子平面可用性（V5 §五）。
+
+        **永不抛异常**，也**永不返回 None**——与 `user_activity` 的处理不同，
+        因为这两件事的语义不同（见 `AndroidBridge.shadow_session` 的说明）：
+        探测失败在这里也要给出一个 dict，只是 `available=False` 且 `reason`
+        说明为什么——调用方需要「不可用 + 原因」这一对信息才能决定
+        fail-closed 还是降级，光知道「没拿到」是不够的。
+        """
+        return _shadow_session_from_bridge(
+            self._bridge, session_id, adapter=type(self).__name__
+        )
+
+    def shadow_release(self, session_id: str) -> None:
+        """释放影子会话。失败不抛——释放是清理动作，它挂掉不该让任务失败。"""
+        release = getattr(self._bridge, "shadow_release", None)
+        if not callable(release):
+            return
+        try:
+            release(str(session_id))
+        except Exception as exc:  # noqa: BLE001 —— 清理失败不该升级成任务失败
+            logger.warning("释放影子会话 %s 失败：%s", session_id, exc)
 
     # ---- Act ----
 

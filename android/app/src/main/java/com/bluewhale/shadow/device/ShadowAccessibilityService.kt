@@ -66,6 +66,36 @@ class ShadowAccessibilityService : AccessibilityService() {
             "辅助功能服务未连接。请在系统「设置 → 无障碍 / 辅助功能」里开启「Shadow 设备端点」，" +
                 "然后回到 Shadow 应用重新启动设备端点。"
         )
+
+        /**
+         * 当前是不是**我们自己**正在发手势（V5 §十）。
+         *
+         * ━━━ 为什么这个标记是必须的 ━━━
+         *
+         * `dispatchGesture` 发出的人造手势同样会触发 `onAccessibilityEvent`。
+         * 如果 `UserActivityMonitor` 不区分来源，就会发生这个循环：
+         *
+         *     Agent 点一下 → 产生 TYPE_VIEW_CLICKED 事件 → 被记成「用户刚操作过」
+         *                  → 运行时在下一个安全点看到「用户在场」→ 暂停任务
+         *
+         * 结果是 **Agent 每动一下就立刻把自己冻住**，任务永远推进不了，
+         * 而日志上看起来是「用户在一直操作手机」——极难定位。
+         *
+         * 所以这里用一个显式标记把「机器手势」排除掉。用 [AtomicBoolean] 而不是
+         * `@Volatile var`：读在无障碍事件线程、写在调用线程，需要真正的可见性与
+         * 原子性（`@Volatile` 只能保证可见性）。
+         *
+         * 注意它**只覆盖我们自己的手势**：用户此时真的碰屏幕，事件照样会被记成用户操作
+         * （那个事件的手势来源不是我们）。这正是我们要的。
+         */
+        private val dispatchingGesture = AtomicBoolean(false)
+
+        /** 见 [dispatchingGesture]。 */
+        fun isDispatchingGesture(): Boolean = dispatchingGesture.get()
+
+        private fun beginGestureDispatch(): Unit = dispatchingGesture.set(true)
+
+        private fun endGestureDispatch(): Unit = dispatchingGesture.set(false)
     }
 
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -84,6 +114,10 @@ class ShadowAccessibilityService : AccessibilityService() {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         val e = event ?: return
+        // V5 §十：先喂给用户活动监测器。它与下面的窗口跟踪是**两件事**：
+        // 那边关心「用户有没有在动」（所有输入类事件），这里只关心「整个窗口换了」。
+        UserActivityMonitor.onAccessibilityEvent(e)
+
         // 只关心「整个窗口换了」这一种。TYPE_WINDOW_CONTENT_CHANGED 太频繁，
         // 而且它不代表页面切换——把它记进来会让「恢复点是否还成立」的判断失真。
         if (e.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
@@ -207,7 +241,16 @@ class ShadowAccessibilityService : AccessibilityService() {
             }
         }
 
-        val accepted = service.dispatchGesture(gesture, callback, mainHandler)
+        // V5 §十：标记「这是我们自己发的手势」，让 `UserActivityMonitor` 不要把
+        // 它记成用户操作（否则 Agent 每动一下就以为用户在操作、立刻暂停自己）。
+        // 用 try/finally 保证异常路径也把标记复位——留在 true 的后果是此后
+        // **真实**的用户操作也被忽略，即「用户拿起手机了但 Agent 还在点」。
+        beginGestureDispatch()
+        val accepted = try {
+            service.dispatchGesture(gesture, callback, mainHandler)
+        } finally {
+            endGestureDispatch()
+        }
         if (!accepted) {
             throw ShadowActionFailed("$what 手势没有下发成功（dispatchGesture 返回 false，可能已有手势在执行）")
         }

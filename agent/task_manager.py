@@ -17,6 +17,7 @@ from typing import Any, Callable
 
 from models.budget import TaskBudget
 from models.exceptions import ConcurrentModificationError
+from models.execution_mode import ExecutionMode
 from models.retry import DEFAULT_POLICY
 from models.task import Task, TaskEvent, TaskPriority, TaskStatus, priority_rank
 from models.task_relation import TaskRelation, TaskRelationResult
@@ -133,6 +134,8 @@ class TaskManager:
         relation_meta: dict | None = None,
         device_serial: str | None = None,
         allowed_devices: frozenset[str] | None = None,
+        execution_mode: ExecutionMode = ExecutionMode.FOREGROUND,
+        requires_user: bool = False,
     ) -> Task:
         task = Task(
             instruction=instruction,
@@ -143,6 +146,11 @@ class TaskManager:
             root_task_id=parent_task_id,
             relation_meta=dict(relation_meta or {}),
             device_serial=device_serial,
+            # 执行平面（V5 §三）：默认为 FOREGROUND，即 V4.5 之前的行为。
+            # 这个参数一路透传到 Task 上，因为「在哪个平面跑」是**任务自己的属性**，
+            # 不是调度器临场决定的——调度器只负责按它分配，不负责替用户选择。
+            execution_mode=execution_mode,
+            requires_user=requires_user,
         )
         task.apply_event(TaskEvent.CREATED, source="task_manager")
         self._store.save(task)

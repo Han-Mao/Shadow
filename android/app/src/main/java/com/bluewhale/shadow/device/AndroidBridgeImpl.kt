@@ -76,6 +76,55 @@ class AndroidBridgeImpl(private val context: Context) {
         else -> "device"
     }
 
+    /**
+     * 用户是不是正在用手机（V5 §十）。
+     *
+     * 返回一个 `Map`，键与 Python 侧 `UserContext` 逐字对齐
+     * （见 `device/android.py` 的 `_user_context_from_bridge`）：
+     *
+     *     confirmed / active / idle_seconds / foreground_package / screen_locked / reason
+     *
+     * **返回 `null` 表示辅助功能没连上**（这项能力用不了），
+     * 而 `confirmed = false` 是「这次没读到」——两者不同：
+     * 前者会让 `supports_user_activity()` 判 False、`SHADOW`/`HYBRID` 任务被拒或降级，
+     * 后者只是这一次保守处理。这个区分要留住，否则「能力缺失」会被当成「这一刻不确定」，
+     * 于是影子模式在根本不支持它的设备上被放行。
+     */
+    fun user_activity(): Map<String, Any?>? = UserActivityMonitor.snapshot(context)
+
+    /**
+     * 影子执行平面探测（V5 §五 / §六）。
+     *
+     * 返回 `Map`，键与 Python 侧 `ShadowSession` 逐字对齐
+     * （见 `device/android.py` 的 `_shadow_session_from_bridge`）：
+     *
+     *     available / reason / display_id
+     *
+     * `available` **当前恒为 `false`**——不是「还没实现所以先给个默认值」，
+     * 而是「§六 的两条限制下，现有 API 造不出可独立操作的屏幕，所以如实说不支持」。
+     * 调用方（`device/session.py`）据此 fail-closed（`shadow` 任务）或降级到前台
+     * （`hybrid` 任务）。
+     *
+     * **不要**在这里返回 `null` 表示「不支持」：`null` 在协议里已经被
+     * `user_activity` 用作「桥声明没有这个能力」，而这里的语义是「探测过了，
+     * 结论是不支持，原因在 `reason` 里」。前者该走 `supports_*()` 的判据，
+     * 后者是**正常的探测结果**。混起来就没法区分「老 APK 没这个方法」与
+     * 「新 APK 探测后说不可用」。
+     */
+    fun shadow_session(sessionId: String?): Map<String, Any?> =
+        ShadowDisplayManager.createSession(context, sessionId ?: "").let { session ->
+            mapOf(
+                "available" to session.available,
+                "reason" to session.reason,
+                "display_id" to session.displayId,
+            )
+        }
+
+    /** 释放影子会话。没登记过时是无操作。 */
+    fun shadow_release(sessionId: String?) {
+        ShadowDisplayManager.destroySession(sessionId)
+    }
+
     // ---- Act ----
 
     fun tap(x: Int, y: Int) {

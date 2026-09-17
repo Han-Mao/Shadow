@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Shadow 应用图标。
+
+  补这一处的原因：`AndroidManifest.xml` 的 `<application>` 原先只声明了
+  `android:label`，`res/` 下也没有任何 drawable/mipmap —— 打出来的包在
+  `aapt2 dump badging` 里是 `icon=''`，装到手机上桌面认不出入口
+  （找不到图标，或显示成默认图形），现象就是「装上了但打不开」。
+
+  用矢量图而不是 PNG：本工程零 androidx，res/ 里原先一个 drawable 都没有，
+  矢量图是纯 XML，不需要为各密度各出一份位图，也不引入构建工具的新依赖。
+
+  形状：设备轮廓 + 偏移的一点白，对应「Shadow」。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- 底色：与 values/themes.xml 的深青一致，保证在浅色壁纸上也看得见 -->
+    <path
+        android:fillColor="#0F6E56"
+        android:pathData="M26,6 L82,6 A20,20 0 0 1 102,26 L102,82 A20,20 0 0 1 82,102 L26,102 A20,20 0 0 1 6,82 L6,26 A20,20 0 0 1 26,6 Z" />
+
+    <!-- 设备轮廓（描边，不填充） -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="5"
+        android:pathData="M44,28 L64,28 A7,7 0 0 1 71,35 L71,73 A7,7 0 0 1 64,80 L44,80 A7,7 0 0 1 37,73 L37,35 A7,7 0 0 1 44,28 Z" />
+
+    <!-- 听筒 -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M49,34 L59,34 L59,37 L49,37 Z" />
+
+    <!-- 影子：偏移的半透明白，就是「Shadow」那一下 -->
+    <path
+        android:fillAlpha="0.35"
+        android:fillColor="#FFFFFF"
+        android:pathData="M50,62 L58,62 L58,67 L50,67 Z" />
+</vector>

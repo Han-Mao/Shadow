@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 
 from device.pool import storage_hint
 from device.session import DeviceBusyError, DeviceSession
@@ -28,7 +29,7 @@ from models.retry import (
     classify_result,
 )
 from models.state import Observation, ObservationEpoch, StepOutcome
-from models.task import TERMINAL_STATUSES, Task, TaskEvent, TaskStatus
+from models.task import PAUSED_BY_USER, TERMINAL_STATUSES, Task, TaskEvent, TaskStatus
 from models.task_step import StepStatus, TaskStep
 from models.verification import ActionDispatch, ActionEffect, DispatchStatus, GoalVerification
 from storage.event_log import (
@@ -87,6 +88,9 @@ class ExecutionMixin:
 
         state = self._state_for(task)
         state.run_version = task.version
+        # V5 §十四：这次运行**是不是从「因用户活动而挂起」恢复来的**。
+        # 必须在任何状态改写之前读——下面 `mark(RUNNING)` 之后 `paused_reason` 就没了。
+        resumed_from_user_pause = task.paused_reason == PAUSED_BY_USER
         # 载入跨重启存活的决策状态（V2.7 P0-1）：用户否决过的动作，重启之后依然算数
         state.denied_fingerprints.update(task.denied_fingerprints)
         # V2.8 §八：崩溃恢复批准后，`recovery_note` 记录了「上次动作效果未知」。
@@ -127,6 +131,12 @@ class ExecutionMixin:
         observation: Observation | None = None
         last_observation: Observation | None = None
 
+        # V5 §十四：因用户活动挂起过的任务，恢复时必须先过「用户停手 + 还是那一屏」。
+        if resumed_from_user_pause:
+            resumed = self._resume_after_user_pause(task, state, session, checkpoint)
+            if not resumed:
+                return RunOutcome.SUSPENDED_BY_USER
+
         try:
             outcome = self._run_loop(
                 task, state, session, checkpoint, observation, last_observation
@@ -138,6 +148,194 @@ class ExecutionMixin:
             return self._degrade(task, state, f"持久化失败：{exc.reason}")
         return outcome
 
+
+    def _resume_after_user_pause(
+        self,
+        task: Task,
+        state: RuntimeState,
+        session: DeviceSession,
+        checkpoint: Checkpoint | None,
+    ) -> bool:
+        """因用户活动挂起的任务，现在能不能接着跑（V5 §十四）。
+
+        返回 `True` = 可以进入执行循环；`False` = 条件不满足，**继续挂着**。
+
+        ━━━ 为什么必须重新观察一次，而不是读 checkpoint ━━━
+
+        挂起时写下的 checkpoint 记的是「**我们**走到的位置」。但在挂起的这段时间里，
+        用户拿着手机干了什么，我们一无所知：他可能退出了那个 App、可能点进了别的页面、
+        可能锁屏了。checkpoint 里的坐标与页面假设**可能全部作废**。
+
+        所以恢复不能「从检查点继续」，而要「先看一眼现在是什么样，确认还是那一屏，
+        再从那里重新规划」。这也是为什么返回值只能是「可以进循环 / 继续挂着」两态——
+        不接受「可以按原计划继续」这个第三态。
+
+        ━━━ 与抢占恢复的区别 ━━━
+
+        抢占挂起（`preemption`）恢复时不需要这一套：另一个 Agent 只是在同一台设备上
+        跑，它结束时可能把页面换了，但那是 Agent 的行为，语义上是「设备状态变了」，
+        由版本围栏与 TOCTOU 门禁处置就够。而**人**的操作没有「任务边界」——
+        用户随时可以停下、随时可以继续，我们只能靠「停手 N 秒 + 页面没变」去猜。
+        """
+        # 重新观察一次。失败就继续挂着——拿不到证据时**不猜**（[80]/[92]）。
+        observation = self._observe(task, state, session)
+        if observation is None:
+            logger.info("任务 %s 恢复判定：重新观察失败，继续等待用户停手", task.id)
+            self._save_checkpoint(task, state, observation)
+            return False
+
+        # 先把「用户现在停手了没」刷新到 state（`user_resume_ready` 读它）。
+        self.refresh_user_context(task, state, session)
+        task.mark(TaskStatus.PAUSED, paused_reason=PAUSED_BY_USER)
+
+        if not self.user_resume_ready(task, state, session, observation):
+            logger.info(
+                "任务 %s 恢复判定：用户仍在操作或页面已变化（前台=%s），继续等待",
+                task.id,
+                state.foreground_package or "未知",
+            )
+            self._save_checkpoint(task, state, observation)
+            return False
+
+        # 条件满足：清掉挂起标记，让循环正常开跑。**不清 `user_pauses`**——那个计数是
+        # 任务级的「用户总共打断了几次」，清掉就等于允许无限次「暂停→恢复」循环，
+        # 上界（`MAX_USER_PAUSES`）也就形同虚设。
+        state.last_user_pause_at = None
+        state.pause_epoch = None
+        self._save_checkpoint(task, state, observation)
+        self._emit(task.id, STARTED, resumed_from="user_pause", step=state.execution_step)
+        logger.info("任务 %s 用户已停手且页面未变，恢复执行", task.id)
+        return True
+
+    def _settle_safe_point(
+        self,
+        task: Task,
+        state: RuntimeState,
+        session: DeviceSession,
+        point: "SafePoint",
+        last_observation: Observation | None,
+    ) -> RunOutcome:
+        """把安全点的结论落成「检查点 + 事件 + 任务状态 + RunOutcome」（V5 §十二）。
+
+        **为什么要有这个中间层**：`safe_point()` 只负责「停不停、为什么停」，
+        它与「停下来之后要写什么」是两件事。原来这两件事混在循环里的 6 个 if 中，
+        于是每加一条停止理由，都要顺手决定它该不该落检查点、该发什么事件、
+        该把任务改成什么状态——这正是最容易漏的地方（比如漏了落检查点，
+        任务被恢复时就从错误的地方开始）。
+
+        这里按 `kind` 分派，每条分支都是显式的：
+        """
+        kind = point.kind
+
+        # ---- 终态：不该再产生任何副作用（V2.5 §六）----
+        if kind == "terminal":
+            # 正常路径走不到这里（外部已经不允许把 RUNNING 改成终态），
+            # 但这是最后一道闸：宁可在这里退出，也不要在一条已经结束的任务上继续点手机。
+            logger.warning(
+                "任务 %s 在执行中被置为终态（%s），立即停止产生副作用",
+                task.id,
+                task.status.value,
+            )
+            return RunOutcome.CANCELLED
+
+        # ---- 取消请求：走到安全点才算真停（V2.5 §七）----
+        if kind == "cancel":
+            # 此刻设备侧可能刚 dispatch 过一个动作——退出路径要如实区分
+            # 「动作发出前就停了」还是「动作发出后才发现要停」，审计才读得懂。
+            task.apply_event(TaskEvent.CANCELLED, source="runtime")
+            logger.info("任务 %s 已被取消，退出执行", task.id)
+            return RunOutcome.CANCELLED
+
+        # ---- 用户暂停 / 被抢占让位 ----
+        if kind == "paused":
+            self._save_checkpoint(task, state, last_observation)
+            return RunOutcome.SUSPENDED
+        if kind == "preemption":
+            self._save_checkpoint(task, state, last_observation)
+            logger.info("任务 %s 让出设备（被抢占），等待稍后恢复", task.id)
+            self._emit(task.id, SUSPENDED, reason="preemption", step=state.execution_step)
+            return RunOutcome.SUSPENDED
+
+        # ---- 用户在场：主动让开（V5 §十四）----
+        if kind == "user_active":
+            return self._suspend_for_user(task, state, session, last_observation, point.reason)
+
+        # ---- 预算：自己跑不动了 ----
+        if kind in ("budget_observations", "budget_model_calls"):
+            self._save_checkpoint(task, state, last_observation)
+            return self._fail(task, point.reason)
+
+        # ---- 用户反复占用的上界：明确失败，把决定权交还给人 ----
+        if kind == "user_pause_limit":
+            self._save_checkpoint(task, state, last_observation)
+            return self._fail(task, point.reason)
+
+        # 兜底：将来新增 kind 时不能静默滑过去。安全点的语义是「停下」，
+        # 走到这里说明有人加了判定却忘了在这里处置——那就按失败处理并留下告警，
+        # 而不是当成「可以继续」把任务放跑（**fail-closed**，[79]/[110] 的一贯方向）。
+        logger.error("安全点返回了未处置的 kind=%r，按失败处理：%s", kind, point.reason)
+        self._save_checkpoint(task, state, last_observation)
+        return self._fail(task, point.reason or f"未处置的安全点：{kind}")
+
+    def _suspend_for_user(
+        self,
+        task: Task,
+        state: RuntimeState,
+        session: DeviceSession,
+        last_observation: Observation | None,
+        reason: str,
+    ) -> RunOutcome:
+        """用户正在用手机 → 让开（V5 §十四 第一阶段）。
+
+        ━━━ 这一条与「抢占」的根本区别 ━━━
+
+        抢占是**平的**：两个 Agent 争一台设备，Scheduler 说谁上就谁上。
+        这里是**不平的**：用户在用手机时，Agent 永远让位——不需要任何人裁决，
+        也不该有「谁优先级高」这个问题。§十八 那句话就是这个意思：
+        缺的不是抢占，是隔离。
+
+        ━━━ 三件事必须一起做，顺序固定 ━━━
+
+        1. **记下那一屏**（`pause_epoch`）——恢复时要靠它判断「还是不是这一屏」。
+           必须在写检查点**之前**记，因为检查点要把它一起存下去。
+           没有观察（`last_observation=None`）时**不伪造**：留空 → 恢复判定自然失败，
+           任务不会在没有证据的情况下接着按老坐标点。
+        2. **写检查点**——用户的操作可能让设备侧状态变得不可回放，
+           恢复必须是「从这一屏重新开始规划」，而不是接着跑。
+        3. **落任务状态为 PAUSED（原因=user）**——这样 Scheduler 看得到、
+           `/tasks` 查得到、用户知道「是我在用手机，不是它坏了」。
+
+        `RunOutcome.SUSPENDED_BY_USER` 与 `SUSPENDED` 分开（见其定义）：
+        两者的恢复条件不同（等用户停手 vs 等设备可用），合起来日志里就分不清。
+        """
+        state.pause_epoch = (
+            ObservationEpoch.capture(last_observation, session.generation)
+            if last_observation is not None
+            else None
+        )
+        state.last_user_pause_at = time.monotonic()
+        state.user_pauses += 1
+
+        self._save_checkpoint(task, state, last_observation)
+
+        # 任务状态改成 PAUSED(user)。用 `mark` 而不是直接赋 status：
+        # 状态迁移的守卫（[33] 终态不可迁出）要靠它。
+        if task.status not in TERMINAL_STATUSES and task.status is not TaskStatus.PAUSED:
+            task.mark(TaskStatus.PAUSED, paused_reason=PAUSED_BY_USER)
+        logger.info(
+            "任务 %s 因用户正在使用设备而暂停（第 %d 次，前台=%s）",
+            task.id,
+            state.user_pauses,
+            state.foreground_package or "未知",
+        )
+        self._emit(
+            task.id,
+            SUSPENDED,
+            reason=PAUSED_BY_USER,
+            step=state.execution_step,
+            detail=reason,
+        )
+        return RunOutcome.SUSPENDED_BY_USER
 
     def _run_loop(
         self,
@@ -153,38 +351,17 @@ class ExecutionMixin:
             # 只同步「否决黑名单」这类必须记住的东西，取舍见 `_sync_durable_state`。
             self._sync_durable_state(task, state)
 
-            # ---- 安全点 ----
-            if task.status in TERMINAL_STATUSES:
-                # V2.5 §六：终态意味着「不该再产生任何副作用」。正常路径走不到这里
-                # （外部已经不允许把 RUNNING 改成终态），但这是最后一道闸：万一有人绕过
-                # 去，我们宁可在这里退出，也不要在一条已经结束的任务上继续点手机。
-                logger.warning(
-                    "任务 %s 在执行中被置为终态（%s），立即停止产生副作用",
-                    task.id,
-                    task.status.value,
-                )
-                return RunOutcome.CANCELLED
-            if task.status is TaskStatus.CANCEL_REQUESTED:
-                # V2.5 §七：CANCEL_REQUESTED 表示「请求已下达」，走到安全点才算真停。
-                # 此刻设备侧可能刚 dispatch 过一个动作——所以退出路径要如实区分
-                # 「动作发出前就停了」还是「动作发出后才发现要停」，审计才读得懂。
-                task.apply_event(TaskEvent.CANCELLED, source="runtime")
-                logger.info("任务 %s 已被取消，退出执行", task.id)
-                return RunOutcome.CANCELLED
-            if task.status is TaskStatus.PAUSED:
-                self._save_checkpoint(task, state, last_observation)
-                return RunOutcome.SUSPENDED
-            if session.should_yield(task.id):
-                self._save_checkpoint(task, state, last_observation)
-                logger.info("任务 %s 让出设备（被抢占），等待稍后恢复", task.id)
-                self._emit(task.id, SUSPENDED, reason="preemption", step=state.execution_step)
-                return RunOutcome.SUSPENDED
-            if state.observation_count >= task.budget.max_observations:
-                self._save_checkpoint(task, state, last_observation)
-                return self._fail(task, f"已达观察次数上限 {task.budget.max_observations}")
-            if state.model_call_count >= task.budget.max_model_calls:
-                self._save_checkpoint(task, state, last_observation)
-                return self._fail(task, f"已达模型调用上限 {task.budget.max_model_calls}")
+            # ---- 刷新人是否在场（V5 §十）----
+            # 放在安全点之前：`safe_point` 读 `state` 里这几个字段，而它自己**不碰设备**
+            # （纯判定才好被用例直接调）。所以「碰设备的那一下」固定在这里发生，一次。
+            self.refresh_user_context(task, state, session)
+
+            # ---- 安全点（V5 §十二）----
+            # 原来这里散着 6 个 if，顺序靠读代码的人自己推。收敛到 `safe_point()` 之后
+            # 顺序显式、可测、只有一处（见其文档字符串里的判定顺序与理由）。
+            point = self.safe_point(task, state, session)
+            if point.stop:
+                return self._settle_safe_point(task, state, session, point, last_observation)
 
             # ---- 版本围栏（V2.3）：目标/计划被外部改写后，旧决策上下文作废 ----
             if task.version != state.run_version:

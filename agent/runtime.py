@@ -3,12 +3,22 @@
 调度不在这一层——排队、抢占、恢复由 `agent.scheduler.TaskScheduler` 负责。
 Runtime 只做 Observe → Think → Act → Verify → Checkpoint 的闭环，
 并在每个循环安全点检查「是否被取消 / 是否该让出设备」。
+
+V5 §十二 起闭环里多了一层**执行策略**：
+
+    Observe → Think → **ExecutionPolicy** → Act → Verify → Checkpoint
+
+`ExecutionPolicy` 的落点是 `safe_point()`——它把「被取消 / 该让设备 / **用户在用手机** /
+执行平面是否可用」这些**与页面无关的中断条件**收敛到一处判断（见该方法的 docstring）。
+拆出去的价值在文档 §十二 说得很清楚：planner 只需要回答「下一步做什么」，
+「在哪里做、现在能不能做」是执行侧的事。
 """
 from __future__ import annotations
 
 import logging
 import os
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
@@ -19,6 +29,7 @@ from device.session import DeviceBusyError, DeviceSession
 from models.action import Action, ActionType, ActionRisk, ActionEffectStatus, Decision
 from models.checkpoint import Checkpoint
 from models.exceptions import DeviceUnavailableError, PersistenceError
+from models.execution_mode import ExecutionMode
 from models.retry import (
     DEFAULT_POLICY,
     ErrorClass,
@@ -26,7 +37,7 @@ from models.retry import (
     classify_error,
     classify_result,
 )
-from models.state import Observation, StepOutcome
+from models.state import Observation, ObservationEpoch, StepOutcome
 from models.task import TERMINAL_STATUSES, Task, TaskStatus
 from models.task_step import StepStatus, TaskStep
 from models.verification import ActionDispatch, ActionEffect, DispatchStatus, GoalVerification
@@ -80,6 +91,22 @@ from ._runtime_types import ApprovalGrant, RunOutcome, RuntimeState
 
 
 
+@dataclass(frozen=True)
+class SafePoint:
+    """循环安全点的一次判定结论（V5 §十二）。
+
+    `stop=False` 表示「可以继续」。停下时带 `outcome`（该以什么结果退出本轮）
+    与 `kind`（结构化原因，用于发事件与统计）——**不发散成自由文本**，
+    因为「任务为什么停」是要能被程序区分、被 `/health` 聚合的，
+    不能只靠人去读日志（[66]：结构化优先，文本兜底）。
+    """
+
+    stop: bool
+    outcome: "RunOutcome | None" = None
+    reason: str = ""
+    kind: str = ""
+
+
 class AgentRuntime(
     ExecutionMixin,
     ConfirmationMixin,
@@ -87,6 +114,27 @@ class AgentRuntime(
     ReconcilerMixin,
     RecoveryMixin,
 ):
+    # 因「用户正在用手机」而暂停的**次数上界**（V5 §十四）。
+    #
+    # 为什么必须有上界：用户长时间连续操作手机时，任务会陷入
+    # 「用户在场 → 暂停 → 用户停手 → 恢复 → 用户又碰 → 又暂停」的循环，
+    # 表现为「任务永远在 running、什么也不做、日志里全是用户活动暂停」。
+    # 用户看到的是「它卡住了」，而他没法知道原因是自己在用手机。
+    #
+    # 到上界就明确失败（附上「可稍后重试或改用 shadow 模式」），
+    # 把决定权交还给人——这比无限期等下去诚实。
+    MAX_USER_PAUSES = 5
+
+    DEFAULT_USER_IDLE_SECONDS = 2.0
+    """用户停手多少秒后认为「他不用了」，可以恢复（V5 §十四）。
+
+    2 秒是 §十四 给的默认值。**不能太短**：用户点完一下到点下一下之间常有一两秒的
+    阅读停顿，按 0.5 秒判「停手了」会表现为「任务和用户抢屏幕」——每次用户刚点完
+    任务就插进来，页面被抢走，用户下一个动作落在错误的页面上。
+    **也不能太长**：用户在等电梯时把手机放到一边，任务要等 10 秒才能继续，
+    用户感受到的是「它反应好慢」。这个值做成类属性便于测试与按设备调整。
+    """
+
     def __init__(
         self,
         session: DeviceSession | DevicePool,
@@ -145,6 +193,273 @@ class AgentRuntime(
         return self._default_session
 
     # ---- 对外 ----
+
+    def safe_point(self, task: Task, state: "RuntimeState", session: DeviceSession) -> "SafePoint":
+        """循环安全点：**统一判断「现在还能不能继续往下做」**（V5 §十二 / §十六）。
+
+        ━━━ 为什么要有这个方法 ━━━
+
+        以前这些检查散在 `_run_loop` 里逐条 if（取消、抢占、预算）。再往里加一条
+        「用户在不在用手机」时，最省事的写法是在那个函数里再插一个 if——但那样会带来
+        两个问题：
+
+        1. **顺序敏感**：这些条件互相不是独立的（用户在用手机 ⇒ 不该走«执行»；
+           被抢占 ⇒ 无论用户在不在都该让位）。散着写时，谁先谁后靠读代码的人自己
+           推，而新加的一条极容易被放到错误的位置。收敛到一处之后，
+           顺序**显式、可测、只有一处**。
+        2. **不可测**：安全点判定需要「造出被抢占/用户在场/预算耗尽」这些状态。
+           收成一个纯函数式的入口后，用例可以直接构造 `Task` + `RuntimeState` +
+           `DeviceSession` 调它，不必跑完整个 loop。
+
+        返回 `SafePoint` 而不是 bool：调用方需要知道**为什么**停下（好发对事件、
+        落对状态、选对 `RunOutcome`）。返回 bool 的话调用方只能再猜一次原因，
+        而那正是「Runtime 说暂停了、Scheduler 说还在跑」这类语义冲突的来源。
+
+        ━━━ 判定顺序与理由 ━━━
+
+        1. **终态**——最高优先。任务已经是 DONE/FAILED/CANCELLED 时不该再动设备
+           （V2.5 §六，这是最后一道闸）。
+        2. **取消请求**——用户明确要求停，优先于其它一切让位理由。
+        3. **用户暂停 / 抢占让位**——外部要求停。
+        4. **用户在场**（V5 §十）——**人**在用手机，让开（§十四 第一阶段）。
+           放在抢占之后：被抢占是硬让位（另一个 Agent 排队等设备），
+           语义更强；而用户在场是可以「等几秒再看看」的软让位。
+        5. **预算**——自己跑不动了。
+        """
+        # 1) 终态：不该再产生任何副作用
+        if task.status in TERMINAL_STATUSES:
+            return SafePoint(
+                stop=True,
+                outcome=RunOutcome.CANCELLED,
+                reason=f"任务已被置为终态（{task.status.value}）",
+                kind="terminal",
+            )
+
+        # 2) 取消请求：走到安全点才算真停（V2.5 §七）
+        if task.status is TaskStatus.CANCEL_REQUESTED:
+            return SafePoint(
+                stop=True, outcome=RunOutcome.CANCELLED, reason="已收到取消请求", kind="cancel"
+            )
+
+        # 3) 用户暂停 / 被抢占让位
+        if task.status is TaskStatus.PAUSED:
+            return SafePoint(stop=True, outcome=RunOutcome.SUSPENDED, reason="任务已暂停", kind="paused")
+        if session.should_yield(task.id):
+            return SafePoint(
+                stop=True, outcome=RunOutcome.SUSPENDED, reason="被抢占，让出设备", kind="preemption"
+            )
+
+        # 4) 用户在场（V5 §十）——本方法新增的那一条。
+        verdict = self._user_presence_verdict(task, state)
+        if verdict is not None:
+            return verdict
+
+        # 5) 预算
+        if state.observation_count >= task.budget.max_observations:
+            return SafePoint(
+                stop=True,
+                outcome=RunOutcome.FAILED,
+                reason=f"已达观察次数上限 {task.budget.max_observations}",
+                kind="budget_observations",
+            )
+        if state.model_call_count >= task.budget.max_model_calls:
+            return SafePoint(
+                stop=True,
+                outcome=RunOutcome.FAILED,
+                reason=f"已达模型调用上限 {task.budget.max_model_calls}",
+                kind="budget_model_calls",
+            )
+
+        return SafePoint(stop=False)
+
+    def _user_presence_verdict(
+        self, task: Task, state: "RuntimeState"
+    ) -> "SafePoint | None":
+        """用户在场时要不要让开（V5 §十 / §十四）。
+
+        只对**会占用用户屏幕**的任务生效：`execution_mode=shadow` 的任务本来就
+        在影子平面跑（§十五），用户在用 Display 0 与它无关——这时因为「用户在操作」
+        而暂停它，等于把用户自己的活动变成了阻断 Agent 的理由，与 §九
+        「用户打开微信 → 无需抢占 A → A 继续执行」正好相反。
+
+        ━━━ 「读不到」怎么办 ━━━
+
+        `UserContext.confirmed=False`（探测失败 / 本端不支持）时**不暂停**。
+        这里刻意与 `device/user_activity.py` 的保守取值方向不同，理由是同一条原则
+        在两个位置上的**代价不对称**：
+
+        - 在**动作层面**（`UserContext` 内部）：宁可说「用户在操作」。
+          代价是任务慢一点。
+        - 在**任务层面**（这里）：宁可继续跑。因为「探测能力缺失」是一个**恒定**条件
+          （本端永远不支持），若把它当「用户在场」，任务会被永久暂停——
+          不是慢一点，而是**完全不能跑**。那比「打扰用户」更糟，而且用户无法修复。
+
+        所以判定要求 `confirmed=True` 且 `active=True`：前者保证「我们确实知道用户
+        在操作」，后者是那个事实。
+        """
+        if not state.user_confirmed or not state.user_active:
+            return None
+
+        mode = state.execution_mode or task.execution_mode.value
+        if mode != ExecutionMode.FOREGROUND.value:
+            # 影子/混合模式：用户在用 Display 0 与影子平面无关（§九 / §十五）。
+            # 需要用户在场的动作另由风险门禁处置，不在这里拦整条任务。
+            return None
+
+        # 用户在场 → 让开。但**必须**有上界：用户一直在操作时不能无限期地
+        # 「暂停→恢复→又暂停」，那会让任务永远推进不了，而用户看到的是
+        # 「任务一直卡在 running」。到达上界就转人工，把决定权交还给人。
+        if state.user_pauses >= self.MAX_USER_PAUSES:
+            return SafePoint(
+                stop=True,
+                outcome=RunOutcome.FAILED,
+                reason=(
+                    f"用户已连续占用设备 {state.user_pauses} 次，"
+                    "无法在不打扰用户的前提下继续（可稍后重试或改用 execution_mode=shadow）"
+                ),
+                kind="user_pause_limit",
+            )
+        return SafePoint(
+            stop=True,
+            outcome=RunOutcome.SUSPENDED_BY_USER,
+            reason=f"用户正在使用设备（前台应用：{state.foreground_package or '未知'}）",
+            kind="user_active",
+        )
+
+    def user_resume_ready(
+        self,
+        task: Task,
+        state: "RuntimeState",
+        session: DeviceSession,
+        observation: "Observation | None",
+        *,
+        idle_seconds: float | None = None,
+    ) -> bool:
+        """判断「因为用户在场而挂起的任务」现在能不能接着跑（V5 §十四）。
+
+        §十四 给的恢复条件是三条，缺一不可：
+
+        1. 用户已经停手 **N 秒**（默认 `DEFAULT_USER_IDLE_SECONDS`）；
+        2. 重新观察过一次页面；
+        3. 页面指纹与暂停前**一致**。
+
+        第 3 条最容易被漏掉，但它是这个方案唯一的安全支柱。用户在场期间
+        页面可能被他自己换掉了（点开通知进了另一个 App、退出了当前页面），
+        这时「继续执行」= 拿 A 屏的坐标点 B 屏。所以恢复**不靠**「用户停手了」，
+        而靠「停手了 **且** 那一屏还是我认识的那一屏」。
+
+        ━━━ 与 [80]/[92]「读不到 ≠ 空」的关系 ━━━
+
+        指纹比对要求**两帧都有指纹**。任何一帧读不到（`None` / 空串）时不判「一致」，
+        而是**不恢复**——注意这里的保守方向与 `_user_presence_verdict` 相反，
+        因为代价又不一样了：这里若把「读不到」当「一致」，就是用不可知的页面
+        去执行动作，代价是**点错地方**；不恢复的代价只是任务多等一轮。
+        """
+        if state.last_user_pause_at is None:
+            # 不是「因用户活动」挂起的，本方法不管——抢占挂起走设备可用性判定。
+            return False
+
+        if not self._user_idle_long_enough(state, session, idle_seconds):
+            return False
+
+        if observation is None:
+            # 还没重新观察过：不能凭「用户停手了」就恢复（第 2 条）。
+            return False
+
+        return self._page_fingerprint_matches(state, observation)
+
+    def _user_idle_long_enough(
+        self,
+        state: "RuntimeState",
+        session: DeviceSession,
+        idle_seconds: float | None,
+    ) -> bool:
+        """用户停手够久了没（第 1 条）。
+
+        优先用**设备侧的实测空闲时长**（`UserContext.idle_seconds`）——它比
+        「距离我们上次暂停过了多久」准确得多：`last_user_pause_at` 里还混着
+        「暂停之后我们自己又观察了一轮」的时间，用户其实早停手了，
+        我们却因为轮询间隔而多等一次。
+
+        设备侧拿不到时退回本地计时，且**只在当前这一轮确实测到用户不活跃时**才算数：
+        拿不到 `confirmed=True` 的「用户不在」就一律不恢复。
+        """
+        threshold = self.DEFAULT_USER_IDLE_SECONDS if idle_seconds is None else idle_seconds
+
+        probe = getattr(session.controller, "user_context", None)
+        if callable(probe):
+            try:
+                context = probe()
+            except Exception as exc:  # noqa: BLE001 —— 探测失败退回本地计时
+                logger.debug("恢复判定读用户活动失败：%s", exc)
+            else:
+                measured = getattr(context, "idle_seconds", None)
+                confirmed = bool(getattr(context, "confirmed", False))
+                active = bool(getattr(context, "active", False))
+                if confirmed and not active and isinstance(measured, (int, float)):
+                    return float(measured) >= threshold
+
+        # 本地计时：只在 state 里最新的探测结论是「确实不在操作」时采用。
+        if not state.user_confirmed or state.user_active:
+            return False
+        return (time.monotonic() - state.last_user_pause_at) >= threshold
+
+    @staticmethod
+    def _page_fingerprint_matches(state: "RuntimeState", observation: "Observation") -> bool:
+        """当前这一屏与暂停前那一屏是不是同一屏（第 3 条）。
+
+        用 `ObservationEpoch`（[81] 决策快照那套）而不是重写一份比对逻辑——
+        「页面还是不是那一屏」在本项目里只有一个权威答案，多写一份就多一个
+        会和它结论不一致的地方。
+        """
+        expected = state.pause_epoch
+        if expected is None:
+            # 暂停时没能记下页面身份（观察缺失 / epoch 读不到）。
+            # 不拿「没记录」当「没变化」——那是把证据缺口当证据（[80]）。
+            return False
+        current = ObservationEpoch.capture(observation, expected.generation)
+        if not current.package and not current.activity:
+            # 重新观察这一帧读不到页面身份 → 同样按「读不到」处理，不判一致。
+            return False
+        return current.stale_reason(expected) is None
+
+    def refresh_user_context(self, task: Task, state: "RuntimeState", session: DeviceSession) -> None:
+        """刷新「用户此刻在不在用手机」，写进 `state`（V5 §十）。
+
+        与 `safe_point` 分开是因为它们的**调用时机不同**：本方法在每轮循环的
+        开始调一次（读完喂给 state），而 `safe_point` 在多个位置被调（每个动作前）。
+        分成两个之后，`safe_point` 是纯判定、不碰设备，可以随便调；
+        探测（会碰设备、可能超时）只在明确的那一个点发生。
+
+        探测失败**不抛异常、不影响任务**：拿不到就当「不知道」
+        （`user_confirmed=False`），由 `_user_presence_verdict` 决定不暂停。
+        """
+        monitor = getattr(session.controller, "user_context", None)
+        if not callable(monitor):
+            # 后端没实现探测（老替身 / 老后端）：如实记「不知道」。
+            state.user_confirmed = False
+            state.user_active = False
+            return
+        try:
+            context = monitor()
+        except Exception as exc:  # noqa: BLE001 —— 探测失败不该弄挂任务
+            logger.debug("读取用户活动失败（按不知道处理）：%s", exc)
+            state.user_confirmed = False
+            state.user_active = False
+            return
+
+        state.user_confirmed = bool(getattr(context, "confirmed", False))
+        state.user_active = bool(getattr(context, "active", False))
+        package = getattr(context, "foreground_package", None)
+        if package:
+            state.foreground_package = str(package)
+        state.execution_mode = task.execution_mode.value
+        # V5 §十三：顺手把「这次执行落在哪块屏幕上」也记下来（恢复点要存它）。
+        # 从设备侧读而不是从任务声明读——`display_id` 是**实际**用的那块，
+        # 而后端已经知道这个事实（ADB 恒为默认显示，Android 侧将来可能是影子显示）。
+        display_id = getattr(session.controller, "display_id", None)
+        if isinstance(display_id, int) and not isinstance(display_id, bool):
+            state.display_id = display_id
 
     def _emit(self, task_id: str, kind: str, **data) -> None:
         """写一条事件。**按 kind 自动分级**（V3.1 P0）。
@@ -223,6 +538,18 @@ class AgentRuntime(
                 "observations": state.observation_count,
                 "model_calls": state.model_call_count,
             },
+            # V5 §十三：把「这个任务实际跑在哪块屏幕上」一起存下来。
+            #
+            # 存的是 `state.execution_mode`（**实测**的平面）而不是
+            # `task.execution_mode`（任务的**声明**）：两者在 hybrid 降级、
+            # 影子平面中途不可用时就会分叉，而恢复时要知道的是真相。
+            # `state.execution_mode` 由 `refresh_user_context` 每轮写入；
+            # 还没刷过时留空，`capture` 的默认值 "foreground" 恰好等于
+            # 「V5 之前的老恢复点」的语义。
+            execution_mode=state.execution_mode or ExecutionMode.FOREGROUND.value,
+            session_id=state.session_id,
+            display_id=state.display_id,
+            shadow_state_id=state.shadow_state_id,
         )
         self._checkpoints.save(checkpoint)
         task.checkpoint_id = checkpoint.id

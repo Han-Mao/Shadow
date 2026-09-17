@@ -24,6 +24,15 @@ class RunOutcome(str, Enum):
     SUSPENDED = "suspended"
     """被抢占或用户暂停，任务保留状态等待恢复。"""
 
+    SUSPENDED_BY_USER = "suspended_by_user"
+    """因为**用户正在用手机**而主动让开（V5 §十四）。
+
+    刻意与 `SUSPENDED` 分开：抢占挂起（`preemption`）是「另一个 Agent 要设备，
+    我按调度让位」，而这个是「**人**在用手机，我按礼貌让位」。两者的恢复方式不同
+    （前者等设备可用，后者等用户停手），审计上也是两回事——把它们合成一个值，
+    日志里就分不出「任务是被别的 Agent 挤掉的」还是「用户拿起手机了」。
+    """
+
     CANCELLED = "cancelled"
     AWAITING_CONFIRMATION = "awaiting_confirmation"
     """撞上危险动作，等人确认（HITL）。"""
@@ -113,6 +122,61 @@ class RuntimeState:
 
     必须计数：判 stale 就 `continue` 重新观察，如果 stale 判定本身有抖动，
     不加计数就会变成死循环。连续多次都稳不下来 → 按瞬时故障处理。"""
+
+    # ---- 用户活动与执行平面（V5 §十 / §十四）----
+
+    user_active: bool = False
+    """上一次探测到「用户正在操作手机」。
+
+    **不要单独读这个字段**——必须与 `user_confirmed` 一起看。
+    见 `device/user_activity.py` 的三态约定：`active=False, confirmed=False`
+    的含义是「我们不知道用户在哪」，处置上要向「用户在操作」靠。"""
+
+    user_confirmed: bool = False
+    """上一次用户活动探测**有没有依据**。`False` = 不知道，不是「用户不在」。"""
+
+    user_pauses: int = 0
+    """因为用户在场而主动暂停了几次。
+
+    计数是必要的：如果用户一直在操作、任务每轮都暂停，任务就永远推进不了。
+    计数到上界时必须做出判断（转人工 / 明确失败），而不是无限期地「再等等」——
+    那会表现为「任务卡在 running、日志里全是用户活动暂停」，用户看不出发生了什么。
+    """
+
+    foreground_package: str = ""
+    """上一次观察到的前台应用（用户活动探测的副产物）。"""
+
+    last_user_pause_at: float | None = None
+    """上一次因用户活动暂停的时刻（monotonic）。用于「用户停手 N 秒后恢复」的判定。"""
+
+    pause_epoch: "ObservationEpoch | None" = None
+    """因用户活动暂停时**那一屏**的身份（V5 §十四）。
+
+    恢复的三条判据里，唯一的安全支柱是「页面还是那一屏」——用户在用手机的这段时间，
+    页面可能已经被他自己换掉了。没有这个快照，「用户停手了」就只是「他不动了」，
+    不足以说明「我可以接着按老坐标点」。
+
+    与 `decision_epoch`（V3.1 P1-6 的 TOCTOU 防护）刻意分开：那个的生命周期是
+    「一次决策」,每次决策都重写；这个的生命周期是「一次挂起」，只在暂停那一刻写、
+    恢复那一刻读。合成一个字段会让两个不同的问题互相覆盖对方的证据。
+    """
+
+    execution_mode: str = ""
+    """本任务声明的执行模式（`ExecutionMode.value`），决策时读。"""
+
+    session_id: str = ""
+    """本次执行所属的会话 id（V5 §十三）。
+
+    与 `DeviceSession` 是两件事：那个回答「谁持有这台设备」（多任务争用），
+    这个回答「这次执行落在哪块屏幕上」（执行平面）。一个任务可以换
+    `DeviceSession` 的持有者而执行平面不变，反之亦然。
+    """
+
+    display_id: int | None = None
+    """实际使用的 display id（V5 §十三）。`None` ＝前台平面 / 未记录。"""
+
+    shadow_state_id: str = ""
+    """影子平面上的状态标识（V5 §十三）。真正的影子平面尚未实现，当前恒为空。"""
 
 
 @dataclass

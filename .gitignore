@@ -4,6 +4,7 @@ _ref_extract/
 
 # 开发文档（不入库）
 bluewhale-shadow-phone/
+docs/
 DEVLOG.md
 
 # 开发侧本地维护、不随仓库发布：运行时不需要它们（V2.5 起）
