@@ -48,8 +48,18 @@ object ScreenCapture {
     /** ImageReader 的缓冲数。2 够用：acquireLatestImage 会丢掉更早的帧。 */
     private const val IMAGE_BUFFER_COUNT = 2
 
-    /** 刚授权后第一帧可能要等一会儿才来；这是等待上界与轮询间隔。 */
-    private const val FIRST_FRAME_TIMEOUT_MS = 1_500L
+    /**
+     * 等待上界与轮询间隔。
+     *
+     * 1.5s 实测**不够**（2026-09-18 真机任务）：应用冷启动、系统弹层切换的那几秒里，
+     * 画面可能迟迟不来。而这个超时在上游被读成「投屏坏了」→ 观察失败 →
+     * 对账判「上次动作未生效」→ 重做同一个动作 → 循环到上限后转人工。
+     * 所以这个数字太小，代价不是「一次截图慢 1 秒」，而是**整条任务空转**。
+     *
+     * 提到 4s：真的没有帧（锁屏 / 安全界面 / 投屏被回收）时，只是晚 2.5 秒报错，
+     * 而那种场景本来就要人来处理，晚一点没有额外损失。
+     */
+    private const val FIRST_FRAME_TIMEOUT_MS = 4_000L
     private const val FIRST_FRAME_POLL_MS = 50L
 
     @Volatile private var ready: Boolean = false

@@ -174,9 +174,17 @@ def _compact_ui_tree(ui_tree: str | None, max_nodes: int = 40) -> str:
 def build_plan_prompt(instruction: str, screenshot_path: str, ui_tree: str | None) -> str:
     tree = _compact_ui_tree(ui_tree)
     return (
-        "你正在控制一部 Android 模拟器。请根据当前页面截图与可点击元素列表，"
+        "你正在控制一部 Android 设备。请根据当前页面截图与可点击元素列表，"
         f"为以下任务制定一份执行计划（3-8 步）：\n{instruction}\n\n"
         "可点击元素（部分）：\n" + (tree or "无") + "\n\n"
+        # 规划阶段就得说清「打开应用」怎么做。否则模型会把
+        # 「先展开文件夹 → 再找到图标点进去」写成计划步骤，而那条路在真机上很脆：
+        # 未展开的文件夹里，预览缩略图也是 clickable 的，点它**不会有任何反应**，
+        # 而验证只会说「页面未进入预期状态」（2026-09-18 真机实测，连失败三次）。
+        "打开某个应用用 launch 动作，value 直接写应用名（如「拼多多」）或包名；"
+        "不要把「展开文件夹 → 找到图标 → 点击」这类步骤写进计划。\n"
+        "需要输入文字时，先规划一步「点击输入框」，再规划一步「输入文字」——"
+        "type 只对已有焦点的输入框生效。\n\n"
         "请先复述这次任务的三件事，再给步骤（v4.3 §1：任务级的规划上下文）：\n"
         "  `goal`              —— 这一趟到底要达成什么（一句话）\n"
         "  `constraints`       —— 执行过程中**不许做**什么（数组，没有就给空数组）\n"
@@ -243,7 +251,7 @@ def build_decision_prompt(
     # 任务级上下文（目标 / 约束 / 完成条件，v4.3 §1）：**空就不占篇幅**——
     # 「约束：无」这种行只会稀释 prompt，而模型对「没写」和「空」的理解是一样的。
     return (
-        "你正在控制一部 Android 模拟器。任务：\n" + instruction + "\n\n"
+        "你正在控制一部 Android 设备。任务：\n" + instruction + "\n\n"
         + (plan_context + "\n\n" if plan_context else "")
         + "整体计划（[状态] 目标）：\n" + plan_text + "\n\n"
         "当前聚焦步骤：\n" + focus + "\n\n"
@@ -253,8 +261,8 @@ def build_decision_prompt(
         "{\n"
         '  "thought": "对当前页面的简短分析",\n'
         '  "action_type": "tap|long_press|type|swipe|back|home|launch|wait|done",\n'
-        '  "target": "点击目标的描述或坐标，如 {\"x\":360,\"y\":600} 或 \"搜索按钮\"",\n'
-        '  "value": "当 action_type=type 时填写要输入的文本；swipe 时填写 x1,y1,x2,y2；wait 时填写毫秒",\n'
+        '  "target": "目标：tap 抄上面列表里那一行的 [x,y]；swipe 填起终点 x1,y1,x2,y2；launch 时留空",\n'
+        '  "value": "type 时填要输入的文本；wait 时填毫秒；swipe 时填滑动时长（毫秒）；launch 时填应用名或包名",\n'
         '  "step_done": false,\n'
         '  "done": false,\n'
         '  "risk_hint": "safe|caution|dangerous（仅建议，最终风险由服务端策略裁定）",\n'
@@ -264,8 +272,28 @@ def build_decision_prompt(
         "注意：done 只是**申请**完成——服务端会用截图、UI 树与包名独立核验，"
         "核验不通过会把任务打回来继续做。所以声称完成时请把 goal_evidence 填上，"
         "否则这次完成申请会因为没有独立证据而被记为「未验证」。\n"
-        "坐标优先返回屏幕绝对像素；若不确定，返回可点击元素的文本或 content-desc 描述。"
-    )
+        # ── 下面两条是 2026-09-17 真机任务失败后加的，各对应一次真实失败 ──
+        #
+        # ① 「让模型自己描述目标」这条路是失败的来源：它写 `拼多多应用图标`，
+        #    而执行层的匹配规则是「描述必须是 UI 文本的子串」（见 parser._text_score），
+        #    于是永远匹配不上，报错还只说「没找到元素」，指向了完全无关的方向。
+        #    所以现在只教坐标，并明确说清为什么别描述。
+        "target 一律给屏幕绝对像素：**直接抄**上面「可点击元素」列表里那一行的 [x, y]，"
+        "整行照抄（如「拼多多 [723,284]」）也可以，坐标会被解析出来。"
+        "**不要**自己编「XX图标」「XX按钮」这类描述——"
+        "它只有在恰好是列表文本的子串时才匹配得上，编出来的名字会直接失败。\n"
+        # ② 打开应用原本靠点桌面图标，而桌面图标可能在文件夹里、
+        #    或者只是文件夹预览的缩略图——后者点了不会有任何反应，
+        #    且失败信息含糊（`VLM 判定页面未进入预期状态`）。
+        #    launch 现在支持直接写应用名（AppResolver），所以把它明说出来。
+        "打开某个应用用 launch，**value 直接写应用名（如「拼多多」）或包名，两种都支持**；"
+        "不要去点桌面上的应用图标——它可能在文件夹里，或只是文件夹预览的缩略图，点了不会有反应。\n"
+        # ③ 输入文字前必须先点输入框（2026-09-18 真机：模型直接 type，被设备层拒绝，
+        #    报「没有可输入的控件」；而它 replan 时又跑回去重新启动应用，越修越远）。
+        #    type 只对**已有焦点**的输入框生效，这一步不能省。
+        "需要输入文字时，**先用一个 tap 动作点中输入框**（抄它的坐标）让它获得焦点，"
+        "再单独发一个 type 动作；type 不会自己去找输入框，没焦点时会直接失败。"
+        )
 
 
 def build_replan_prompt(context: dict[str, Any]) -> str:
@@ -281,7 +309,7 @@ def build_replan_prompt(context: dict[str, Any]) -> str:
     alternatives_text = "\n".join(f"- {item}" for item in alternatives) if alternatives else "（无）"
 
     return (
-        "你正在控制一部 Android 模拟器。**任务本身没有失败**，失败的是下面这种执行方式。\n"
+        "你正在控制一部 Android 设备。**任务本身没有失败**，失败的是下面这种执行方式。\n"
         "请换一种做法，不要重复已经失败过的动作。\n\n"
         f"任务：{context.get('task', '')}\n"
         f"当前步骤：{context.get('current_step', '')}\n"
@@ -587,7 +615,7 @@ def verify_transition(
     pre_b64 = _encode_image(pre_screenshot_path)
     post_b64 = _encode_image(post_screenshot_path)
     prompt = (
-        "你正在评估一次 Android 模拟器操作是否有效。\n"
+        "你正在评估一次 Android 设备操作是否有效。\n"
         f"任务：{instruction}\n"
         f"执行动作：{action}\n\n"
         "请比较两张截图，判断操作是否让页面进入预期状态。"

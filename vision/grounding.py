@@ -46,15 +46,48 @@ def _numbers_of(text: str) -> list[float] | None:
     return None
 
 
+# planner 的候选列表格式是 `{label} [{x},{y}]`（见 `vlm._compact_ui_tree`），
+# 模型会把整行**原样回填**成 target。麻烦在于 label 里经常自带数字
+# （"工具,文件夹,9个应用"、"11个应用，10条通知"），于是「数一数有几个数字」
+# 这条判据全线失效：凑够 4 个就被当成 bbox，静默点到 label 数字算出来的位置。
+# 方括号结构比数字个数可靠得多，所以先认它。
+_BRACKET_BBOX_RE = re.compile(
+    r"\[\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\]"
+    r"\s*"
+    r"\[\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\]"
+)
+_BRACKET_POINT_RE = re.compile(r"\[\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\]")
+
+
+def _numbers_from_brackets(text: str) -> list[float] | None:
+    """方括号坐标：`[x1,y1][x2,y2]` → bbox；`[x,y]` → 点。认不出返回 None。
+
+    **必须在 `_numbers_of` 之前判**——两者的判据会打架，而这里更可靠：
+    `生活,文件夹,11个应用，10条通知 [773,361]` 按数字个数算是 4 个（11/10/773/361），
+    会得出一个完全错误的 bbox（中心落在屏幕左上角附近，**静默点错地方**）；
+    按方括号结构算只有一个 `[773,361]`，那正是要点的图标。
+    """
+    bbox = _BRACKET_BBOX_RE.search(text)
+    if bbox:
+        return [float(group) for group in bbox.groups()]
+    point = _BRACKET_POINT_RE.search(text)
+    if point:
+        return [float(point.group(1)), float(point.group(2))]
+    return None
+
+
 def _extract_numbers(text: str) -> list[float] | None:
     """从 target 字符串里提取坐标数字，非坐标描述返回 None。
 
-    两道守卫避免把普通描述误判成坐标：
-    ① 含拉丁字母的字符串不做 2 数提取 —— 否则 "微信 v8.0.32" 会变成坐标 (8, 32)；
-    ② 先原样匹配，再剥离中文引导词后重试 —— 兼顾 "点击(540, 1200)" 这类带前缀的写法。
+    三道守卫避免把普通描述误判成坐标：
+    ① 方括号结构优先 —— planner 候选行 `{label} [{x},{y}]` 的直接产物；
+    ② 含拉丁字母的字符串不做 2 数提取 —— 否则 "微信 v8.0.32" 会变成坐标 (8, 32)；
+    ③ 先原样匹配，再剥离中文引导词后重试 —— 兼顾 "点击(540, 1200)" 这类带前缀的写法。
     """
     if not text:
         return None
+    if numbers := _numbers_from_brackets(text):
+        return numbers
     if numbers := _numbers_of(text):
         return numbers
     return _numbers_of(_CJK_RE.sub("", text))
@@ -81,12 +114,43 @@ def _bbox_center(controller: DeviceController, box: list[float]) -> tuple[int, i
     return round((x1 + x2) / 2), round((y1 + y2) / 2)
 
 
+# 模型给结构化 target 时，字段名的**优先级本身就是「该怎么匹配」的声明**：
+# text / content-desc 是给人看的标签，resource-id 是给机器的标识。
+# 顺序与 `parser._text_score` 取字段的顺序保持一致，免得两处各判各的。
+_TARGET_LABEL_KEYS = (
+    "text",
+    "content-desc",
+    "content_desc",
+    "resource-id",
+    "resource_id",
+    "description",
+    "desc",
+)
+
+
+def _point_from_mapping(target: dict) -> tuple[float, float] | None:
+    """`{"x": 540, "y": 1200}` → 点；缺一个、或不是数字，返回 None。"""
+    x, y = target.get("x"), target.get("y")
+    if isinstance(x, (int, float)) and isinstance(y, (int, float)):
+        return float(x), float(y)
+    return None
+
+
+def _label_from_mapping(target: dict) -> str:
+    """按字段优先级取出可匹配的标签；一个都没有就返回空串。"""
+    for key in _TARGET_LABEL_KEYS:
+        value = target.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
 def resolve_target(
     controller: DeviceController,
-    target: Point | str | None,
+    target: Point | str | dict | None,
     ui_tree: str | None = None,
 ) -> tuple[int, int]:
-    """把 target 解析成屏幕坐标。支持：Point、像素/归一化坐标串、bbox 串、语义描述。
+    """把 target 解析成屏幕坐标。支持：Point、坐标串/bbox 串、语义描述、结构化对象。
 
     解析失败时抛出 GroundingError，不静默回退到屏幕中心。
     """
@@ -95,6 +159,20 @@ def resolve_target(
 
     if target is None:
         raise GroundingError("target 为空，无法解析坐标")
+
+    if isinstance(target, dict):
+        # 模型有时把定位信息写成结构化对象，例如
+        #     {"text": "耳机有线耳机"}   或   {"resource-id": "com.x.ui:id/search"}
+        # 这比一串自由文本**更有信息量**（字段名直接说明该用哪个字段匹配），
+        # 丢掉太可惜 —— 2026-09-18 真机上，一个任务里 4 次尝试全是这么被拒的，
+        # 而报文只说「没找到元素」，完全看不出真正的原因是**类型不支持**。
+        point = _point_from_mapping(target)
+        if point is not None:
+            return _point_to_pixel(controller, point[0], point[1])
+        label = _label_from_mapping(target)
+        if not label:
+            raise GroundingError(f"target 是对象，但里面没有可用的定位信息: {target!r}")
+        target = label  # 交给下面的文本匹配
 
     if isinstance(target, str):
         numbers = _extract_numbers(target)

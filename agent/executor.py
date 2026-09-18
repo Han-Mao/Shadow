@@ -16,6 +16,27 @@ from vision import grounding
 from vision.grounding import GroundingError
 
 
+LAUNCH_SETTLE_MS = 6_000
+"""启动应用后等它稳定下来的时长。
+
+应用冷启动要几秒，而观察紧跟在动作之后 —— 不等就必然看到启动页或桌面，
+验证于是判「页面未进入预期状态」。**动作其实是成功的**，但这条误判会连锁成
+「判失败 → 重做 → 再判失败」，是 2026-09-18 真机上观察到的第一种死循环。
+
+6s 是**量出来的**（2026-09-18 在 vivo V2352A 上逐秒取样）：
+
+    +0s   launch 发出
+    +2s   前台 = com.vivo.appfilter/.activity.AppJumpPromptActivity    ← vivo「应用跳转」确认框
+    +4s   前台 = 同上
+    +6s   前台 = com.xunmeng.pinduoduo/.ui.activity.MainFrameActivity  ← 应用到位
+
+国产 ROM 会拦「一个应用启动另一个应用」，中间插一个跳转确认框，
+**约 5-6 秒后自动放行**（不需要用户点，但期间前台既不是原应用、也不是目标应用）。
+原先取 2.5s 正好落在那段弹窗里，于是每次 launch 都判失败——
+**这不是代码问题，是把厂商弹窗的耗时算短了**。
+"""
+
+
 def _split_launch(value: str) -> tuple[str, str | None]:
     if "/" in value:
         package, activity = value.split("/", 1)
@@ -106,9 +127,21 @@ def execute(device: DeviceController, action: Action, ui_tree: str | None = None
                 return {"ok": True}
 
             case ActionType.LAUNCH:
-                if not action.value:
-                    raise ActionArgumentError("LAUNCH 操作需要提供 value（package/activity）")
-                package, activity = _split_launch(action.value)
+                # 模型经常把应用名/包名塞进 `target`、把 `value` 留空 ——
+                # 2026-09-18 真机上三次尝试有两次是这么错的（`target="拼多多" value=""`），
+                # 两次重试就这么白费了，而 AppResolver 根本没机会被调用。
+                #
+                # `target` 在 launch 语义下**没有别的用途**，所以这里宽容一点：
+                # value 为空、而 target 是非空字符串时，就当包名/应用名用。
+                # 读宽写严 —— 这个宽容不会把一种动作变成另一种动作。
+                raw = action.value or (
+                    action.target
+                    if isinstance(action.target, str) and action.target.strip()
+                    else ""
+                )
+                if not raw:
+                    raise ActionArgumentError("LAUNCH 操作需要提供应用名或包名（写在 value 里）")
+                package, activity = _split_launch(str(raw))
                 # 只给包名时走端口上的 `launch_app`（方案文档 §6「App 启动改成 Android Intent」）：
                 # ADB 侧是 `monkey -p`，Android 侧是 PackageManager + startActivity。
                 # 这里刻意不写「if 后端是 android」——那等于把后端类型判断塞回核心。
@@ -116,6 +149,9 @@ def execute(device: DeviceController, action: Action, ui_tree: str | None = None
                     device.launch(package, activity)
                 else:
                     device.launch_app(package)
+                # 见 LAUNCH_SETTLE_MS 的说明：不等的话，紧跟其后的观察只会看到
+                # 启动页，验证判「未进入预期状态」，而动作其实已经成功。
+                device.wait(LAUNCH_SETTLE_MS)
                 return {"ok": True, "package": package, "activity": activity}
 
             case ActionType.WAIT:

@@ -3,6 +3,7 @@ package com.bluewhale.shadow.device
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 
 /**
  * 启动应用：`PackageManager` + `startActivity`（V3.3 §6）。
@@ -27,11 +28,15 @@ object AppLauncher {
         if (packageName.isBlank()) {
             throw ShadowActionFailed("启动应用需要包名")
         }
+        // 模型给的常常是**应用名**（「拼多多」）而不是包名。在这层翻译存在之前，
+        // 它会被原样送进 getLaunchIntentForPackage，失败后报「应用可能未安装」——
+        // 而应用明明装着，于是排查方向被彻底带偏（2026-09-17 真机任务踩到）。
+        val resolved = resolvePackageName(context, packageName)
         val intent = if (activity.isNullOrBlank()) {
-            launchIntentForPackage(context, packageName)
+            launchIntentForPackage(context, resolved)
         } else {
             Intent(Intent.ACTION_MAIN).setComponent(
-                ComponentName(packageName, qualify(packageName, activity))
+                ComponentName(resolved, qualify(resolved, activity))
             )
         }
 
@@ -45,6 +50,47 @@ object AppLauncher {
                 "启动 $packageName${activity?.let { "/$it" } ?: ""} 失败：${exc.message}。" +
                     "常见原因：应用未安装、该 Activity 未导出、或组件名写法不对。"
             )
+        }
+    }
+
+    /**
+     * 把「模型嘴里的名字」解析成真包名。
+     *
+     * **先认包名，再认应用名**——顺序写死而不是碰运气。反过来的话，一个恰好与应用名
+     * 同形的包名会被丢进模糊匹配，命中一堆候选后报歧义。现实中罕见，
+     * 但「先查什么」在两可时必须是一条明确规则，而不是看谁先被想到。
+     *
+     * 已经是装好的包名就**原样返回**，不做任何规范化：包名是唯一标识，
+     * 对它做「聪明的修正」只会引入第二种失败方式。
+     */
+    private fun resolvePackageName(context: Context, target: String): String {
+        if (isInstalled(context, target)) return target
+        return AppResolver.resolve(target, launcherApps(context))
+    }
+
+    private fun isInstalled(context: Context, packageName: String): Boolean =
+        try {
+            context.packageManager.getPackageInfo(packageName, 0)
+            true
+        } catch (exc: PackageManager.NameNotFoundException) {
+            false
+        }
+
+    /**
+     * 候选集 = **有启动入口**的应用，不是全部已安装包。
+     *
+     * 拿全部包会让「设置」「日历」这类系统组件参与匹配——它们没有 LAUNCHER 入口、
+     * 启动了也必然失败；更要紧的是会让重名判定（歧义）被一堆用户根本看不见的包污染，
+     * 于是「微信」这种本该唯一的名字被判成歧义。
+     *
+     * `QUERY_ALL_PACKAGES` + `<queries>` 已在 manifest 里声明，
+     * 否则 Android 11+ 这里会安静地返回空列表（见 AndroidManifest.xml 顶部说明）。
+     */
+    private fun launcherApps(context: Context): List<AppResolver.AppEntry> {
+        val pm = context.packageManager
+        val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+        return pm.queryIntentActivities(intent, 0).map {
+            AppResolver.AppEntry(it.activityInfo.packageName, it.loadLabel(pm).toString())
         }
     }
 
